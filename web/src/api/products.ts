@@ -62,3 +62,10 @@ export async function createProductAlias(productId: string, data: CreateAliasReq
 export async function deleteProductAlias(productId: string, aliasId: string): Promise<void> {
   return del<void>(`/products/${encodeURIComponent(productId)}/aliases/${encodeURIComponent(aliasId)}`)
 }
+
+export async function mergeProducts(keepId: string, mergeId: string): Promise<void> {
+  return post<void>('/products/merge', {
+    keep_id: keepId,
+    merge_id: mergeId,
+  })
+}

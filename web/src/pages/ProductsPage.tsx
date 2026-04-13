@@ -168,13 +168,25 @@ function ProductsPage() {
       </div>
 
       <div className="mb-4">
-        <input
-          type="text"
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          placeholder="Search products..."
-          className="w-full max-w-sm px-3 py-2 text-body border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
-        />
+        <div className="flex items-center gap-3">
+          <input
+            type="text"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            placeholder="Search products and aliases..."
+            className="w-full max-w-sm px-3 py-2 text-body border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+          />
+          {debouncedSearch && !isLoading && (
+            <span className="text-caption text-neutral-400">
+              {rows.length} result{rows.length !== 1 ? 's' : ''}
+            </span>
+          )}
+        </div>
+        {debouncedSearch && (
+          <p className="mt-1 text-small text-neutral-400">
+            Searching product names and aliases
+          </p>
+        )}
       </div>
 
       {isLoading ? (

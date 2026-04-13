@@ -76,6 +76,7 @@ type productLinkResponse struct {
 // RegisterRoutes mounts product endpoints onto the protected group.
 func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products := protected.Group("/products")
+	products.POST("/merge", h.Merge) // Must be before /:id to avoid "merge" matching as an ID.
 	products.GET("", h.List)
 	products.POST("", h.Create)
 	products.PUT("/:id", h.Update)
@@ -457,6 +458,168 @@ func (h *ProductHandler) ListLinks(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, links)
+}
+
+// --- Merge types ---
+
+type mergeProductRequest struct {
+	KeepID  string `json:"keep_id"`
+	MergeID string `json:"merge_id"`
+}
+
+// Merge combines two products into one. All related records (aliases, line items,
+// prices, shopping list items, matching rules, images, links) are moved from the
+// merge product to the keep product, purchase stats are aggregated, and the merge
+// product is deleted. Everything runs in a single transaction.
+// POST /api/v1/products/merge
+func (h *ProductHandler) Merge(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	var req mergeProductRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.KeepID = strings.TrimSpace(req.KeepID)
+	req.MergeID = strings.TrimSpace(req.MergeID)
+	if req.KeepID == "" || req.MergeID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "keep_id and merge_id are required"})
+	}
+	if req.KeepID == req.MergeID {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "keep_id and merge_id must be different"})
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	// 1. Verify both products exist and belong to the same household.
+	var keepHouseholdID, mergeHouseholdID string
+	var keepPurchaseCount, mergePurchaseCount int
+	var keepLastPurchased, mergeLastPurchased *time.Time
+
+	err = tx.QueryRow(
+		"SELECT household_id, purchase_count, last_purchased_at FROM products WHERE id = ?",
+		req.KeepID,
+	).Scan(&keepHouseholdID, &keepPurchaseCount, &keepLastPurchased)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "keep product not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	err = tx.QueryRow(
+		"SELECT household_id, purchase_count, last_purchased_at FROM products WHERE id = ?",
+		req.MergeID,
+	).Scan(&mergeHouseholdID, &mergePurchaseCount, &mergeLastPurchased)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "merge product not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if keepHouseholdID != householdID || mergeHouseholdID != householdID {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "products do not belong to your household"})
+	}
+
+	// 2. Move aliases from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE product_aliases SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 3. Move line_items from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE line_items SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 4. Move product_prices from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE product_prices SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 5. Update shopping_list_items from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE shopping_list_items SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 6. Update matching_rules from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE matching_rules SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 7. Move product_images from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE product_images SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 8. Move product_links from merge → keep.
+	if _, err := tx.Exec(
+		"UPDATE product_links SET product_id = ? WHERE product_id = ?",
+		req.KeepID, req.MergeID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 9. Aggregate purchase stats: add counts, use later last_purchased_at.
+	newPurchaseCount := keepPurchaseCount + mergePurchaseCount
+	newLastPurchased := keepLastPurchased
+	if mergeLastPurchased != nil {
+		if newLastPurchased == nil || mergeLastPurchased.After(*newLastPurchased) {
+			newLastPurchased = mergeLastPurchased
+		}
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.Exec(
+		"UPDATE products SET purchase_count = ?, last_purchased_at = ?, updated_at = ? WHERE id = ?",
+		newPurchaseCount, newLastPurchased, now, req.KeepID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 10. Delete the merge product (CASCADE handles any remaining FKs).
+	if _, err := tx.Exec("DELETE FROM products WHERE id = ?", req.MergeID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// Return the kept product.
+	var p productResponse
+	err = h.DB.QueryRow(
+		`SELECT id, household_id, name, category, default_unit, notes,
+		        last_purchased_at, purchase_count, created_at, updated_at
+		 FROM products WHERE id = ?`, req.KeepID,
+	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
+		&p.LastPurchasedAt, &p.PurchaseCount, &p.CreatedAt, &p.UpdatedAt)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusOK, p)
 }
 
 // --- Product Detail types ---

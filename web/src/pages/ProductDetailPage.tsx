@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -12,6 +12,7 @@ import { listStores } from '@/api/stores'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
+import { ProductMerge } from '@/components/products/ProductMerge'
 import type { ProductDetail, ProductImage, ProductAlias, Store } from '@/types'
 
 // --- Helper ---
@@ -227,6 +228,27 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
   )
 }
 
+function AliasChip({ alias, storeName, onDelete }: { alias: ProductAlias; storeName: string | null; onDelete: () => void }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-50 rounded-xl text-caption text-neutral-600">
+      &quot;{alias.alias}&quot;
+      {storeName && (
+        <Badge variant="neutral">{storeName}</Badge>
+      )}
+      <button
+        type="button"
+        className="ml-1 text-neutral-400 hover:text-expensive transition-colors cursor-pointer"
+        onClick={onDelete}
+        aria-label={`Delete alias ${alias.alias}`}
+      >
+        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </span>
+  )
+}
+
 function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; productId: string; stores: Store[] }) {
   const queryClient = useQueryClient()
   const [showAdd, setShowAdd] = useState(false)
@@ -268,6 +290,20 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
     return stores.find((s) => s.id === storeId)?.name ?? null
   }
 
+  // Group aliases: global vs store-specific
+  const { globalAliases, storeAliases } = useMemo(() => {
+    const global: ProductAlias[] = []
+    const store: ProductAlias[] = []
+    for (const a of detail.aliases) {
+      if (a.store_id) {
+        store.push(a)
+      } else {
+        global.push(a)
+      }
+    }
+    return { globalAliases: global, storeAliases: store }
+  }, [detail.aliases])
+
   return (
     <>
       <div className="bg-white rounded-2xl shadow-subtle p-5">
@@ -295,7 +331,7 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
               onChange={(e) => setNewAliasStoreId(e.target.value)}
               className="px-3 py-2 text-caption border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand"
             >
-              <option value="">Any store</option>
+              <option value="">Any store (global)</option>
               {stores.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name}
@@ -311,31 +347,40 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
         {detail.aliases.length === 0 ? (
           <p className="text-caption text-neutral-400">No aliases yet.</p>
         ) : (
-          <div className="flex flex-wrap gap-2">
-            {detail.aliases.map((a) => {
-              const storeName = storeNameById(a.store_id)
-              return (
-                <span
-                  key={a.id}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-50 rounded-xl text-caption text-neutral-600"
-                >
-                  &quot;{a.alias}&quot;
-                  {storeName && (
-                    <span className="text-small text-neutral-400">({storeName})</span>
-                  )}
-                  <button
-                    type="button"
-                    className="ml-1 text-neutral-400 hover:text-expensive transition-colors cursor-pointer"
-                    onClick={() => setDeleteConfirm(a)}
-                    aria-label={`Delete alias ${a.alias}`}
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                </span>
-              )
-            })}
+          <div className="space-y-3">
+            {/* Global aliases */}
+            {globalAliases.length > 0 && (
+              <div>
+                <p className="text-small font-medium text-neutral-400 mb-1.5">Global aliases</p>
+                <div className="flex flex-wrap gap-2">
+                  {globalAliases.map((a) => (
+                    <AliasChip
+                      key={a.id}
+                      alias={a}
+                      storeName={null}
+                      onDelete={() => setDeleteConfirm(a)}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Store-specific aliases */}
+            {storeAliases.length > 0 && (
+              <div>
+                <p className="text-small font-medium text-neutral-400 mb-1.5">Store-specific aliases</p>
+                <div className="flex flex-wrap gap-2">
+                  {storeAliases.map((a) => (
+                    <AliasChip
+                      key={a.id}
+                      alias={a}
+                      storeName={storeNameById(a.store_id)}
+                      onDelete={() => setDeleteConfirm(a)}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -506,6 +551,7 @@ function MealieLinksSection({ detail }: { detail: ProductDetail }) {
 function ProductDetailPage() {
   const { id } = useParams<{ id: string }>()
   const productId = id ?? ''
+  const [mergeOpen, setMergeOpen] = useState(false)
 
   const { data: detail, isLoading, error } = useQuery({
     queryKey: ['product-detail', productId],
@@ -552,9 +598,14 @@ function ProductDetailPage() {
 
       {/* Header */}
       <div className="mb-6">
-        <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
-          {product.name}
-        </h1>
+        <div className="flex items-start justify-between">
+          <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
+            {product.name}
+          </h1>
+          <Button size="sm" variant="outlined" onClick={() => setMergeOpen(true)}>
+            Merge with Another Product
+          </Button>
+        </div>
         <div className="flex items-center gap-3 mt-2">
           {product.category && <Badge variant="neutral">{product.category}</Badge>}
           {product.default_unit && (
@@ -574,6 +625,13 @@ function ProductDetailPage() {
         <TransactionsSection detail={detail} />
         <MealieLinksSection detail={detail} />
       </div>
+
+      {/* Merge Modal */}
+      <ProductMerge
+        open={mergeOpen}
+        onClose={() => setMergeOpen(false)}
+        keepProduct={product}
+      />
     </div>
   )
 }

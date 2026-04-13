@@ -10,6 +10,7 @@ import ReceiptReviewPage from '@/pages/ReceiptReviewPage'
 import ReceiptsPage from '@/pages/ReceiptsPage'
 import ProductsPage from '@/pages/ProductsPage'
 import ProductDetailPage from '@/pages/ProductDetailPage'
+import RulesPage from '@/pages/RulesPage'
 import ListsIndexPage from '@/pages/ListsIndexPage'
 import ShoppingListPage from '@/pages/ShoppingListPage'
 import type { ReactNode } from 'react'
@@ -105,7 +106,7 @@ function AppRoutes() {
         <Route path="products/:id" element={<ProductDetailPage />} />
         <Route path="lists" element={<ListsIndexPage />} />
         <Route path="lists/:id" element={<ShoppingListPage />} />
-        <Route path="rules" element={<PlaceholderPage title="Rules" />} />
+        <Route path="rules" element={<RulesPage />} />
         <Route path="receipts" element={<ReceiptsPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />
         <Route path="import" element={<PlaceholderPage title="Import" />} />
