@@ -9,6 +9,9 @@ import ScanPage from '@/pages/ScanPage'
 import ReceiptReviewPage from '@/pages/ReceiptReviewPage'
 import ReceiptsPage from '@/pages/ReceiptsPage'
 import ProductsPage from '@/pages/ProductsPage'
+import ProductDetailPage from '@/pages/ProductDetailPage'
+import ListsIndexPage from '@/pages/ListsIndexPage'
+import ShoppingListPage from '@/pages/ShoppingListPage'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -99,6 +102,9 @@ function AppRoutes() {
         <Route path="stores/:id" element={<PlaceholderPage title="Store Details" />} />
         <Route path="analytics" element={<PlaceholderPage title="Analytics" />} />
         <Route path="products" element={<ProductsPage />} />
+        <Route path="products/:id" element={<ProductDetailPage />} />
+        <Route path="lists" element={<ListsIndexPage />} />
+        <Route path="lists/:id" element={<ShoppingListPage />} />
         <Route path="rules" element={<PlaceholderPage title="Rules" />} />
         <Route path="receipts" element={<ReceiptsPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />

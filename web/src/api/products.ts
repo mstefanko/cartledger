@@ -4,6 +4,7 @@ import type {
   ProductAlias,
   ProductImage,
   ProductLink,
+  ProductDetail,
   CreateProductRequest,
   UpdateProductRequest,
   CreateAliasRequest,
@@ -28,6 +29,10 @@ export async function updateProduct(id: string, data: UpdateProductRequest): Pro
 
 export async function deleteProduct(id: string): Promise<void> {
   return del<void>(`/products/${encodeURIComponent(id)}`)
+}
+
+export async function getProductDetail(id: string): Promise<ProductDetail> {
+  return get<ProductDetail>(`/products/${encodeURIComponent(id)}/detail`)
 }
 
 export async function uploadProductImage(productId: string, file: File, type?: string, caption?: string): Promise<ProductImage> {

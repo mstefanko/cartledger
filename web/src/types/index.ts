@@ -160,6 +160,41 @@ export interface ProductLink {
   created_at: string
 }
 
+// --- Product Detail Types ---
+
+export interface PriceHistoryEntry {
+  date: string
+  store_name: string
+  store_id: string
+  quantity: string
+  unit: string
+  unit_price: string
+  total_price: string
+}
+
+export interface StorePriceComparison {
+  store_id: string
+  store_name: string
+  latest_price: string
+  latest_date: string
+  is_cheapest: boolean
+}
+
+export interface ProductDetail {
+  product: Product
+  aliases: ProductAlias[]
+  images: ProductImage[]
+  links: ProductLink[]
+  price_history: PriceHistoryEntry[]
+  store_prices: StorePriceComparison[]
+  stats: {
+    count: number
+    avg: string
+    min: string
+    max: string
+  }
+}
+
 // --- API Request Types ---
 
 export interface LoginRequest {
@@ -299,6 +334,74 @@ export interface UpdateRuleRequest {
   store_id?: string
   product_id?: string
   category?: string
+}
+
+// --- Shopping List Extended Types ---
+
+export interface ShoppingListWithCounts extends ShoppingList {
+  item_count: number
+  checked_count: number
+}
+
+export interface ListItemWithPrice {
+  id: string
+  list_id: string
+  product_id: string | null
+  product_name: string | null
+  name: string
+  quantity: string
+  unit: string | null
+  checked: boolean
+  checked_by: string | null
+  sort_order: number
+  notes: string | null
+  estimated_price: string | null
+  cheapest_store: string | null
+  cheapest_price: string | null
+  created_at: string
+}
+
+export interface ShoppingListDetail {
+  id: string
+  household_id: string
+  name: string
+  created_by: string | null
+  status: 'active' | 'completed' | 'archived'
+  items: ListItemWithPrice[]
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateListRequest {
+  name: string
+}
+
+export interface UpdateListRequest {
+  name?: string
+  status?: 'active' | 'completed' | 'archived'
+}
+
+export interface CreateListItemRequest {
+  name: string
+  product_id?: string
+  quantity?: string
+  unit?: string
+  notes?: string
+}
+
+export interface UpdateListItemRequest {
+  name?: string
+  product_id?: string
+  quantity?: string
+  unit?: string
+  checked?: boolean
+  checked_by?: string
+  notes?: string
+  sort_order?: number
+}
+
+export interface ReorderListItemsRequest {
+  items: { id: string; sort_order: number }[]
 }
 
 // --- WebSocket Message Types ---

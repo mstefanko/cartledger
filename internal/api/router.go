@@ -84,6 +84,12 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	matchingHandler := &MatchingHandler{DB: database, Cfg: cfg}
 	matchingHandler.RegisterRoutes(protected)
 
+	listHandler := &ListHandler{DB: database, Cfg: cfg, Hub: hub}
+	listHandler.RegisterRoutes(protected)
+
+	exportHandler := &ExportHandler{DB: database, Cfg: cfg}
+	exportHandler.RegisterRoutes(protected)
+
 	// WebSocket endpoint (auth via query param, not middleware).
 	wsHandler := &WSHandler{Hub: hub, JWTSecret: cfg.JWTSecret}
 	v1.GET("/ws", wsHandler.HandleWS)

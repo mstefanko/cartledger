@@ -5,6 +5,7 @@ const (
 	EventListItemChecked  = "list.item.checked"
 	EventListItemAdded    = "list.item.added"
 	EventListItemRemoved  = "list.item.removed"
+	EventListItemUpdated  = "list.item.updated"
 	EventReceiptProcessing = "receipt.processing"
 	EventReceiptComplete  = "receipt.complete"
 	EventReceiptMatched   = "receipt.matched"

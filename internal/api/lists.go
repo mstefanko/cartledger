@@ -1,0 +1,686 @@
+package api
+
+import (
+	"database/sql"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+
+	"github.com/mstefanko/cartledger/internal/auth"
+	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/ws"
+)
+
+// ListHandler holds dependencies for shopping list endpoints.
+type ListHandler struct {
+	DB  *sql.DB
+	Cfg *config.Config
+	Hub *ws.Hub
+}
+
+// --- Request types ---
+
+type createListRequest struct {
+	Name string `json:"name"`
+}
+
+type updateListRequest struct {
+	Name   *string `json:"name,omitempty"`
+	Status *string `json:"status,omitempty"`
+}
+
+type createListItemRequest struct {
+	Name      string  `json:"name"`
+	ProductID *string `json:"product_id,omitempty"`
+	Quantity  *string `json:"quantity,omitempty"`
+	Unit      *string `json:"unit,omitempty"`
+	Notes     *string `json:"notes,omitempty"`
+}
+
+type updateListItemRequest struct {
+	Name      *string `json:"name,omitempty"`
+	ProductID *string `json:"product_id,omitempty"`
+	Quantity  *string `json:"quantity,omitempty"`
+	Unit      *string `json:"unit,omitempty"`
+	Checked   *bool   `json:"checked,omitempty"`
+	CheckedBy *string `json:"checked_by,omitempty"`
+	Notes     *string `json:"notes,omitempty"`
+	SortOrder *int    `json:"sort_order,omitempty"`
+}
+
+type reorderListItemEntry struct {
+	ID        string `json:"id"`
+	SortOrder int    `json:"sort_order"`
+}
+
+type reorderListItemsRequest struct {
+	Items []reorderListItemEntry `json:"items"`
+}
+
+// --- Response types ---
+
+type listSummaryResponse struct {
+	ID           string    `json:"id"`
+	HouseholdID  string    `json:"household_id"`
+	Name         string    `json:"name"`
+	CreatedBy    *string   `json:"created_by,omitempty"`
+	Status       string    `json:"status"`
+	ItemCount    int       `json:"item_count"`
+	CheckedCount int       `json:"checked_count"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type listDetailResponse struct {
+	ID          string             `json:"id"`
+	HouseholdID string            `json:"household_id"`
+	Name        string             `json:"name"`
+	CreatedBy   *string            `json:"created_by,omitempty"`
+	Status      string             `json:"status"`
+	Items       []listItemResponse `json:"items"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+}
+
+type listItemResponse struct {
+	ID             string  `json:"id"`
+	ListID         string  `json:"list_id"`
+	ProductID      *string `json:"product_id,omitempty"`
+	ProductName    *string `json:"product_name,omitempty"`
+	Name           string  `json:"name"`
+	Quantity       string  `json:"quantity"`
+	Unit           *string `json:"unit,omitempty"`
+	Checked        bool    `json:"checked"`
+	CheckedBy      *string `json:"checked_by,omitempty"`
+	SortOrder      int     `json:"sort_order"`
+	Notes          *string `json:"notes,omitempty"`
+	EstimatedPrice *string `json:"estimated_price,omitempty"`
+	CheapestStore  *string `json:"cheapest_store,omitempty"`
+	CheapestPrice  *string `json:"cheapest_price,omitempty"`
+	CreatedAt      string  `json:"created_at"`
+}
+
+// RegisterRoutes mounts shopping list endpoints onto the protected group.
+func (h *ListHandler) RegisterRoutes(protected *echo.Group) {
+	lists := protected.Group("/lists")
+	lists.GET("", h.List)
+	lists.POST("", h.Create)
+	lists.GET("/:id", h.Get)
+	lists.PUT("/:id", h.Update)
+	lists.DELETE("/:id", h.Delete)
+	lists.POST("/:id/items", h.AddItem)
+	lists.PUT("/:id/items/:itemId", h.UpdateItem)
+	lists.DELETE("/:id/items/:itemId", h.DeleteItem)
+	lists.PUT("/:id/reorder", h.ReorderItems)
+}
+
+// List returns all shopping lists for the authenticated household with item counts.
+// GET /api/v1/lists
+func (h *ListHandler) List(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	rows, err := h.DB.Query(
+		`SELECT sl.id, sl.household_id, sl.name, sl.created_by, sl.status,
+		        sl.created_at, sl.updated_at,
+		        (SELECT COUNT(*) FROM shopping_list_items WHERE list_id = sl.id) AS item_count,
+		        (SELECT COUNT(*) FROM shopping_list_items WHERE list_id = sl.id AND checked = TRUE) AS checked_count
+		 FROM shopping_lists sl
+		 WHERE sl.household_id = ?
+		 ORDER BY sl.updated_at DESC`,
+		householdID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer rows.Close()
+
+	lists := make([]listSummaryResponse, 0)
+	for rows.Next() {
+		var l listSummaryResponse
+		if err := rows.Scan(&l.ID, &l.HouseholdID, &l.Name, &l.CreatedBy, &l.Status,
+			&l.CreatedAt, &l.UpdatedAt, &l.ItemCount, &l.CheckedCount); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		lists = append(lists, l)
+	}
+	if err := rows.Err(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusOK, lists)
+}
+
+// Create adds a new shopping list.
+// POST /api/v1/lists
+func (h *ListHandler) Create(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	userID := auth.UserIDFrom(c)
+
+	var req createListRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+
+	now := time.Now().UTC()
+	var id string
+	err := h.DB.QueryRow(
+		`INSERT INTO shopping_lists (id, household_id, name, created_by, status, created_at, updated_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'active', ?, ?)
+		 RETURNING id`,
+		householdID, req.Name, userID, now, now,
+	).Scan(&id)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusCreated, listSummaryResponse{
+		ID:          id,
+		HouseholdID: householdID,
+		Name:        req.Name,
+		CreatedBy:   &userID,
+		Status:      "active",
+		ItemCount:   0,
+		CheckedCount: 0,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+}
+
+// Get returns a shopping list with all items, including price estimates.
+// GET /api/v1/lists/:id
+func (h *ListHandler) Get(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+
+	var resp listDetailResponse
+	err := h.DB.QueryRow(
+		`SELECT id, household_id, name, created_by, status, created_at, updated_at
+		 FROM shopping_lists WHERE id = ? AND household_id = ?`,
+		listID, householdID,
+	).Scan(&resp.ID, &resp.HouseholdID, &resp.Name, &resp.CreatedBy, &resp.Status,
+		&resp.CreatedAt, &resp.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// Fetch items with product name and latest price.
+	rows, err := h.DB.Query(
+		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
+		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
+		        sli.sort_order, sli.notes, sli.created_at,
+		        (SELECT pp.unit_price FROM product_prices pp
+		         WHERE pp.product_id = sli.product_id
+		         ORDER BY pp.receipt_date DESC LIMIT 1) AS estimated_price
+		 FROM shopping_list_items sli
+		 LEFT JOIN products p ON sli.product_id = p.id
+		 WHERE sli.list_id = ?
+		 ORDER BY sli.sort_order, sli.created_at`,
+		listID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer rows.Close()
+
+	resp.Items = make([]listItemResponse, 0)
+	for rows.Next() {
+		var item listItemResponse
+		var estimatedPrice *float64
+		var createdAt time.Time
+		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
+			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
+			&item.SortOrder, &item.Notes, &createdAt, &estimatedPrice); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		item.CreatedAt = createdAt.Format(time.RFC3339)
+		if estimatedPrice != nil {
+			s := fmt.Sprintf("%.2f", *estimatedPrice)
+			item.EstimatedPrice = &s
+		}
+		resp.Items = append(resp.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// For items with a product_id, find cheapest store.
+	for i, item := range resp.Items {
+		if item.ProductID == nil {
+			continue
+		}
+		var storeName string
+		var price float64
+		err := h.DB.QueryRow(
+			`SELECT s.name, pp.unit_price
+			 FROM product_prices pp
+			 JOIN stores s ON pp.store_id = s.id
+			 WHERE pp.product_id = ?
+			 AND pp.receipt_date = (
+			     SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+			     WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+			 )
+			 ORDER BY pp.unit_price ASC
+			 LIMIT 1`,
+			*item.ProductID,
+		).Scan(&storeName, &price)
+		if err == nil {
+			resp.Items[i].CheapestStore = &storeName
+			p := fmt.Sprintf("%.2f", price)
+			resp.Items[i].CheapestPrice = &p
+		}
+	}
+
+	return c.JSON(http.StatusOK, resp)
+}
+
+// Update modifies a shopping list (name, status).
+// PUT /api/v1/lists/:id
+func (h *ListHandler) Update(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+
+	var req updateListRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	setClauses := make([]string, 0)
+	args := make([]interface{}, 0)
+
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "name cannot be empty"})
+		}
+		setClauses = append(setClauses, "name = ?")
+		args = append(args, name)
+	}
+	if req.Status != nil {
+		status := *req.Status
+		if status != "active" && status != "completed" && status != "archived" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "status must be active, completed, or archived"})
+		}
+		setClauses = append(setClauses, "status = ?")
+		args = append(args, status)
+	}
+
+	if len(setClauses) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "no fields to update"})
+	}
+
+	now := time.Now().UTC()
+	setClauses = append(setClauses, "updated_at = ?")
+	args = append(args, now)
+	args = append(args, listID, householdID)
+
+	query := fmt.Sprintf(
+		"UPDATE shopping_lists SET %s WHERE id = ? AND household_id = ?",
+		strings.Join(setClauses, ", "),
+	)
+
+	result, err := h.DB.Exec(query, args...)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+
+	var resp listSummaryResponse
+	err = h.DB.QueryRow(
+		`SELECT sl.id, sl.household_id, sl.name, sl.created_by, sl.status,
+		        sl.created_at, sl.updated_at,
+		        (SELECT COUNT(*) FROM shopping_list_items WHERE list_id = sl.id) AS item_count,
+		        (SELECT COUNT(*) FROM shopping_list_items WHERE list_id = sl.id AND checked = TRUE) AS checked_count
+		 FROM shopping_lists sl WHERE sl.id = ?`,
+		listID,
+	).Scan(&resp.ID, &resp.HouseholdID, &resp.Name, &resp.CreatedBy, &resp.Status,
+		&resp.CreatedAt, &resp.UpdatedAt, &resp.ItemCount, &resp.CheckedCount)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusOK, resp)
+}
+
+// Delete removes a shopping list (CASCADE deletes items).
+// DELETE /api/v1/lists/:id
+func (h *ListHandler) Delete(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+
+	result, err := h.DB.Exec(
+		"DELETE FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+// AddItem adds an item to a shopping list.
+// POST /api/v1/lists/:id/items
+func (h *ListHandler) AddItem(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRow(
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req createListItemRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+
+	quantity := "1"
+	if req.Quantity != nil {
+		quantity = *req.Quantity
+	}
+
+	now := time.Now().UTC()
+	var id string
+	err = h.DB.QueryRow(
+		`INSERT INTO shopping_list_items (id, list_id, product_id, name, quantity, unit, notes, created_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?)
+		 RETURNING id`,
+		listID, req.ProductID, req.Name, quantity, req.Unit, req.Notes, now,
+	).Scan(&id)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// Touch list updated_at.
+	h.DB.Exec("UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID)
+
+	item := listItemResponse{
+		ID:        id,
+		ListID:    listID,
+		ProductID: req.ProductID,
+		Name:      req.Name,
+		Quantity:  quantity,
+		Unit:      req.Unit,
+		Checked:   false,
+		Notes:     req.Notes,
+		CreatedAt: now.Format(time.RFC3339),
+	}
+
+	// Broadcast WebSocket event.
+	h.Hub.Broadcast(ws.Message{
+		Type:      ws.EventListItemAdded,
+		Household: householdID,
+		Payload: map[string]interface{}{
+			"list_id": listID,
+			"item":    item,
+		},
+	})
+
+	return c.JSON(http.StatusCreated, item)
+}
+
+// UpdateItem modifies a shopping list item.
+// PUT /api/v1/lists/:id/items/:itemId
+func (h *ListHandler) UpdateItem(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+	itemID := c.Param("itemId")
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRow(
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req updateListItemRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	setClauses := make([]string, 0)
+	args := make([]interface{}, 0)
+	isCheckUpdate := false
+
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "name cannot be empty"})
+		}
+		setClauses = append(setClauses, "name = ?")
+		args = append(args, name)
+	}
+	if req.ProductID != nil {
+		setClauses = append(setClauses, "product_id = ?")
+		args = append(args, *req.ProductID)
+	}
+	if req.Quantity != nil {
+		setClauses = append(setClauses, "quantity = ?")
+		args = append(args, *req.Quantity)
+	}
+	if req.Unit != nil {
+		setClauses = append(setClauses, "unit = ?")
+		args = append(args, *req.Unit)
+	}
+	if req.Checked != nil {
+		setClauses = append(setClauses, "checked = ?")
+		args = append(args, *req.Checked)
+		isCheckUpdate = true
+	}
+	if req.CheckedBy != nil {
+		setClauses = append(setClauses, "checked_by = ?")
+		args = append(args, *req.CheckedBy)
+	}
+	if req.Notes != nil {
+		setClauses = append(setClauses, "notes = ?")
+		args = append(args, *req.Notes)
+	}
+	if req.SortOrder != nil {
+		setClauses = append(setClauses, "sort_order = ?")
+		args = append(args, *req.SortOrder)
+	}
+
+	if len(setClauses) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "no fields to update"})
+	}
+
+	args = append(args, itemID, listID)
+	query := fmt.Sprintf(
+		"UPDATE shopping_list_items SET %s WHERE id = ? AND list_id = ?",
+		strings.Join(setClauses, ", "),
+	)
+
+	result, err := h.DB.Exec(query, args...)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "item not found"})
+	}
+
+	// Touch list updated_at.
+	now := time.Now().UTC()
+	h.DB.Exec("UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID)
+
+	// Read back the updated item for response and broadcast.
+	var item listItemResponse
+	var createdAt time.Time
+	err = h.DB.QueryRow(
+		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
+		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
+		        sli.sort_order, sli.notes, sli.created_at
+		 FROM shopping_list_items sli
+		 LEFT JOIN products p ON sli.product_id = p.id
+		 WHERE sli.id = ?`,
+		itemID,
+	).Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
+		&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
+		&item.SortOrder, &item.Notes, &createdAt)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	item.CreatedAt = createdAt.Format(time.RFC3339)
+
+	// Broadcast appropriate WebSocket event.
+	if isCheckUpdate {
+		h.Hub.Broadcast(ws.Message{
+			Type:      ws.EventListItemChecked,
+			Household: householdID,
+			Payload: map[string]interface{}{
+				"list_id":    listID,
+				"item_id":    itemID,
+				"checked":    item.Checked,
+				"checked_by": item.CheckedBy,
+			},
+		})
+	} else {
+		h.Hub.Broadcast(ws.Message{
+			Type:      ws.EventListItemUpdated,
+			Household: householdID,
+			Payload: map[string]interface{}{
+				"list_id": listID,
+				"item":    item,
+			},
+		})
+	}
+
+	return c.JSON(http.StatusOK, item)
+}
+
+// DeleteItem removes an item from a shopping list.
+// DELETE /api/v1/lists/:id/items/:itemId
+func (h *ListHandler) DeleteItem(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+	itemID := c.Param("itemId")
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRow(
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	result, err := h.DB.Exec(
+		"DELETE FROM shopping_list_items WHERE id = ? AND list_id = ?",
+		itemID, listID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "item not found"})
+	}
+
+	// Touch list updated_at.
+	now := time.Now().UTC()
+	h.DB.Exec("UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID)
+
+	// Broadcast WebSocket event.
+	h.Hub.Broadcast(ws.Message{
+		Type:      ws.EventListItemRemoved,
+		Household: householdID,
+		Payload: map[string]interface{}{
+			"list_id": listID,
+			"item_id": itemID,
+		},
+	})
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+// ReorderItems updates sort_order for multiple items in a single transaction.
+// PUT /api/v1/lists/:id/reorder
+func (h *ListHandler) ReorderItems(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRow(
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req reorderListItemsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.Items) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "items array is required"})
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	for _, entry := range req.Items {
+		_, err := tx.Exec(
+			"UPDATE shopping_list_items SET sort_order = ? WHERE id = ? AND list_id = ?",
+			entry.SortOrder, entry.ID, listID,
+		)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
+
+	now := time.Now().UTC()
+	tx.Exec("UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID)
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}

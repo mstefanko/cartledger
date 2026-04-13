@@ -1,6 +1,8 @@
-import { NavLink } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { NavLink, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { listStores } from '@/api/stores'
+import { listLists, createList } from '@/api/lists'
 
 interface SidebarProps {
   open: boolean
@@ -44,12 +46,34 @@ function PageIcon({ icon }: { icon: string }) {
 }
 
 function Sidebar({ open, onClose }: SidebarProps) {
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [creatingList, setCreatingList] = useState(false)
+  const [newListName, setNewListName] = useState('')
+
   const storesQuery = useQuery({
     queryKey: ['stores'],
     queryFn: listStores,
   })
 
+  const listsQuery = useQuery({
+    queryKey: ['shopping-lists'],
+    queryFn: listLists,
+  })
+
+  const createListMutation = useMutation({
+    mutationFn: createList,
+    onSuccess: (newList) => {
+      void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+      setCreatingList(false)
+      setNewListName('')
+      navigate(`/lists/${newList.id}`)
+      onClose()
+    },
+  })
+
   const stores = storesQuery.data ?? []
+  const lists = (listsQuery.data ?? []).filter((l) => l.status === 'active')
 
   const sidebarContent = (
     <nav className="flex flex-col h-full">
@@ -61,12 +85,75 @@ function Sidebar({ open, onClose }: SidebarProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-4 flex flex-col gap-6">
-        {/* Lists section — placeholder for future */}
+        {/* Lists section */}
         <div>
-          <p className="px-3 mb-2 text-small font-semibold text-neutral-400 uppercase tracking-wide">
-            Lists
-          </p>
-          <p className="px-3 text-small text-neutral-400">No lists yet</p>
+          <div className="flex items-center justify-between px-3 mb-2">
+            <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide">
+              Lists
+            </p>
+            <button
+              type="button"
+              className="text-small font-medium text-brand hover:text-brand-dark transition-colors"
+              onClick={() => setCreatingList(true)}
+              aria-label="New list"
+            >
+              +
+            </button>
+          </div>
+          {creatingList && (
+            <div className="px-3 mb-2">
+              <input
+                type="text"
+                value={newListName}
+                onChange={(e) => setNewListName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && newListName.trim()) {
+                    createListMutation.mutate({ name: newListName.trim() })
+                  }
+                  if (e.key === 'Escape') {
+                    setCreatingList(false)
+                    setNewListName('')
+                  }
+                }}
+                onBlur={() => {
+                  if (!newListName.trim()) {
+                    setCreatingList(false)
+                  }
+                }}
+                placeholder="List name..."
+                className="w-full px-2 py-1 text-caption rounded-lg border border-neutral-200 focus:outline-none focus:ring-1 focus:ring-brand"
+                autoFocus
+              />
+            </div>
+          )}
+          <div className="flex flex-col gap-0.5">
+            <NavLink
+              to="/lists"
+              className={navLinkClass}
+              onClick={onClose}
+              end
+            >
+              <span className="text-base leading-none">&#x1F4CB;</span>
+              All Lists
+            </NavLink>
+            {lists.map((list) => (
+              <NavLink
+                key={list.id}
+                to={`/lists/${list.id}`}
+                className={navLinkClass}
+                onClick={onClose}
+              >
+                <span className="text-base leading-none">&#x1F6D2;</span>
+                <span className="truncate flex-1">{list.name}</span>
+                <span className="text-small text-neutral-400 shrink-0">
+                  {list.checked_count}/{list.item_count}
+                </span>
+              </NavLink>
+            ))}
+            {lists.length === 0 && !creatingList && (
+              <p className="px-3 text-small text-neutral-400">No active lists</p>
+            )}
+          </div>
         </div>
 
         {/* Stores section */}

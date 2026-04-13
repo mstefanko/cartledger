@@ -1,9 +1,10 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { listProducts, createProduct, updateProduct } from '@/api/products'
 import { Button } from '@/components/ui/Button'
 import { EditableTable } from '@/components/ui/EditableTable'
-import type { ColumnDef } from '@tanstack/react-table'
+import type { ColumnDef, CellContext } from '@tanstack/react-table'
 import type { Product } from '@/types'
 
 interface ProductRow extends Product {
@@ -96,6 +97,19 @@ function ProductsPage() {
         header: 'Name',
         size: 240,
         meta: { editable: true, cellType: 'text' as const },
+        cell: ({ getValue, row }: CellContext<ProductRow, unknown>) => {
+          const name = getValue() as string
+          const product = row.original
+          return (
+            <Link
+              to={`/products/${product.id}`}
+              className="text-brand hover:underline"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {name}
+            </Link>
+          )
+        },
       },
       {
         accessorKey: 'category',
