@@ -1,0 +1,77 @@
+{
+  "store_name": "ShopRite",
+  "store_address": "123 Main Street, Springfield, NJ 07081",
+  "date": "2026-04-10",
+  "items": [
+    {
+      "raw_name": "BNLS CHKN BRST",
+      "suggested_name": "Chicken Breast, Boneless",
+      "suggested_category": "Meat",
+      "quantity": 2.34,
+      "unit": "lb",
+      "unit_price": 4.99,
+      "total_price": 11.68,
+      "line_number": 1,
+      "confidence": 0.97
+    },
+    {
+      "raw_name": "ORG BABY SPNCH",
+      "suggested_name": "Organic Baby Spinach",
+      "suggested_category": "Produce",
+      "quantity": 1.0,
+      "unit": "each",
+      "unit_price": 3.49,
+      "total_price": 3.49,
+      "line_number": 2,
+      "confidence": 0.95
+    },
+    {
+      "raw_name": "2% MILK GAL",
+      "suggested_name": "2% Milk, Gallon",
+      "suggested_category": "Dairy",
+      "quantity": 1.0,
+      "unit": "gal",
+      "unit_price": 4.29,
+      "total_price": 4.29,
+      "line_number": 3,
+      "confidence": 0.98
+    },
+    {
+      "raw_name": "WHL WHT BRD",
+      "suggested_name": "Whole Wheat Bread",
+      "suggested_category": "Bakery",
+      "quantity": 1.0,
+      "unit": "each",
+      "unit_price": 3.99,
+      "total_price": 3.99,
+      "line_number": 4,
+      "confidence": 0.92
+    },
+    {
+      "raw_name": "BROC CROWNS",
+      "suggested_name": "Broccoli Crowns",
+      "suggested_category": "Produce",
+      "quantity": 1.52,
+      "unit": "lb",
+      "unit_price": 2.49,
+      "total_price": 3.78,
+      "line_number": 5,
+      "confidence": 0.96
+    },
+    {
+      "raw_name": "KS PREM PPR TWL",
+      "suggested_name": "Paper Towels, Premium",
+      "suggested_category": "Household",
+      "quantity": 1.0,
+      "unit": "pack",
+      "unit_price": 12.99,
+      "total_price": 12.99,
+      "line_number": 6,
+      "confidence": 0.93
+    }
+  ],
+  "subtotal": 40.22,
+  "tax": 0.91,
+  "total": 41.13,
+  "confidence": 0.95
+}

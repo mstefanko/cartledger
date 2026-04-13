@@ -1,0 +1,23 @@
+services:
+  cartledger:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data          # SQLite DB + receipt images
+    environment:
+      - CARTLEDGER_DB_PATH=/data/cartledger.db
+      - CARTLEDGER_UPLOAD_DIR=/data/receipts
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}      # optional fallback
+      - MEALIE_URL=${MEALIE_URL}              # optional
+      - MEALIE_TOKEN=${MEALIE_TOKEN}          # optional
+    restart: unless-stopped
+
+  # Optional: Mealie alongside (if not already running)
+  # mealie:
+  #   image: ghcr.io/mealie-recipes/mealie:latest
+  #   ports:
+  #     - "9925:9000"
+  #   volumes:
+  #     - ./mealie-data:/app/data

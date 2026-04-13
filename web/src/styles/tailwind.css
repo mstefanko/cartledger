@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+@theme {
+  /* Brand colors — Kraken Purple */
+  --color-brand: #7132f5;
+  --color-brand-dark: #5741d8;
+  --color-brand-deep: #5b1ecf;
+  --color-brand-subtle: rgba(133, 91, 251, 0.16);
+
+  /* Neutral scale */
+  --color-neutral-900: #101114;
+  --color-neutral-600: #484b5e;
+  --color-neutral-500: #686b82;
+  --color-neutral-400: #9497a9;
+  --color-neutral-200: #dedee5;
+  --color-neutral-50: rgba(148, 151, 169, 0.08);
+
+  /* Success / deal */
+  --color-success: #149e61;
+  --color-success-dark: #026b3f;
+  --color-success-subtle: rgba(20, 158, 97, 0.16);
+
+  --color-deal: #149e61;
+  --color-deal-subtle: rgba(20, 158, 97, 0.16);
+
+  /* Expensive / price increase */
+  --color-expensive: #e5484d;
+  --color-expensive-subtle: rgba(229, 72, 77, 0.16);
+
+  /* Font families */
+  --font-display: "IBM Plex Sans", Helvetica, Arial, sans-serif;
+  --font-body: "Helvetica Neue", Helvetica, Arial, sans-serif;
+
+  /* Font sizes */
+  --text-hero: 48px;
+  --text-hero--line-height: 1.17;
+  --text-hero--letter-spacing: -1px;
+  --text-hero--font-weight: 700;
+
+  --text-section: 36px;
+  --text-section--line-height: 1.22;
+  --text-section--letter-spacing: -0.5px;
+  --text-section--font-weight: 700;
+
+  --text-subhead: 28px;
+  --text-subhead--line-height: 1.29;
+  --text-subhead--letter-spacing: -0.5px;
+  --text-subhead--font-weight: 700;
+
+  --text-feature: 22px;
+  --text-feature--line-height: 1.2;
+  --text-feature--font-weight: 600;
+
+  --text-body: 16px;
+  --text-body--line-height: 1.38;
+  --text-body--font-weight: 400;
+
+  --text-body-medium: 16px;
+  --text-body-medium--line-height: 1.38;
+  --text-body-medium--font-weight: 500;
+
+  --text-caption: 14px;
+  --text-caption--line-height: 1.43;
+  --text-caption--font-weight: 400;
+
+  --text-small: 12px;
+  --text-small--line-height: 1.33;
+  --text-small--font-weight: 400;
+
+  /* Border radius */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+
+  /* Box shadows */
+  --shadow-subtle: rgba(0, 0, 0, 0.03) 0px 4px 24px;
+  --shadow-micro: rgba(16, 24, 40, 0.04) 0px 1px 4px;
+}
+
+/* Google Fonts import for IBM Plex Sans */
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap");
