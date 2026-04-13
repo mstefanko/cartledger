@@ -404,6 +404,82 @@ export interface ReorderListItemsRequest {
   items: { id: string; sort_order: number }[]
 }
 
+// --- Mealie Integration Types ---
+
+export interface MealieStatus {
+  configured: boolean
+  connected: boolean
+  mealie_url: string | null
+  error: string | null
+}
+
+export interface MealieRecipe {
+  id: string
+  slug: string
+  name: string
+  description: string | null
+  image: string | null
+  total_time: string | null
+  servings: number | null
+}
+
+export interface MealieFood {
+  id: string
+  name: string
+  description: string | null
+}
+
+export interface MealieIngredient {
+  quantity: string | null
+  unit: string | null
+  food: MealieFood | null
+  note: string | null
+  original_text: string | null
+}
+
+export interface MealieRecipeDetail extends MealieRecipe {
+  ingredients: MealieIngredient[]
+}
+
+export interface MealieShoppingList {
+  id: string
+  name: string
+  item_count: number
+}
+
+export interface ImportedItem {
+  product_id: string | null
+  product_name: string | null
+  mealie_food_name: string
+  quantity: string | null
+  unit: string | null
+  cost: string | null
+  matched: boolean
+}
+
+export interface ImportedRecipe {
+  recipe_name: string
+  recipe_slug: string
+  total_cost: string | null
+  items: ImportedItem[]
+}
+
+export interface ImportedShoppingList {
+  list_id: string
+  list_name: string
+  items_imported: number
+  items_matched: number
+}
+
+// --- Unit Conversion Types ---
+
+export interface CreateConversionRequest {
+  product_id?: string
+  from_unit: string
+  to_unit: string
+  factor: string
+}
+
 // --- WebSocket Message Types ---
 
 export interface WSMessage {

@@ -13,6 +13,8 @@ type Config struct {
 	GeminiAPIKey   string
 	LLMProvider    string // "claude", "gemini", "mock"
 	JWTSecret      string
+	MealieURL      string
+	MealieToken    string
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -24,6 +26,8 @@ func Load() *Config {
 		GeminiAPIKey:   getEnv("GEMINI_API_KEY", ""),
 		LLMProvider:    getEnv("LLM_PROVIDER", "claude"),
 		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-production"),
+		MealieURL:      getEnv("MEALIE_URL", ""),
+		MealieToken:    getEnv("MEALIE_TOKEN", ""),
 	}
 }
 

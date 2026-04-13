@@ -15,6 +15,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/units"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -247,14 +248,24 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			}
 			up := totalPrice.Div(quantity)
 
+			priceID := uuid.New().String()
 			_, err = tx.Exec(
 				`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, created_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				uuid.New().String(), *productID, storeID, job.ReceiptID,
+				priceID, *productID, storeID, job.ReceiptID,
 				receiptDate, quantity.String(), unit, up.String(), now,
 			)
 			if err != nil {
 				return fmt.Errorf("insert product price: %w", err)
+			}
+
+			// Normalize price to standard unit (per oz, per fl_oz, per each).
+			normalizedPrice, normalizedUnit, normErr := units.NormalizePrice(totalPrice, quantity, unit, *productID, w.db)
+			if normErr == nil {
+				_, _ = tx.Exec(
+					`UPDATE product_prices SET normalized_price = ?, normalized_unit = ? WHERE id = ?`,
+					normalizedPrice.String(), normalizedUnit, priceID,
+				)
 			}
 
 			// Update product purchase stats.

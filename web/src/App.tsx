@@ -13,6 +13,8 @@ import ProductDetailPage from '@/pages/ProductDetailPage'
 import RulesPage from '@/pages/RulesPage'
 import ListsIndexPage from '@/pages/ListsIndexPage'
 import ShoppingListPage from '@/pages/ShoppingListPage'
+import ImportPage from '@/pages/ImportPage'
+import ConversionsPage from '@/pages/ConversionsPage'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -109,7 +111,8 @@ function AppRoutes() {
         <Route path="rules" element={<RulesPage />} />
         <Route path="receipts" element={<ReceiptsPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />
-        <Route path="import" element={<PlaceholderPage title="Import" />} />
+        <Route path="import" element={<ImportPage />} />
+        <Route path="conversions" element={<ConversionsPage />} />
         <Route path="scan" element={<ScanPage />} />
       </Route>
 

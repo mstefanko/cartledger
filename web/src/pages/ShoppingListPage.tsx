@@ -323,7 +323,7 @@ function ShoppingListPage() {
           <div className="flex items-center gap-2 mt-1">
             <Badge variant={statusVariant}>{list.status}</Badge>
             {estimatedTotal > 0 && (
-              <span className="text-caption text-neutral-400">
+              <span className="text-caption font-medium text-brand">
                 Est. ${estimatedTotal.toFixed(2)}
               </span>
             )}
@@ -440,11 +440,16 @@ function ShoppingListPage() {
 
       {/* Footer — estimated total for unchecked */}
       {uncheckedItems.length > 0 && estimatedTotal > 0 && (
-        <div className="mt-6 pt-4 border-t border-neutral-200 flex items-center justify-between">
-          <span className="text-body-medium font-medium text-neutral-900">Estimated Total</span>
-          <span className="text-feature font-semibold text-neutral-900">
-            ${estimatedTotal.toFixed(2)}
-          </span>
+        <div className="mt-6 pt-4 border-t border-neutral-200">
+          <div className="flex items-center justify-between">
+            <span className="text-body-medium font-medium text-neutral-900">Estimated Total</span>
+            <span className="font-display text-subhead font-bold text-brand">
+              ${estimatedTotal.toFixed(2)}
+            </span>
+          </div>
+          <p className="text-small text-neutral-400 mt-1">
+            Based on {uncheckedItems.filter((i) => i.estimated_price).length} of {uncheckedItems.length} items with price data
+          </p>
         </div>
       )}
 
@@ -578,14 +583,21 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
         {/* Price */}
         <div className="shrink-0 text-right">
           {item.estimated_price && (
-            <span
-              className={[
-                'text-caption font-medium',
-                item.checked ? 'text-neutral-400 line-through' : 'text-neutral-900',
-              ].join(' ')}
-            >
-              ${item.estimated_price}
-            </span>
+            <div className="flex flex-col items-end">
+              <span
+                className={[
+                  'text-caption font-medium',
+                  item.checked ? 'text-neutral-400 line-through' : 'text-neutral-900',
+                ].join(' ')}
+              >
+                ${item.estimated_price}
+              </span>
+              {!item.checked && item.unit && item.cheapest_price && parseFloat(item.quantity) > 0 && (
+                <span className="text-small text-neutral-400">
+                  {item.quantity} {item.unit} x ${item.cheapest_price}/{item.unit}
+                </span>
+              )}
+            </div>
           )}
         </div>
 

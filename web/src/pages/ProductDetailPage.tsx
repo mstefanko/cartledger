@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
 import { ProductMerge } from '@/components/products/ProductMerge'
-import type { ProductDetail, ProductImage, ProductAlias, Store } from '@/types'
+import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry } from '@/types'
 
 // --- Helper ---
 
@@ -414,12 +414,38 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
   )
 }
 
+function formatNormalizedPrice(rawPrice: string | null, rawUnit: string, normalizedPrice: string | null | undefined, normalizedUnit: string | null | undefined): string {
+  const raw = formatPrice(rawPrice, rawUnit)
+  if (!normalizedPrice || !normalizedUnit) return raw
+  // Don't show normalized if it's the same unit
+  if (rawUnit === normalizedUnit) return raw
+  const normNum = parseFloat(normalizedPrice)
+  if (isNaN(normNum)) return raw
+  return `${raw} ($${normNum.toFixed(2)}/${normalizedUnit})`
+}
+
 function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
   if (detail.store_prices.length === 0) {
     return null
   }
 
   const unit = detail.product.default_unit ?? 'ea'
+
+  // Find normalized price info from price_history for each store
+  const storeNormalized = new Map<string, { normalized_price: string | null; normalized_unit: string | null }>()
+  for (const entry of detail.price_history) {
+    if (!storeNormalized.has(entry.store_id)) {
+      const priceEntry = detail.price_history.find(
+        (p) => p.store_id === entry.store_id
+      )
+      if (priceEntry) {
+        storeNormalized.set(entry.store_id, {
+          normalized_price: (priceEntry as PriceHistoryEntry & { normalized_price?: string | null }).normalized_price ?? null,
+          normalized_unit: (priceEntry as PriceHistoryEntry & { normalized_unit?: string | null }).normalized_unit ?? null,
+        })
+      }
+    }
+  }
 
   return (
     <div className="bg-white rounded-2xl shadow-subtle p-5">
@@ -435,25 +461,28 @@ function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
             </tr>
           </thead>
           <tbody>
-            {detail.store_prices.map((sp) => (
-              <tr
-                key={sp.store_id}
-                className={`border-b border-neutral-200 last:border-0 ${
-                  sp.is_cheapest ? 'bg-success-subtle/30' : ''
-                }`}
-              >
-                <td className="py-2.5 text-body-medium text-neutral-900">{sp.store_name}</td>
-                <td className={`py-2.5 text-right font-medium ${sp.is_cheapest ? 'text-success-dark' : 'text-neutral-600'}`}>
-                  {formatPrice(sp.latest_price, unit)}
-                </td>
-                <td className="py-2.5 text-right text-caption text-neutral-400">
-                  {sp.latest_date}
-                </td>
-                <td className="py-2.5 text-right">
-                  {sp.is_cheapest && <Badge variant="success">Best</Badge>}
-                </td>
-              </tr>
-            ))}
+            {detail.store_prices.map((sp) => {
+              const norm = storeNormalized.get(sp.store_id)
+              return (
+                <tr
+                  key={sp.store_id}
+                  className={`border-b border-neutral-200 last:border-0 ${
+                    sp.is_cheapest ? 'bg-success-subtle/30' : ''
+                  }`}
+                >
+                  <td className="py-2.5 text-body-medium text-neutral-900">{sp.store_name}</td>
+                  <td className={`py-2.5 text-right font-medium ${sp.is_cheapest ? 'text-success-dark' : 'text-neutral-600'}`}>
+                    {formatNormalizedPrice(sp.latest_price, unit, norm?.normalized_price, norm?.normalized_unit)}
+                  </td>
+                  <td className="py-2.5 text-right text-caption text-neutral-400">
+                    {sp.latest_date}
+                  </td>
+                  <td className="py-2.5 text-right">
+                    {sp.is_cheapest && <Badge variant="success">Best</Badge>}
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
