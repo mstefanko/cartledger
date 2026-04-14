@@ -31,7 +31,7 @@ function BuyAgainRow({ item }: { item: BuyAgainItem }) {
   return (
     <div className="flex items-center justify-between py-3 border-b border-neutral-200 last:border-b-0">
       <div className="flex items-center gap-3">
-        <span className="text-body">{urgencyEmoji(item.urgency_ratio)}</span>
+        <span role="img" aria-label={urgencyLabel(item.urgency_ratio)} className="text-body">{urgencyEmoji(item.urgency_ratio)}</span>
         <div>
           <Link
             to={`/products/${item.product_id}`}

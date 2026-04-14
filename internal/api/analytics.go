@@ -457,10 +457,19 @@ func (h *AnalyticsHandler) StoreSummary(c echo.Context) error {
 	return c.JSON(http.StatusOK, resp)
 }
 
-// Trips returns all receipts as trip items for charting.
-// GET /api/v1/analytics/trips
+// Trips returns receipts as trip items for charting, with pagination.
+// GET /api/v1/analytics/trips?limit=500&offset=0
 func (h *AnalyticsHandler) Trips(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
+
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
+	if offset < 0 {
+		offset = 0
+	}
 
 	rows, err := h.DB.Query(
 		`SELECT r.id, r.receipt_date, COALESCE(s.name, 'Unknown') as store_name,
@@ -469,8 +478,9 @@ func (h *AnalyticsHandler) Trips(c echo.Context) error {
 		 FROM receipts r
 		 LEFT JOIN stores s ON r.store_id = s.id
 		 WHERE r.household_id = ?
-		 ORDER BY r.receipt_date DESC`,
-		householdID,
+		 ORDER BY r.receipt_date DESC
+		 LIMIT ? OFFSET ?`,
+		householdID, limit, offset,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -495,10 +505,19 @@ func (h *AnalyticsHandler) Trips(c echo.Context) error {
 	return c.JSON(http.StatusOK, trips)
 }
 
-// Deals returns products where latest price is significantly below average.
-// GET /api/v1/analytics/deals
+// Deals returns products where latest price is significantly below average, with pagination.
+// GET /api/v1/analytics/deals?limit=100&offset=0
 func (h *AnalyticsHandler) Deals(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
+
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
+	if offset < 0 {
+		offset = 0
+	}
 
 	rows, err := h.DB.Query(
 		`SELECT p.id, p.name, s.name,
@@ -521,8 +540,9 @@ func (h *AnalyticsHandler) Deals(c echo.Context) error {
 		 ) stats ON stats.product_id = p.id
 		 WHERE p.household_id = ?
 		   AND COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) < stats.avg_price * 0.85
-		 ORDER BY (1.0 - COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) / stats.avg_price) DESC`,
-		householdID,
+		 ORDER BY (1.0 - COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) / stats.avg_price) DESC
+		 LIMIT ? OFFSET ?`,
+		householdID, limit, offset,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

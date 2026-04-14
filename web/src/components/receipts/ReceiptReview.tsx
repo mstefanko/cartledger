@@ -5,7 +5,7 @@ import { EditableTable, type AutocompleteOption } from '@/components/ui/Editable
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
-import { CreateRuleModal } from './CreateRuleModal'
+// CreateRuleModal replaced by inline batch rule modal
 import { getReceipt, updateLineItem, type ReceiptDetail } from '@/api/receipts'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
@@ -90,13 +90,11 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
     },
   })
 
-  // --- Rule modal state ---
-  const [ruleModal, setRuleModal] = useState<{
-    open: boolean
-    rawName: string
-    productName: string
-    productId: string
-  }>({ open: false, rawName: '', productName: '', productId: '' })
+  // --- Pending matches for batch rule creation ---
+  const [pendingRuleMatches, setPendingRuleMatches] = useState<
+    { rawName: string; productName: string; productId: string; selected: boolean }[]
+  >([])
+  const [batchRuleModalOpen, setBatchRuleModalOpen] = useState(false)
 
   // --- Raw JSON modal ---
   const [rawJsonOpen, setRawJsonOpen] = useState(false)
@@ -146,18 +144,22 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         matchMutation.mutate(
           { lineItemId: row.id, productId: value },
           {
-            onSuccess: (data) => {
+            onSuccess: () => {
               const matchedProduct = products.find((p) => p.id === value)
               if (matchedProduct) {
-                setRuleModal({
-                  open: true,
-                  rawName: row.raw_name,
-                  productName: matchedProduct.name,
-                  productId: value,
+                setPendingRuleMatches((prev) => {
+                  // Avoid duplicates for the same rawName + productId
+                  if (prev.some((m) => m.rawName === row.raw_name && m.productId === value)) {
+                    return prev
+                  }
+                  return [...prev, {
+                    rawName: row.raw_name,
+                    productName: matchedProduct.name,
+                    productId: value,
+                    selected: true,
+                  }]
                 })
               }
-              // If the server response indicates a rule suggestion, it's handled by the modal
-              void data
             },
           },
         )
@@ -244,12 +246,12 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
       },
       {
         accessorKey: 'raw_name',
-        header: 'Raw Name',
+        header: 'Receipt Text',
         size: 200,
       },
       {
         accessorKey: 'product_id',
-        header: 'Match',
+        header: 'Product',
         size: 220,
         meta: {
           editable: true,
@@ -292,7 +294,8 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         },
         cell: ({ row }) => {
           const price = row.original.total_price
-          return <span className="tabular-nums">${price}</span>
+          const formatted = '$' + Number(price).toFixed(2)
+          return <span className="tabular-nums">{formatted}</span>
         },
       },
     ],
@@ -353,7 +356,13 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
           <Button
             variant="primary"
             size="sm"
-            onClick={() => confirmMutation.mutate()}
+            onClick={() => {
+              if (pendingRuleMatches.length > 0 && receipt.status !== 'reviewed') {
+                setBatchRuleModalOpen(true)
+              } else {
+                confirmMutation.mutate()
+              }
+            }}
             disabled={confirmMutation.isPending || receipt.status === 'reviewed'}
           >
             {confirmMutation.isPending
@@ -387,17 +396,91 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         </pre>
       </Modal>
 
-      {/* Create rule modal */}
-      <CreateRuleModal
-        open={ruleModal.open}
-        onClose={() =>
-          setRuleModal((s) => ({ ...s, open: false }))
+      {/* Batch rule creation modal — shown after Confirm All */}
+      <Modal
+        open={batchRuleModalOpen}
+        onClose={() => {
+          setBatchRuleModalOpen(false)
+          setPendingRuleMatches([])
+          confirmMutation.mutate()
+        }}
+        title="Create Auto-Match Rules"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                setBatchRuleModalOpen(false)
+                setPendingRuleMatches([])
+                confirmMutation.mutate()
+              }}
+            >
+              Skip
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => {
+                const selected = pendingRuleMatches.filter((m) => m.selected)
+                // Create rules for selected matches then confirm
+                Promise.all(
+                  selected.map((m) =>
+                    import('@/api/matching').then((mod) =>
+                      mod.createRule({
+                        condition_op: 'exact',
+                        condition_val: m.rawName,
+                        product_id: m.productId,
+                        store_id: receipt.store_id ?? undefined,
+                      }),
+                    ),
+                  ),
+                ).finally(() => {
+                  setBatchRuleModalOpen(false)
+                  setPendingRuleMatches([])
+                  confirmMutation.mutate()
+                })
+              }}
+            >
+              Create Selected Rules & Confirm
+            </Button>
+          </>
         }
-        rawName={ruleModal.rawName}
-        productName={ruleModal.productName}
-        productId={ruleModal.productId}
-        storeId={receipt.store_id}
-      />
+      >
+        <p className="text-body text-neutral-900 mb-3">
+          You matched {pendingRuleMatches.length} new{' '}
+          {pendingRuleMatches.length === 1 ? 'item' : 'items'}. Create
+          auto-match rules for future receipts?
+        </p>
+        <div className="flex flex-col gap-2">
+          {pendingRuleMatches.map((match, idx) => (
+            <label
+              key={`${match.rawName}-${match.productId}`}
+              className="flex items-center gap-3 px-3 py-2 rounded-lg bg-neutral-50 cursor-pointer hover:bg-neutral-200/40"
+            >
+              <input
+                type="checkbox"
+                checked={match.selected}
+                onChange={() =>
+                  setPendingRuleMatches((prev) =>
+                    prev.map((m, i) =>
+                      i === idx ? { ...m, selected: !m.selected } : m,
+                    ),
+                  )
+                }
+                className="w-4 h-4 accent-brand"
+              />
+              <span className="text-caption text-neutral-600">
+                &ldquo;{match.rawName}&rdquo;
+              </span>
+              <span className="text-caption text-neutral-400 mx-1">&rarr;</span>
+              <span className="text-caption font-medium text-brand">
+                {match.productName}
+              </span>
+            </label>
+          ))}
+        </div>
+      </Modal>
     </div>
   )
 }

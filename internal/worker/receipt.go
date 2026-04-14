@@ -52,9 +52,18 @@ func NewReceiptWorker(concurrency int, llmClient llm.Client, matchEngine *matche
 	return w
 }
 
+// ErrQueueFull is returned when the worker queue cannot accept more jobs.
+var ErrQueueFull = fmt.Errorf("receipt processing queue is full")
+
 // Submit enqueues a receipt job for background processing.
-func (w *ReceiptWorker) Submit(job ReceiptJob) {
-	w.jobs <- job
+// Returns ErrQueueFull if the queue is at capacity, allowing the caller to return 503.
+func (w *ReceiptWorker) Submit(job ReceiptJob) error {
+	select {
+	case w.jobs <- job:
+		return nil
+	default:
+		return ErrQueueFull
+	}
 }
 
 // process is the main worker loop that pulls jobs from the channel and processes them.
@@ -260,7 +269,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			}
 
 			// Normalize price to standard unit (per oz, per fl_oz, per each).
-			normalizedPrice, normalizedUnit, normErr := units.NormalizePrice(totalPrice, quantity, unit, *productID, w.db)
+			normalizedPrice, normalizedUnit, normErr := units.NormalizePrice(totalPrice, quantity, unit, *productID, tx)
 			if normErr == nil {
 				_, _ = tx.Exec(
 					`UPDATE product_prices SET normalized_price = ?, normalized_unit = ? WHERE id = ?`,

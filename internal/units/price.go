@@ -1,7 +1,6 @@
 package units
 
 import (
-	"database/sql"
 	"fmt"
 
 	"github.com/shopspring/decimal"
@@ -11,8 +10,11 @@ import (
 // per fl_oz for volume, per each for count). It uses Convert() internally,
 // which checks product-specific overrides in the database.
 //
+// The db parameter accepts both *sql.DB and *sql.Tx via the Querier interface,
+// so callers within a transaction can pass the tx to avoid reading stale data.
+//
 // Returns the normalized price per standard unit and the standard unit name.
-func NormalizePrice(totalPrice, quantity decimal.Decimal, unit string, productID string, db *sql.DB) (decimal.Decimal, string, error) {
+func NormalizePrice(totalPrice, quantity decimal.Decimal, unit string, productID string, db Querier) (decimal.Decimal, string, error) {
 	unit = NormalizeUnit(unit)
 
 	if quantity.IsZero() {

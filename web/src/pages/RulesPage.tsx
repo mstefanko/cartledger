@@ -131,10 +131,10 @@ function RulesPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
-            Matching Rules
+            Auto-Match Rules
           </h1>
           <p className="mt-1 text-caption text-neutral-400">
-            Rules automatically match receipt line items to products. Lower priority numbers are evaluated first.
+            Automatically match receipt items to your products. Lower priority numbers are evaluated first.
           </p>
         </div>
         <Button size="sm" onClick={handleOpenCreate}>

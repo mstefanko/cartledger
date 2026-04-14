@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getList, updateList, updateItem, addItem, deleteItem } from '@/api/lists'
 import { listProducts } from '@/api/products'
@@ -293,6 +293,13 @@ function ShoppingListPage() {
         </div>
       )}
 
+      {/* Breadcrumb */}
+      <div className="mb-4">
+        <Link to="/lists" className="text-caption text-brand hover:underline">
+          &larr; Back to Lists
+        </Link>
+      </div>
+
       {/* Header */}
       <div className="flex items-start justify-between mb-6">
         <div className="flex-1 min-w-0">
@@ -538,22 +545,26 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
       >
-        {/* Checkbox */}
+        {/* Checkbox — 44px touch target for mobile accessibility */}
         <button
           type="button"
-          className="shrink-0 w-6 h-6 rounded-lg border-2 flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand"
-          style={{
-            borderColor: item.checked ? '#149e61' : '#dedee5',
-            backgroundColor: item.checked ? '#149e61' : 'transparent',
-          }}
+          className="shrink-0 w-11 h-11 rounded-lg flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand -m-1"
           onClick={() => onToggle(!item.checked)}
           aria-label={item.checked ? `Uncheck ${item.name}` : `Check ${item.name}`}
         >
-          {item.checked && (
-            <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-          )}
+          <span
+            className="w-6 h-6 rounded-lg border-2 flex items-center justify-center"
+            style={{
+              borderColor: item.checked ? '#149e61' : '#dedee5',
+              backgroundColor: item.checked ? '#149e61' : 'transparent',
+            }}
+          >
+            {item.checked && (
+              <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+            )}
+          </span>
         </button>
 
         {/* Item details */}
@@ -601,15 +612,15 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
           )}
         </div>
 
-        {/* Delete button (desktop) */}
+        {/* Delete button — always visible on mobile for discoverability, hover style on desktop */}
         <button
           type="button"
-          className="shrink-0 p-1.5 text-neutral-300 hover:text-expensive rounded-lg hover:bg-neutral-50 transition-colors hidden sm:block"
+          className="shrink-0 w-9 h-9 flex items-center justify-center text-neutral-300 sm:text-neutral-200 hover:text-expensive rounded-lg hover:bg-neutral-50 transition-colors"
           onClick={onDelete}
           aria-label={`Delete ${item.name}`}
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
           </svg>
         </button>
       </div>

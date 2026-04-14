@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,6 +14,10 @@ import (
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
 )
+
+// setupMu serializes setup requests to prevent the race condition where two
+// concurrent requests both pass the "no users exist" check before either writes.
+var setupMu sync.Mutex
 
 // emailRegex is a basic email format check: must contain @ with a dot after it.
 var emailRegex = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
@@ -56,13 +61,16 @@ type userResponse struct {
 	Name        string `json:"name"`
 }
 
-// RegisterRoutes mounts auth endpoints onto the given Echo group.
-func (h *AuthHandler) RegisterRoutes(public *echo.Group, protected *echo.Group) {
+// RegisterRoutes mounts auth endpoints onto the given Echo groups.
+// publicRateLimited applies rate limiting to login/setup/join to prevent brute-force attacks.
+func (h *AuthHandler) RegisterRoutes(public *echo.Group, publicRateLimited *echo.Group, protected *echo.Group) {
 	public.GET("/status", h.Status)
-	public.POST("/setup", h.Setup)
-	public.POST("/login", h.Login)
 	public.GET("/invite/:token/validate", h.ValidateInvite)
-	public.POST("/join", h.Join)
+
+	// Rate-limited auth endpoints: 10 requests/minute per IP.
+	publicRateLimited.POST("/setup", h.Setup)
+	publicRateLimited.POST("/login", h.Login)
+	publicRateLimited.POST("/join", h.Join)
 
 	protected.POST("/invite", h.CreateInvite)
 }
@@ -95,15 +103,18 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
 	}
 
-	// BEGIN IMMEDIATE to serialize with any concurrent setup attempts.
+	// Serialize setup requests with a mutex to prevent the TOCTOU race where
+	// SQLite's deferred BEGIN lets two concurrent requests both pass the
+	// "no users exist" check before either writes.
+	setupMu.Lock()
+	defer setupMu.Unlock()
+
 	tx, err := h.DB.Begin()
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	defer tx.Rollback()
 
-	// Execute PRAGMA to get immediate lock (SQLite BEGIN IMMEDIATE equivalent via exec).
-	// With modernc.org/sqlite we use a workaround: check count inside the transaction.
 	var count int
 	if err := tx.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

@@ -43,6 +43,11 @@ function StoreViewPage() {
 
   return (
     <div className="py-8">
+      <div className="mb-4">
+        <Link to="/" className="text-caption text-brand hover:underline">
+          &larr; Back to Dashboard
+        </Link>
+      </div>
       <div className="flex items-center gap-3">
         {summary.store.icon && <span className="text-section">{summary.store.icon}</span>}
         <h1 className="font-display text-section font-bold text-neutral-900 tracking-tight">

@@ -7,6 +7,12 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// Querier is an interface satisfied by both *sql.DB and *sql.Tx, allowing
+// unit conversion lookups to participate in an existing transaction.
+type Querier interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
 // Standard base units for each measurement category.
 const (
 	StandardWeight = "oz"
@@ -97,7 +103,7 @@ func StandardUnit(unit string) string {
 // table), then falls back to built-in conversion tables.
 //
 // If db is nil, only built-in conversions are used.
-func Convert(qty decimal.Decimal, fromUnit, toUnit string, productID string, db *sql.DB) (decimal.Decimal, error) {
+func Convert(qty decimal.Decimal, fromUnit, toUnit string, productID string, db Querier) (decimal.Decimal, error) {
 	fromUnit = NormalizeUnit(fromUnit)
 	toUnit = NormalizeUnit(toUnit)
 
@@ -143,7 +149,7 @@ func Convert(qty decimal.Decimal, fromUnit, toUnit string, productID string, db 
 
 // lookupConversion checks the unit_conversions table for a matching factor.
 // It first checks product-specific conversions, then generic (NULL product_id).
-func lookupConversion(db *sql.DB, fromUnit, toUnit, productID string) (decimal.Decimal, error) {
+func lookupConversion(db Querier, fromUnit, toUnit, productID string) (decimal.Decimal, error) {
 	var factorStr string
 
 	// Product-specific conversion first.

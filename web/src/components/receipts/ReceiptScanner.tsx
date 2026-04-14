@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { scanReceipt } from '@/api/receipts'
 import { getWebSocket } from '@/api/ws'
@@ -15,7 +15,7 @@ interface ImageEntry {
   previewUrl: string
 }
 
-type ScannerPhase = 'capture' | 'uploading' | 'processing' | 'error'
+type ScannerPhase = 'capture' | 'uploading' | 'processing' | 'timeout' | 'error'
 
 function validateFile(file: File): string | null {
   if (!ACCEPTED_TYPES.includes(file.type)) {
@@ -70,6 +70,15 @@ function ReceiptScanner() {
       ws.removeEventListener('message', handleMessage)
     }
   }, [phase, navigate])
+
+  // 60-second timeout for processing phase
+  useEffect(() => {
+    if (phase !== 'processing') return
+    const timer = setTimeout(() => {
+      setPhase('timeout')
+    }, 60_000)
+    return () => clearTimeout(timer)
+  }, [phase])
 
   const uploadMutation = useMutation<Receipt, Error, File[]>({
     mutationFn: scanReceipt,
@@ -152,6 +161,31 @@ function ReceiptScanner() {
     setError(null)
     setPhase('capture')
   }, [])
+
+  // --- Timeout state ---
+  if (phase === 'timeout') {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
+          <svg className="h-8 w-8 text-amber-800" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        </div>
+        <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
+          Processing is taking longer than expected
+        </p>
+        <p className="mt-2 text-body text-neutral-400">
+          The receipt may still be processing in the background. You can check back on the Receipts page.
+        </p>
+        <Link
+          to="/receipts"
+          className="mt-6 inline-flex items-center gap-2 text-body font-medium text-brand hover:underline"
+        >
+          Go to Receipts
+        </Link>
+      </div>
+    )
+  }
 
   // --- Processing state ---
   if (phase === 'processing') {

@@ -113,9 +113,10 @@ function EditableCell({
       onKeyDown={handleCellKeyDown}
       className={[
         'w-full h-full px-2 py-1 text-caption font-body text-neutral-900 cursor-pointer truncate',
-        'leading-[36px]',
+        'leading-[36px] border-b border-dashed border-neutral-200 hover:border-neutral-400 hover:bg-neutral-50/50 transition-colors',
         isActive ? 'ring-2 ring-brand ring-inset rounded-sm' : '',
       ].join(' ')}
+      title="Click to edit"
     >
       {value}
     </div>

@@ -48,25 +48,31 @@ type createConversionRequest struct {
 // to that product plus generic conversions. Otherwise returns all.
 // GET /api/v1/conversions
 func (h *ConversionHandler) List(c echo.Context) error {
-	_ = auth.HouseholdIDFrom(c)
+	householdID := auth.HouseholdIDFrom(c)
 	productID := c.QueryParam("product_id")
 
 	var rows *sql.Rows
 	var err error
 
 	if productID != "" {
+		// Return conversions for a specific product (must belong to household) plus generic ones.
 		rows, err = h.DB.Query(
-			`SELECT id, product_id, from_unit, to_unit, factor
-			 FROM unit_conversions
-			 WHERE product_id = ? OR product_id IS NULL
-			 ORDER BY product_id IS NULL, from_unit`,
-			productID,
+			`SELECT uc.id, uc.product_id, uc.from_unit, uc.to_unit, uc.factor
+			 FROM unit_conversions uc
+			 LEFT JOIN products p ON uc.product_id = p.id
+			 WHERE (uc.product_id = ? AND p.household_id = ?) OR uc.product_id IS NULL
+			 ORDER BY uc.product_id IS NULL, uc.from_unit`,
+			productID, householdID,
 		)
 	} else {
+		// Return all conversions that are generic or belong to products in this household.
 		rows, err = h.DB.Query(
-			`SELECT id, product_id, from_unit, to_unit, factor
-			 FROM unit_conversions
-			 ORDER BY product_id IS NULL, from_unit`,
+			`SELECT uc.id, uc.product_id, uc.from_unit, uc.to_unit, uc.factor
+			 FROM unit_conversions uc
+			 LEFT JOIN products p ON uc.product_id = p.id
+			 WHERE uc.product_id IS NULL OR p.household_id = ?
+			 ORDER BY uc.product_id IS NULL, uc.from_unit`,
+			householdID,
 		)
 	}
 	if err != nil {
@@ -94,7 +100,7 @@ func (h *ConversionHandler) List(c echo.Context) error {
 // Create adds a new unit conversion.
 // POST /api/v1/conversions
 func (h *ConversionHandler) Create(c echo.Context) error {
-	_ = auth.HouseholdIDFrom(c)
+	householdID := auth.HouseholdIDFrom(c)
 
 	var req createConversionRequest
 	if err := c.Bind(&req); err != nil {
@@ -115,6 +121,21 @@ func (h *ConversionHandler) Create(c echo.Context) error {
 	}
 	if factor.IsZero() || factor.IsNegative() {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "factor must be positive"})
+	}
+
+	// If product_id is provided, verify it belongs to this household.
+	if req.ProductID != nil && *req.ProductID != "" {
+		var exists int
+		err = h.DB.QueryRow(
+			"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+			*req.ProductID, householdID,
+		).Scan(&exists)
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
 	}
 
 	id := uuid.New().String()
@@ -142,16 +163,40 @@ func (h *ConversionHandler) Create(c echo.Context) error {
 // Delete removes a unit conversion.
 // DELETE /api/v1/conversions/:id
 func (h *ConversionHandler) Delete(c echo.Context) error {
-	_ = auth.HouseholdIDFrom(c)
+	householdID := auth.HouseholdIDFrom(c)
 	convID := c.Param("id")
 
-	result, err := h.DB.Exec("DELETE FROM unit_conversions WHERE id = ?", convID)
+	// Verify the conversion is either generic (no product_id) or belongs to
+	// a product in the caller's household before deleting.
+	var productID *string
+	err := h.DB.QueryRow(
+		"SELECT product_id FROM unit_conversions WHERE id = ?", convID,
+	).Scan(&productID)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "conversion not found"})
+	}
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "conversion not found"})
+
+	// If product-specific, verify the product belongs to this household.
+	if productID != nil {
+		var exists int
+		err = h.DB.QueryRow(
+			"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+			*productID, householdID,
+		).Scan(&exists)
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "conversion not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
+
+	_, err = h.DB.Exec("DELETE FROM unit_conversions WHERE id = ?", convID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
 	return c.NoContent(http.StatusNoContent)

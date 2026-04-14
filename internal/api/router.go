@@ -5,8 +5,11 @@ import (
 	"io/fs"
 	"net/http"
 
+	"time"
+
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"golang.org/x/time/rate"
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
@@ -52,8 +55,28 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	v1 := e.Group("/api/v1")
 
-	// Public routes (no auth required).
+	// Public routes (no auth required), with rate limiting on auth endpoints.
 	public := v1.Group("")
+	authRateLimiter := middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
+		Skipper: middleware.DefaultSkipper,
+		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
+			middleware.RateLimiterMemoryStoreConfig{
+				Rate:      rate.Every(6 * time.Second), // 10 requests per minute
+				Burst:     10,
+				ExpiresIn: 3 * time.Minute,
+			},
+		),
+		IdentifierExtractor: func(ctx echo.Context) (string, error) {
+			return ctx.RealIP(), nil
+		},
+		ErrorHandler: func(context echo.Context, err error) error {
+			return context.JSON(http.StatusForbidden, map[string]string{"error": "rate limit identifier error"})
+		},
+		DenyHandler: func(context echo.Context, identifier string, err error) error {
+			return context.JSON(http.StatusTooManyRequests, map[string]string{"error": "too many requests, please try again later"})
+		},
+	})
+	publicRateLimited := v1.Group("", authRateLimiter)
 
 	// Protected routes (auth required).
 	protected := v1.Group("")
@@ -67,7 +90,7 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	// --- Mount handlers ---
 
 	authHandler := &AuthHandler{DB: database, Cfg: cfg}
-	authHandler.RegisterRoutes(public, protected)
+	authHandler.RegisterRoutes(public, publicRateLimited, protected)
 
 	storeHandler := &StoreHandler{DB: database, Cfg: cfg}
 	storeHandler.RegisterRoutes(protected)

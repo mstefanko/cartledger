@@ -1,5 +1,5 @@
 import { useRef, useCallback } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
 import { getReceipt, type ReceiptDetail } from '@/api/receipts'
@@ -40,6 +40,11 @@ function ReceiptReviewPage() {
 
   return (
     <div className="py-6">
+      <div className="mb-4">
+        <Link to="/receipts" className="text-caption text-brand hover:underline">
+          &larr; Back to Receipts
+        </Link>
+      </div>
       <h1 className="font-display text-subhead font-bold text-neutral-900 mb-6">
         Review Receipt
       </h1>

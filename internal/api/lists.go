@@ -253,30 +253,68 @@ func (h *ListHandler) Get(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// For items with a product_id, find cheapest store.
-	for i, item := range resp.Items {
-		if item.ProductID == nil {
-			continue
+	// Batch query: find cheapest store for all items with a product_id.
+	productIDs := make([]string, 0)
+	productIDSet := make(map[string]bool)
+	for _, item := range resp.Items {
+		if item.ProductID != nil && !productIDSet[*item.ProductID] {
+			productIDs = append(productIDs, *item.ProductID)
+			productIDSet[*item.ProductID] = true
 		}
-		var storeName string
-		var price float64
-		err := h.DB.QueryRow(
-			`SELECT s.name, pp.unit_price
-			 FROM product_prices pp
-			 JOIN stores s ON pp.store_id = s.id
-			 WHERE pp.product_id = ?
-			 AND pp.receipt_date = (
-			     SELECT MAX(pp2.receipt_date) FROM product_prices pp2
-			     WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
-			 )
-			 ORDER BY pp.unit_price ASC
-			 LIMIT 1`,
-			*item.ProductID,
-		).Scan(&storeName, &price)
+	}
+
+	if len(productIDs) > 0 {
+		// Build placeholders for IN clause.
+		placeholders := make([]string, len(productIDs))
+		args := make([]interface{}, len(productIDs))
+		for i, pid := range productIDs {
+			placeholders[i] = "?"
+			args[i] = pid
+		}
+
+		cheapestRows, err := h.DB.Query(
+			fmt.Sprintf(
+				`SELECT sub.product_id, s.name, sub.unit_price
+				 FROM (
+				     SELECT pp.product_id, pp.store_id, pp.unit_price,
+				            ROW_NUMBER() OVER (PARTITION BY pp.product_id ORDER BY pp.unit_price ASC) AS rn
+				     FROM product_prices pp
+				     WHERE pp.product_id IN (%s)
+				       AND pp.receipt_date = (
+				           SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+				           WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+				       )
+				 ) sub
+				 JOIN stores s ON sub.store_id = s.id
+				 WHERE sub.rn = 1`,
+				strings.Join(placeholders, ",")),
+			args...,
+		)
 		if err == nil {
-			resp.Items[i].CheapestStore = &storeName
-			p := fmt.Sprintf("%.2f", price)
-			resp.Items[i].CheapestPrice = &p
+			defer cheapestRows.Close()
+			type cheapestInfo struct {
+				StoreName string
+				Price     float64
+			}
+			cheapestMap := make(map[string]cheapestInfo)
+			for cheapestRows.Next() {
+				var productID, storeName string
+				var price float64
+				if cheapestRows.Scan(&productID, &storeName, &price) == nil {
+					cheapestMap[productID] = cheapestInfo{StoreName: storeName, Price: price}
+				}
+			}
+
+			for i, item := range resp.Items {
+				if item.ProductID == nil {
+					continue
+				}
+				if info, ok := cheapestMap[*item.ProductID]; ok {
+					resp.Items[i].CheapestStore = &info.StoreName
+					p := fmt.Sprintf("%.2f", info.Price)
+					resp.Items[i].CheapestPrice = &p
+				}
+			}
 		}
 	}
 

@@ -175,11 +175,13 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	}
 
 	// Submit to worker for background processing.
-	h.Worker.Submit(worker.ReceiptJob{
+	if err := h.Worker.Submit(worker.ReceiptJob{
 		ReceiptID:   receiptID,
 		HouseholdID: householdID,
 		ImageDir:    imageDir,
-	})
+	}); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "server busy, please try again later"})
+	}
 
 	return c.JSON(http.StatusAccepted, map[string]string{
 		"id":     receiptID,

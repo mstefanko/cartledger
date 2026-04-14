@@ -97,6 +97,10 @@ func (h *ProductHandler) List(c echo.Context) error {
 	var err error
 
 	if q != "" {
+		// Sanitize search input: wrap in double quotes to treat as literal phrase,
+		// escaping any embedded double quotes. This prevents FTS5 operator injection.
+		sanitizedQ := `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
+
 		// FTS5 search — scope to household via JOIN.
 		rows, err = h.DB.Query(
 			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
@@ -105,7 +109,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 			 JOIN products_fts f ON p.rowid = f.rowid
 			 WHERE products_fts MATCH ? AND p.household_id = ?
 			 ORDER BY rank`,
-			q, householdID,
+			sanitizedQ, householdID,
 		)
 	} else {
 		rows, err = h.DB.Query(
@@ -231,6 +235,19 @@ func (h *ProductHandler) Delete(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
 
+	// Verify the product exists and belongs to this household BEFORE touching files.
+	var exists int
+	err := h.DB.QueryRow(
+		"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+		productID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
 	// Clean up image files before deleting the DB row.
 	rows, err := h.DB.Query("SELECT image_path FROM product_images WHERE product_id = ?", productID)
 	if err == nil {
@@ -247,16 +264,12 @@ func (h *ProductHandler) Delete(c echo.Context) error {
 	productDir := filepath.Join(h.Cfg.DataDir, "products", productID)
 	os.RemoveAll(productDir)
 
-	result, err := h.DB.Exec(
+	_, err = h.DB.Exec(
 		"DELETE FROM products WHERE id = ? AND household_id = ?",
 		productID, householdID,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
 	}
 
 	return c.NoContent(http.StatusNoContent)

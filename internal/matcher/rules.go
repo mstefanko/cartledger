@@ -1,10 +1,14 @@
 package matcher
 
 import (
+	"context"
 	"database/sql"
 	"regexp"
 	"strings"
+	"time"
 )
+
+const maxRegexPatternLen = 200
 
 // matchByRules queries matching_rules by priority DESC and evaluates each rule's condition
 // against the normalized item name. Returns nil if no rule matches.
@@ -53,11 +57,26 @@ func evaluateCondition(normalized, conditionVal, op string) bool {
 	case "starts_with":
 		return strings.HasPrefix(normalized, conditionVal)
 	case "matches":
+		if len(conditionVal) > maxRegexPatternLen {
+			return false
+		}
 		re, err := regexp.Compile(conditionVal)
 		if err != nil {
 			return false
 		}
-		return re.MatchString(normalized)
+		// Run the match in a goroutine with a 100ms timeout to prevent ReDoS.
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		resultCh := make(chan bool, 1)
+		go func() {
+			resultCh <- re.MatchString(normalized)
+		}()
+		select {
+		case result := <-resultCh:
+			return result
+		case <-ctx.Done():
+			return false
+		}
 	default:
 		return false
 	}

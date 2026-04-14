@@ -21,6 +21,10 @@ import (
 func main() {
 	cfg := config.Load()
 
+	if cfg.JWTSecret == "change-me-in-production" {
+		log.Println("WARNING: Using default JWT secret. Set JWT_SECRET environment variable for production.")
+	}
+
 	// Open SQLite database with pragmas.
 	database, err := db.Open(cfg.DBPath())
 	if err != nil {
