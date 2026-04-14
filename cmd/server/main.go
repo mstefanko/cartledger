@@ -46,10 +46,26 @@ func main() {
 	switch cfg.LLMProvider {
 	case "claude":
 		llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey)
+	case "claude-cli":
+		cli, err := llm.NewCLIClient()
+		if err != nil {
+			log.Fatalf("claude-cli provider: %v", err)
+		}
+		llmClient = cli
+		log.Println("using Claude CLI (subscription billing)")
 	case "mock":
 		llmClient = llm.NewMockClient()
 	default:
-		llmClient = llm.NewMockClient()
+		// Auto-detect: use API if key is set, else try CLI, else mock.
+		if cfg.AnthropicAPIKey != "" {
+			llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey)
+		} else if cli, err := llm.NewCLIClient(); err == nil {
+			llmClient = cli
+			log.Println("no API key found, using Claude CLI (subscription billing)")
+		} else {
+			llmClient = llm.NewMockClient()
+			log.Println("no API key or Claude CLI found, using mock provider")
+		}
 	}
 
 	// Create matching engine and receipt worker.

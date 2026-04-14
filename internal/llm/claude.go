@@ -19,8 +19,13 @@ type ClaudeClient struct {
 }
 
 // NewClaudeClient creates a new Claude LLM client.
+// If apiKey is empty, the SDK falls back to the ANTHROPIC_API_KEY environment variable.
 func NewClaudeClient(apiKey string) *ClaudeClient {
-	client := anthropic.NewClient(option.WithAPIKey(apiKey))
+	var opts []option.RequestOption
+	if apiKey != "" {
+		opts = append(opts, option.WithAPIKey(apiKey))
+	}
+	client := anthropic.NewClient(opts...)
 	return &ClaudeClient{
 		client: &client,
 		model:  "claude-sonnet-4-20250514",

@@ -11,7 +11,7 @@ type Config struct {
 	DataDir        string
 	AnthropicAPIKey string
 	GeminiAPIKey   string
-	LLMProvider    string // "claude", "gemini", "mock"
+	LLMProvider    string // "claude", "claude-cli", "gemini", "mock" (empty = auto-detect)
 	JWTSecret      string
 	MealieURL      string
 	MealieToken    string
@@ -24,7 +24,7 @@ func Load() *Config {
 		DataDir:        getEnv("DATA_DIR", "./data"),
 		AnthropicAPIKey: getEnv("ANTHROPIC_API_KEY", ""),
 		GeminiAPIKey:   getEnv("GEMINI_API_KEY", ""),
-		LLMProvider:    getEnv("LLM_PROVIDER", "claude"),
+		LLMProvider:    getEnv("LLM_PROVIDER", ""),
 		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-production"),
 		MealieURL:      getEnv("MEALIE_URL", ""),
 		MealieToken:    getEnv("MEALIE_TOKEN", ""),
