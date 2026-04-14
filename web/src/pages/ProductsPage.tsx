@@ -2,14 +2,18 @@ import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { listProducts, createProduct, updateProduct } from '@/api/products'
+import { getProductsWithTrends } from '@/api/analytics'
 import { Button } from '@/components/ui/Button'
+import { Badge } from '@/components/ui/Badge'
+import { Sparkline } from '@/components/ui/Sparkline'
 import { EditableTable } from '@/components/ui/EditableTable'
 import type { ColumnDef, CellContext } from '@tanstack/react-table'
-import type { Product } from '@/types'
+import type { Product, ProductTrend } from '@/types'
 
 interface ProductRow extends Product {
   alias_count: number
   last_price: string | null
+  trend: ProductTrend | null
 }
 
 function ProductsPage() {
@@ -37,6 +41,11 @@ function ProductsPage() {
     queryFn: () => listProducts(debouncedSearch ? { search: debouncedSearch } : undefined),
   })
 
+  const { data: productsWithTrends } = useQuery({
+    queryKey: ['analytics', 'products-trends'],
+    queryFn: () => getProductsWithTrends(),
+  })
+
   const updateMutation = useMutation({
     mutationFn: ({ id, data }: { id: string; data: { name?: string; category?: string; default_unit?: string } }) =>
       updateProduct(id, data),
@@ -52,14 +61,25 @@ function ProductsPage() {
     },
   })
 
+  const trendMap = useMemo(() => {
+    const map = new Map<string, ProductTrend>()
+    if (productsWithTrends) {
+      for (const pwt of productsWithTrends) {
+        if (pwt.trend) map.set(pwt.product.id, pwt.trend)
+      }
+    }
+    return map
+  }, [productsWithTrends])
+
   const rows: ProductRow[] = useMemo(() => {
     if (!products) return []
     return products.map((p) => ({
       ...p,
       alias_count: 0,
       last_price: null,
+      trend: trendMap.get(p.id) ?? null,
     }))
-  }, [products])
+  }, [products, trendMap])
 
   const handleCellUpdate = useCallback(
     (rowIndex: number, columnId: string, value: string) => {
@@ -150,6 +170,34 @@ function ProductsPage() {
           const num = parseFloat(val)
           if (isNaN(num)) return '\u2014'
           return `$${num.toFixed(2)}`
+        },
+      },
+      {
+        id: 'sparkline',
+        header: 'Trend',
+        size: 100,
+        cell: ({ row }: CellContext<ProductRow, unknown>) => {
+          const t = row.original.trend
+          if (!t) return <span className="text-small text-neutral-400">&mdash;</span>
+          const sparkData = t.sparkline.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
+          if (sparkData.length < 2) return <span className="text-small text-neutral-400">&mdash;</span>
+          return <Sparkline data={sparkData} />
+        },
+      },
+      {
+        id: 'price_change',
+        header: '% Change',
+        size: 90,
+        cell: ({ row }: CellContext<ProductRow, unknown>) => {
+          const t = row.original.trend
+          if (!t) return <span className="text-small text-neutral-400">&mdash;</span>
+          const pct = t.percent_change
+          const variant = pct > 0 ? 'warning' : pct < 0 ? 'success' : 'neutral'
+          return (
+            <Badge variant={variant}>
+              {pct > 0 ? '+' : ''}{pct.toFixed(1)}%
+            </Badge>
+          )
         },
       },
     ],

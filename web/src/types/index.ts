@@ -508,3 +508,74 @@ export interface WSListItemUpdated {
     item_id: string
   }
 }
+
+// --- Analytics Types ---
+
+export interface AnalyticsOverview {
+  spent_this_month: string
+  spent_last_month: string
+  percent_change: number
+  trip_count: number
+  avg_trip_cost: string
+}
+
+export interface SparklinePoint {
+  date: string
+  price: string
+  store: string
+}
+
+export interface ProductTrend {
+  product_id: string
+  product_name: string
+  sparkline: SparklinePoint[]
+  percent_change: number
+  min_price: string
+  max_price: string
+  avg_price: string
+  current_price: string
+}
+
+export interface ProductWithTrend {
+  product: Product
+  trend: ProductTrend | null
+}
+
+export interface StoreSummary {
+  store: Store
+  total_spent: string
+  item_count: number
+  trip_count: number
+  avg_trip_cost: string
+  price_leaders: { product_name: string; price: string; savings: string }[]
+  recent_trips: Trip[]
+}
+
+export interface Trip {
+  receipt_id: string
+  store_id: string
+  store_name: string
+  date: string
+  total: string
+  item_count: number
+}
+
+export interface Deal {
+  product_id: string
+  product_name: string
+  store_name: string
+  current_price: string
+  avg_price: string
+  savings_percent: number
+}
+
+export interface BuyAgainItem {
+  product_id: string
+  product_name: string
+  avg_days_between: number
+  days_since_last: number
+  est_supply_days: number
+  urgency_ratio: number
+  last_quantity: string
+  last_store: string
+}

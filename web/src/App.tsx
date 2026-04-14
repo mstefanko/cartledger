@@ -15,6 +15,8 @@ import ListsIndexPage from '@/pages/ListsIndexPage'
 import ShoppingListPage from '@/pages/ShoppingListPage'
 import ImportPage from '@/pages/ImportPage'
 import ConversionsPage from '@/pages/ConversionsPage'
+import AnalyticsPage from '@/pages/AnalyticsPage'
+import StoreViewPage from '@/pages/StoreViewPage'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -102,8 +104,8 @@ function AppRoutes() {
       >
         <Route index element={<DashboardPage />} />
         {/* Placeholder routes — pages will be implemented in later layers */}
-        <Route path="stores/:id" element={<PlaceholderPage title="Store Details" />} />
-        <Route path="analytics" element={<PlaceholderPage title="Analytics" />} />
+        <Route path="stores/:id" element={<StoreViewPage />} />
+        <Route path="analytics" element={<AnalyticsPage />} />
         <Route path="products" element={<ProductsPage />} />
         <Route path="products/:id" element={<ProductDetailPage />} />
         <Route path="lists" element={<ListsIndexPage />} />
@@ -119,15 +121,6 @@ function AppRoutes() {
       {/* Catch-all */}
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
-  )
-}
-
-function PlaceholderPage({ title }: { title: string }) {
-  return (
-    <div className="py-8">
-      <h1 className="font-display text-subhead font-bold text-neutral-900">{title}</h1>
-      <p className="mt-2 text-body text-neutral-400">This page is coming soon.</p>
-    </div>
   )
 }
 
