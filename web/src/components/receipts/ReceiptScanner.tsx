@@ -184,7 +184,7 @@ function ReceiptScanner() {
         return
       }
 
-      if (message.type === 'receipt.processed' && pendingReceiptId.current) {
+      if (message.type === 'receipt.complete' && pendingReceiptId.current) {
         const payload = message.payload as { receipt_id?: string }
         if (payload.receipt_id === pendingReceiptId.current) {
           navigate(`/receipts/${pendingReceiptId.current}`)

@@ -120,10 +120,12 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	})
 
 	// 2. Send to LLM vision API.
+	log.Printf("worker: calling LLM for receipt %s (%d images, provider=%s)", job.ReceiptID, len(images), w.llmClient.Provider())
 	extraction, err := w.llmClient.ExtractReceipt(images)
 	if err != nil {
 		return fmt.Errorf("llm extraction: %w", err)
 	}
+	log.Printf("worker: LLM returned for receipt %s (store=%s, items=%d)", job.ReceiptID, extraction.StoreName, len(extraction.Items))
 
 	// 3. Store raw_llm_json on the receipt.
 	rawJSON, err := json.Marshal(extraction)
@@ -162,26 +164,29 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 
 		// Phase 2: Store number + name prefix match
 		if err == sql.ErrNoRows && extraction.StoreNumber != nil {
-			baseName := strings.Fields(extraction.StoreName)[0]
-			err = tx.QueryRow(
-				`SELECT id FROM stores WHERE household_id = ? AND store_number = ? AND LOWER(name) LIKE LOWER(? || '%')`,
-				job.HouseholdID, *extraction.StoreNumber, baseName,
-			).Scan(&storeID)
+			if fields := strings.Fields(extraction.StoreName); len(fields) > 0 {
+				err = tx.QueryRow(
+					`SELECT id FROM stores WHERE household_id = ? AND store_number = ? AND LOWER(name) LIKE LOWER(? || '%')`,
+					job.HouseholdID, *extraction.StoreNumber, fields[0],
+				).Scan(&storeID)
+			}
 		}
 
 		if err == sql.ErrNoRows {
 			storeID = uuid.New().String()
+			log.Printf("worker: creating new store %q (id=%s)", extraction.StoreName, storeID)
 			_, err = tx.Exec(
 				`INSERT INTO stores (id, household_id, name, address, city, state, zip, store_number, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				storeID, job.HouseholdID, extraction.StoreName,
-				extraction.StoreAddress, nilPtrStr(extraction.StoreCity),
+				nilPtrStr(extraction.StoreAddress), nilPtrStr(extraction.StoreCity),
 				nilPtrStr(extraction.StoreState), nilPtrStr(extraction.StoreZip),
 				nilPtrStr(extraction.StoreNumber), now, now,
 			)
 			if err != nil {
 				return fmt.Errorf("create store: %w", err)
 			}
+			log.Printf("worker: store created successfully")
 		} else if err != nil {
 			return fmt.Errorf("lookup store: %w", err)
 		} else {
@@ -194,13 +199,14 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 				store_number = COALESCE(store_number, ?),
 				updated_at = ?
 				WHERE id = ?`,
-				extraction.StoreAddress, nilPtrStr(extraction.StoreCity),
+				nilPtrStr(extraction.StoreAddress), nilPtrStr(extraction.StoreCity),
 				nilPtrStr(extraction.StoreState), nilPtrStr(extraction.StoreZip),
 				nilPtrStr(extraction.StoreNumber), now, storeID)
 		}
 	}
 
 	// Update receipt with extraction data.
+	log.Printf("worker: updating receipt %s with extraction data", job.ReceiptID)
 	_, err = tx.Exec(
 		`UPDATE receipts SET store_id = ?, receipt_date = ?, receipt_time = ?,
 		 subtotal = ?, tax = ?, total = ?,

@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"io/fs"
 	"net/http"
-
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -122,6 +122,19 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	analyticsHandler := &AnalyticsHandler{DB: database, Cfg: cfg}
 	analyticsHandler.RegisterRoutes(protected)
 
+	// Serve uploaded receipt images. Paths stored in DB are relative to
+	// the working directory (e.g., "data/receipts/{id}/1.jpg").
+	protected.GET("/files/*", func(c echo.Context) error {
+		filePath := c.Param("*")
+
+		// Path traversal protection.
+		if containsDotDot(filePath) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
+		}
+
+		return c.File(filePath)
+	})
+
 	// WebSocket endpoint (auth via query param, not middleware).
 	wsHandler := &WSHandler{Hub: hub, JWTSecret: cfg.JWTSecret}
 	v1.GET("/ws", wsHandler.HandleWS)
@@ -150,4 +163,14 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	})
 
 	return e
+}
+
+// containsDotDot checks for path traversal attempts.
+func containsDotDot(path string) bool {
+	for _, seg := range strings.Split(path, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
