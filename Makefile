@@ -1,5 +1,11 @@
 PORT ?= 8079
 
+# Load .env if it exists (exports vars for all targets)
+ifneq (,$(wildcard .env))
+  include .env
+  export
+endif
+
 .PHONY: run kill restart build dev
 
 # Kill server and any orphaned claude CLI subprocesses

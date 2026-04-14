@@ -10,7 +10,7 @@ const MAX_IMAGES = 5
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
 const ACCEPTED_TYPES = ['image/jpeg', 'image/png']
 const RESIZE_MAX_DIM = 1600 // max width or height in px
-const RESIZE_QUALITY = 0.70 // lower quality is fine for text-on-paper receipts
+const RESIZE_QUALITY = 0.85
 
 interface ImageEntry {
   file: File
@@ -42,17 +42,16 @@ async function resizeImage(file: File): Promise<File> {
     const bitmap = await createImageBitmap(file)
     const { width, height } = bitmap
 
-    // Even if within bounds, still convert to grayscale for smaller file size
-    let targetW = width
-    let targetH = height
-    const needsResize = width > RESIZE_MAX_DIM || height > RESIZE_MAX_DIM
+    // Skip if already within bounds
+    if (width <= RESIZE_MAX_DIM && height <= RESIZE_MAX_DIM) {
+      bitmap.close()
+      return file
+    }
 
     // Calculate target dimensions preserving aspect ratio
-    if (needsResize) {
-      const scale = Math.min(RESIZE_MAX_DIM / width, RESIZE_MAX_DIM / height)
-      targetW = Math.round(width * scale)
-      targetH = Math.round(height * scale)
-    }
+    const scale = Math.min(RESIZE_MAX_DIM / width, RESIZE_MAX_DIM / height)
+    let targetW = Math.round(width * scale)
+    let targetH = Math.round(height * scale)
 
     // Step-down resize: halve dimensions until we're within 2x of target.
     // This produces much better quality than a single large downscale.
@@ -74,9 +73,7 @@ async function resizeImage(file: File): Promise<File> {
       srcH = halfH
     }
 
-    // Final draw to target size, converting to grayscale.
-    // Receipts are black text on white paper — color adds no information
-    // but triples the pixel data sent to the LLM.
+    // Final draw to target size
     const canvas = document.createElement('canvas')
     canvas.width = targetW
     canvas.height = targetH
@@ -84,15 +81,6 @@ async function resizeImage(file: File): Promise<File> {
     ctx.imageSmoothingQuality = 'high'
     ctx.drawImage(source, 0, 0, targetW, targetH)
     if (source instanceof ImageBitmap) source.close()
-
-    // Convert to grayscale via pixel manipulation (works in all browsers)
-    const imageData = ctx.getImageData(0, 0, targetW, targetH)
-    const data = imageData.data
-    for (let i = 0; i < data.length; i += 4) {
-      const gray = data[i]! * 0.299 + data[i + 1]! * 0.587 + data[i + 2]! * 0.114
-      data[i] = data[i + 1] = data[i + 2] = gray
-    }
-    ctx.putImageData(imageData, 0, 0)
 
     const blob = await new Promise<Blob | null>((resolve) =>
       canvas.toBlob(resolve, 'image/jpeg', RESIZE_QUALITY)

@@ -1,0 +1,14 @@
+# Environment (secrets)
+.env
+
+# Data
+data/
+
+# OS
+.DS_Store
+
+# Planning docs (not shipped)
+PLAN-*.md
+REVIEW-*.md
+UX-AUDIT-*.md
+WORK-BREAKDOWN-*.md
