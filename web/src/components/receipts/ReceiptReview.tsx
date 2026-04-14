@@ -294,7 +294,7 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         },
         cell: ({ row }) => {
           const price = row.original.total_price
-          const formatted = '$' + Number(price).toFixed(2)
+          const formatted = price != null ? '$' + Number(price).toFixed(2) : '\u2014'
           return <span className="tabular-nums">{formatted}</span>
         },
       },

@@ -40,7 +40,7 @@ function TripCostChart({ trips }: TripCostChartProps) {
           tick={{ fontSize: 12, fill: '#9497a9' }}
         />
         <Tooltip
-          formatter={(value: number) => [`$${value.toFixed(2)}`, 'Total']}
+          formatter={(value: number) => [`$${(Number(value) || 0).toFixed(2)}`, 'Total']}
           contentStyle={{
             borderRadius: 12,
             border: '1px solid #dedee5',

@@ -108,7 +108,7 @@ function AnalyticsPage() {
                           )}
                         </td>
                         <td className="px-4 py-3 text-right text-small text-neutral-400">
-                          {trend
+                          {trend?.min_price && trend?.max_price
                             ? `$${parseFloat(trend.min_price).toFixed(2)} / $${parseFloat(trend.max_price).toFixed(2)}`
                             : '\u2014'}
                         </td>

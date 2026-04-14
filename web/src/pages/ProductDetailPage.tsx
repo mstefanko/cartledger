@@ -67,7 +67,7 @@ function PriceTrendSection({ detail }: { detail: ProductDetail }) {
                 key={i}
                 className="flex-1 bg-brand rounded-sm min-h-[4px]"
                 style={{ height: `${Math.max(height, 6)}%` }}
-                title={`$${val.toFixed(2)}`}
+                title={`$${isNaN(val) ? '0.00' : val.toFixed(2)}`}
               />
             )
           })}

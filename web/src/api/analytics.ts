@@ -25,7 +25,8 @@ export async function getProductsWithTrends(params?: {
   if (params?.sort) searchParams.set('sort', params.sort)
   if (params?.order) searchParams.set('order', params.order)
   const query = searchParams.toString()
-  return get<ProductWithTrend[]>(`/analytics/products${query ? `?${query}` : ''}`)
+  const resp = await get<{ products: ProductWithTrend[]; total: number }>(`/analytics/products${query ? `?${query}` : ''}`)
+  return resp?.products ?? []
 }
 
 export async function getStoreSummary(id: string): Promise<StoreSummary> {

@@ -20,7 +20,7 @@ type Config struct {
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
 	return &Config{
-		Port:           getEnv("PORT", "8080"),
+		Port:           getEnv("PORT", "8079"),
 		DataDir:        getEnv("DATA_DIR", "./data"),
 		AnthropicAPIKey: getEnv("ANTHROPIC_API_KEY", ""),
 		GeminiAPIKey:   getEnv("GEMINI_API_KEY", ""),

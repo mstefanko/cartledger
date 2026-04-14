@@ -72,7 +72,7 @@ function ProductsPage() {
   }, [productsWithTrends])
 
   const rows: ProductRow[] = useMemo(() => {
-    if (!products) return []
+    if (!products || !Array.isArray(products)) return []
     return products.map((p) => ({
       ...p,
       alias_count: 0,

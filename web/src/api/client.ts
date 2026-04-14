@@ -56,7 +56,10 @@ async function handleResponse<T>(response: Response): Promise<T> {
     return undefined as T
   }
 
-  return response.json() as Promise<T>
+  const data = await response.json()
+  // Go encodes nil slices as null; normalize to empty array for list endpoints.
+  if (data === null) return [] as unknown as T
+  return data as T
 }
 
 function authHeaders(): HeadersInit {

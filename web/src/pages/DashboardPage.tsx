@@ -95,7 +95,7 @@ function DashboardPage() {
           <p className="mt-1 font-display text-subhead font-bold text-neutral-900">
             {formatCurrency(overview?.spent_this_month)}
           </p>
-          {overview && (
+          {overview && overview.percent_change != null && (
             <Badge variant={changePositive ? 'success' : 'warning'} className="mt-1">
               {overview.percent_change > 0 ? '+' : ''}
               {overview.percent_change.toFixed(1)}% vs last month
@@ -166,7 +166,7 @@ function DashboardPage() {
                   <span className="text-small text-neutral-400 line-through">
                     avg {formatCurrency(deal.avg_price)}
                   </span>
-                  <Badge variant="success">-{deal.savings_percent.toFixed(0)}%</Badge>
+                  <Badge variant="success">-{(deal.savings_percent ?? 0).toFixed(0)}%</Badge>
                 </div>
               </div>
             ))
