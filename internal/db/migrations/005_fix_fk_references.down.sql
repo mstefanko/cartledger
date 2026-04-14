@@ -1,0 +1,1 @@
+-- No-op: the old schema was broken, no reason to revert.

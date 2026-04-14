@@ -47,3 +47,12 @@ export async function acceptSuggestions(
     data,
   )
 }
+
+export async function confirmReceipt(
+  receiptId: string,
+): Promise<{ status: string }> {
+  return put<{ status: string }>(
+    `/receipts/${encodeURIComponent(receiptId)}`,
+    { status: 'reviewed' },
+  )
+}

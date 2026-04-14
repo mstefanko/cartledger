@@ -84,6 +84,8 @@ type receiptDetailResponse struct {
 	CardType    *string            `json:"card_type,omitempty"`
 	CardLast4   *string            `json:"card_last4,omitempty"`
 	ReceiptTime *string            `json:"receipt_time,omitempty"`
+	ImagePaths  *string            `json:"image_paths,omitempty"`
+	RawLLMJSON  *string            `json:"raw_llm_json,omitempty"`
 	CreatedAt   string             `json:"created_at"`
 	LineItems   []lineItemResponse `json:"line_items"`
 }
@@ -96,6 +98,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.GET("/:id", h.Get)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
 	receipts.POST("/:id/accept-suggestions", h.AcceptSuggestions)
+	receipts.PUT("/:id", h.UpdateReceipt)
 }
 
 // Scan handles multipart receipt image upload and submits for background processing.
@@ -258,7 +261,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	err := h.DB.QueryRow(
 		`SELECT r.id, r.household_id, r.store_id, s.name, r.scanned_by, r.receipt_date,
 		        r.subtotal, r.tax, r.total, r.status, r.llm_provider,
-		        r.card_type, r.card_last4, r.receipt_time, r.created_at
+		        r.card_type, r.card_last4, r.receipt_time,
+		        r.image_paths, r.raw_llm_json, r.created_at
 		 FROM receipts r
 		 LEFT JOIN stores s ON r.store_id = s.id
 		 WHERE r.id = ? AND r.household_id = ?`,
@@ -267,7 +271,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		&resp.ID, &resp.HouseholdID, &resp.StoreID, &resp.StoreName,
 		&resp.ScannedBy, &receiptDate, &subtotal, &tax, &total,
 		&resp.Status, &resp.LLMProvider,
-		&resp.CardType, &resp.CardLast4, &resp.ReceiptTime, &createdAt,
+		&resp.CardType, &resp.CardLast4, &resp.ReceiptTime,
+		&resp.ImagePaths, &resp.RawLLMJSON, &createdAt,
 	)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
@@ -414,6 +419,39 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// UpdateReceipt updates receipt status (e.g., mark as reviewed).
+// PUT /api/v1/receipts/:id
+func (h *ReceiptHandler) UpdateReceipt(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	var req struct {
+		Status string `json:"status"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	allowedStatuses := map[string]bool{"reviewed": true, "matched": true}
+	if !allowedStatuses[req.Status] {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid status"})
+	}
+
+	result, err := h.DB.Exec(
+		"UPDATE receipts SET status = ? WHERE id = ? AND household_id = ?",
+		req.Status, receiptID, householdID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": req.Status})
 }
 
 // --- Accept Suggestions types ---

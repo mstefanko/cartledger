@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
 import { getReceipt, type ReceiptDetail } from '@/api/receipts'
+import { getToken } from '@/api/client'
 
 function ReceiptReviewPage() {
   const { id } = useParams<{ id: string }>()
@@ -49,7 +50,7 @@ function ReceiptReviewPage() {
         Review Receipt
       </h1>
 
-      {receipt && (receipt.receipt_time || receipt.card_type) && (
+      {receipt && (
         <div className="flex items-center gap-3 text-sm text-neutral-500 mb-4">
           {receipt.receipt_date && (
             <span>
@@ -59,6 +60,15 @@ function ReceiptReviewPage() {
                 day: 'numeric',
               })}
               {receipt.receipt_time && ` at ${receipt.receipt_time}`}
+            </span>
+          )}
+          {receipt.created_at && receipt.created_at !== receipt.receipt_date && (
+            <span className="text-neutral-400">
+              Scanned {new Date(receipt.created_at).toLocaleDateString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+              })}
             </span>
           )}
           {receipt.card_type && (
@@ -81,7 +91,7 @@ function ReceiptReviewPage() {
               {imagePaths.map((path, idx) => (
                 <img
                   key={idx}
-                  src={`/api/v1/files/${encodeURIComponent(path)}`}
+                  src={`/api/v1/files/${path}?token=${encodeURIComponent(getToken() ?? '')}`}
                   alt={`Receipt page ${idx + 1}`}
                   className="w-full rounded-lg shadow-micro"
                   loading="lazy"

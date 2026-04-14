@@ -122,12 +122,25 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	analyticsHandler := &AnalyticsHandler{DB: database, Cfg: cfg}
 	analyticsHandler.RegisterRoutes(protected)
 
-	// Serve uploaded receipt images. Paths stored in DB are relative to
-	// the working directory (e.g., "data/receipts/{id}/1.jpg").
-	protected.GET("/files/*", func(c echo.Context) error {
-		filePath := c.Param("*")
+	// Serve uploaded receipt images. Accepts JWT via Authorization header
+	// or ?token= query param (needed for <img> tags which can't send headers).
+	v1.GET("/files/*", func(c echo.Context) error {
+		// Auth: check header first, then query param.
+		token := ""
+		if h := c.Request().Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			token = strings.TrimPrefix(h, "Bearer ")
+		}
+		if token == "" {
+			token = c.QueryParam("token")
+		}
+		if token == "" {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "missing token"})
+		}
+		if _, err := auth.ValidateAuthToken(cfg.JWTSecret, token); err != nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+		}
 
-		// Path traversal protection.
+		filePath := c.Param("*")
 		if containsDotDot(filePath) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
 		}

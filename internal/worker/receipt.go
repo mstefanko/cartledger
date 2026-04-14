@@ -356,9 +356,11 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	}
 
 	// 6. Update receipt status.
+	// "matched" = all items matched to products, "review" = some items need user attention.
+	// Never set back to "pending" — that means LLM hasn't processed yet.
 	finalStatus := "matched"
 	if hasUnmatched {
-		finalStatus = "pending"
+		finalStatus = "matched" // extraction complete; unmatched items get suggestions in the UI
 	}
 	_, err = tx.Exec("UPDATE receipts SET status = ? WHERE id = ?", finalStatus, job.ReceiptID)
 	if err != nil {

@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 // CreateRuleModal replaced by inline batch rule modal
-import { getReceipt, updateLineItem, acceptSuggestions, type ReceiptDetail } from '@/api/receipts'
+import { getReceipt, updateLineItem, acceptSuggestions, confirmReceipt, type ReceiptDetail } from '@/api/receipts'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { LineItem, Product } from '@/types'
@@ -75,16 +75,7 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
   })
 
   const confirmMutation = useMutation({
-    mutationFn: () => {
-      // Mark all unmatched items as reviewed by confirming the receipt
-      // The backend PUT /receipts/:id with status: 'reviewed'
-      return import('@/api/client').then((client) =>
-        client.put<ReceiptDetail>(
-          `/receipts/${encodeURIComponent(receiptId)}`,
-          { status: 'reviewed' },
-        ),
-      )
-    },
+    mutationFn: () => confirmReceipt(receiptId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
     },
