@@ -75,6 +75,7 @@ export interface Receipt {
   id: string
   household_id: string
   store_id: string | null
+  store_name: string | null
   scanned_by: string | null
   receipt_date: string
   subtotal: string | null

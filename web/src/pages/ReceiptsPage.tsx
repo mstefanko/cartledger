@@ -2,7 +2,6 @@ import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { NavLink, useNavigate } from 'react-router-dom'
 import { listReceipts } from '@/api/receipts'
-import { listStores } from '@/api/stores'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import type { Receipt } from '@/types'
@@ -23,21 +22,6 @@ function ReceiptsPage() {
     queryKey: ['receipts'],
     queryFn: listReceipts,
   })
-
-  const { data: stores } = useQuery({
-    queryKey: ['stores'],
-    queryFn: listStores,
-  })
-
-  const storeMap = useMemo(() => {
-    const map = new Map<string, string>()
-    if (stores) {
-      for (const store of stores) {
-        map.set(store.id, store.name)
-      }
-    }
-    return map
-  }, [stores])
 
   const sortedReceipts = useMemo(() => {
     if (!receipts) return []
@@ -114,7 +98,7 @@ function ReceiptsPage() {
             <tbody>
               {sortedReceipts.map((receipt) => {
                 const config = statusConfig[receipt.status]
-                const storeName = receipt.store_id ? storeMap.get(receipt.store_id) ?? 'Unknown' : 'Unknown'
+                const storeName = receipt.store_name ?? 'Unknown'
                 return (
                   <tr
                     key={receipt.id}
