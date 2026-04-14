@@ -27,8 +27,19 @@ createRoot(root).render(
 // Register service worker for PWA
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => {
-      // Service worker registration failed — PWA features unavailable
-    })
+    navigator.serviceWorker
+      .register('/sw.js', { updateViaCache: 'none' })
+      .then((reg) => reg.update())
+      .catch(() => {
+        // Service worker registration failed — PWA features unavailable
+      })
+  })
+
+  // When a new service worker takes over, reload to pick up new assets
+  let refreshing = false
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return
+    refreshing = true
+    window.location.reload()
   })
 }
