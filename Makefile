@@ -2,9 +2,10 @@ PORT ?= 8079
 
 .PHONY: run kill restart build dev
 
-# Kill any process on the server port
+# Kill server and any orphaned claude CLI subprocesses
 kill:
 	@lsof -t -i :$(PORT) | xargs -r kill -9 2>/dev/null || true
+	@pkill -9 -f "claude.*--print.*cartledger" 2>/dev/null || true
 	@echo "port $(PORT) cleared"
 
 # Build frontend and run server

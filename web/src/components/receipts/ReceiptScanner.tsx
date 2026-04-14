@@ -9,13 +9,106 @@ import type { Receipt, WSMessage } from '@/types'
 const MAX_IMAGES = 5
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
 const ACCEPTED_TYPES = ['image/jpeg', 'image/png']
+const RESIZE_MAX_DIM = 1600 // max width or height in px
+const RESIZE_QUALITY = 0.70 // lower quality is fine for text-on-paper receipts
 
 interface ImageEntry {
   file: File
   previewUrl: string
 }
 
-type ScannerPhase = 'capture' | 'uploading' | 'processing' | 'timeout' | 'error'
+type ScannerPhase = 'capture' | 'preparing' | 'uploading' | 'processing' | 'timeout' | 'error'
+
+// Processing stage labels shown during the "processing" phase
+const PROCESSING_STAGES = [
+  { label: 'Starting AI engine...', duration: 8_000 },
+  { label: 'Reading receipt image...', duration: 12_000 },
+  { label: 'Extracting line items and prices...', duration: 30_000 },
+  { label: 'Identifying store and date...', duration: 15_000 },
+  { label: 'Matching products...', duration: 20_000 },
+  { label: 'Almost done...', duration: 120_000 },
+]
+
+/**
+ * Resize an image to fit within maxDim x maxDim while preserving aspect ratio.
+ *
+ * Uses createImageBitmap (preferred, handles EXIF orientation natively) with
+ * canvas fallback. Step-down resizing for quality when scaling > 2x.
+ * On any failure, returns the original file so the upload still works.
+ */
+async function resizeImage(file: File): Promise<File> {
+  try {
+    // createImageBitmap handles EXIF orientation automatically
+    const bitmap = await createImageBitmap(file)
+    const { width, height } = bitmap
+
+    // Even if within bounds, still convert to grayscale for smaller file size
+    let targetW = width
+    let targetH = height
+    const needsResize = width > RESIZE_MAX_DIM || height > RESIZE_MAX_DIM
+
+    // Calculate target dimensions preserving aspect ratio
+    if (needsResize) {
+      const scale = Math.min(RESIZE_MAX_DIM / width, RESIZE_MAX_DIM / height)
+      targetW = Math.round(width * scale)
+      targetH = Math.round(height * scale)
+    }
+
+    // Step-down resize: halve dimensions until we're within 2x of target.
+    // This produces much better quality than a single large downscale.
+    let source: ImageBitmap | HTMLCanvasElement = bitmap
+    let srcW = width
+    let srcH = height
+
+    while (srcW / 2 > targetW) {
+      const halfW = Math.round(srcW / 2)
+      const halfH = Math.round(srcH / 2)
+      const step = document.createElement('canvas')
+      step.width = halfW
+      step.height = halfH
+      const stepCtx = step.getContext('2d')!
+      stepCtx.drawImage(source, 0, 0, halfW, halfH)
+      if (source instanceof ImageBitmap) source.close()
+      source = step
+      srcW = halfW
+      srcH = halfH
+    }
+
+    // Final draw to target size, converting to grayscale.
+    // Receipts are black text on white paper — color adds no information
+    // but triples the pixel data sent to the LLM.
+    const canvas = document.createElement('canvas')
+    canvas.width = targetW
+    canvas.height = targetH
+    const ctx = canvas.getContext('2d')!
+    ctx.imageSmoothingQuality = 'high'
+    ctx.drawImage(source, 0, 0, targetW, targetH)
+    if (source instanceof ImageBitmap) source.close()
+
+    // Convert to grayscale via pixel manipulation (works in all browsers)
+    const imageData = ctx.getImageData(0, 0, targetW, targetH)
+    const data = imageData.data
+    for (let i = 0; i < data.length; i += 4) {
+      const gray = data[i]! * 0.299 + data[i + 1]! * 0.587 + data[i + 2]! * 0.114
+      data[i] = data[i + 1] = data[i + 2] = gray
+    }
+    ctx.putImageData(imageData, 0, 0)
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, 'image/jpeg', RESIZE_QUALITY)
+    )
+
+    if (!blob) return file // fallback to original
+
+    return new File([blob], file.name.replace(/\.\w+$/, '.jpg'), {
+      type: 'image/jpeg',
+      lastModified: file.lastModified,
+    })
+  } catch {
+    // Any failure (canvas OOM, unsupported format) — send original
+    return file
+  }
+}
 
 function validateFile(file: File): string | null {
   if (!ACCEPTED_TYPES.includes(file.type)) {
@@ -26,6 +119,52 @@ function validateFile(file: File): string | null {
     return `"${file.name}" is ${sizeMB} MB. Maximum is 10 MB.`
   }
   return null
+}
+
+/** Indeterminate progress bar that fills over time. */
+function ProgressBar({ stages }: { stages: typeof PROCESSING_STAGES }) {
+  const [stageIndex, setStageIndex] = useState(0)
+  const [barWidth, setBarWidth] = useState(0)
+
+  useEffect(() => {
+    let elapsed = 0
+    let currentStage = 0
+    const interval = setInterval(() => {
+      elapsed += 500
+      // Advance stage based on cumulative duration
+      let cumulativeDuration = 0
+      for (let i = 0; i < stages.length; i++) {
+        cumulativeDuration += stages[i]!.duration
+        if (elapsed < cumulativeDuration) {
+          currentStage = i
+          break
+        }
+        if (i === stages.length - 1) currentStage = i
+      }
+      setStageIndex(currentStage)
+
+      // Calculate total progress (eased — slows down toward the end)
+      const totalDuration = stages.reduce((sum, s) => sum + s.duration, 0)
+      const linear = Math.min(elapsed / totalDuration, 0.95) // never hit 100% until real completion
+      const eased = 1 - Math.pow(1 - linear, 2) // ease-out
+      setBarWidth(Math.round(eased * 100))
+    }, 500)
+    return () => clearInterval(interval)
+  }, [stages])
+
+  return (
+    <div className="w-full max-w-xs mx-auto mt-6">
+      <div className="h-2 rounded-full bg-neutral-200 overflow-hidden">
+        <div
+          className="h-full rounded-full bg-brand transition-all duration-500 ease-out"
+          style={{ width: `${barWidth}%` }}
+        />
+      </div>
+      <p className="mt-3 text-small text-neutral-400 animate-pulse">
+        {stages[stageIndex]?.label ?? 'Processing...'}
+      </p>
+    </div>
+  )
 }
 
 function ReceiptScanner() {
@@ -71,12 +210,12 @@ function ReceiptScanner() {
     }
   }, [phase, navigate])
 
-  // 60-second timeout for processing phase
+  // 3-minute timeout for processing phase
   useEffect(() => {
     if (phase !== 'processing') return
     const timer = setTimeout(() => {
       setPhase('timeout')
-    }, 60_000)
+    }, 180_000)
     return () => clearTimeout(timer)
   }, [phase])
 
@@ -84,7 +223,6 @@ function ReceiptScanner() {
     mutationFn: scanReceipt,
     onSuccess: (receipt) => {
       pendingReceiptId.current = receipt.id
-      // If status is already matched/reviewed, navigate immediately
       if (receipt.status !== 'pending') {
         navigate(`/receipts/${receipt.id}`)
       } else {
@@ -130,7 +268,6 @@ function ReceiptScanner() {
         setImages((prev) => [...prev, ...newEntries])
       }
 
-      // Reset input so the same file can be re-selected
       event.target.value = ''
     },
     [images.length],
@@ -150,11 +287,19 @@ function ReceiptScanner() {
     fileInputRef.current?.click()
   }, [])
 
-  const handleUpload = useCallback(() => {
+  const handleUpload = useCallback(async () => {
     if (images.length === 0) return
     setError(null)
-    setPhase('uploading')
-    uploadMutation.mutate(images.map((img) => img.file))
+    setPhase('preparing')
+
+    try {
+      const resized = await Promise.all(images.map((img) => resizeImage(img.file)))
+      setPhase('uploading')
+      uploadMutation.mutate(resized)
+    } catch {
+      setError('Failed to process images. Please try again.')
+      setPhase('error')
+    }
   }, [images, uploadMutation])
 
   const handleRetry = useCallback(() => {
@@ -187,16 +332,29 @@ function ReceiptScanner() {
     )
   }
 
-  // --- Processing state ---
+  // --- Processing state (with progress bar) ---
   if (phase === 'processing') {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <div className="h-12 w-12 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
         <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
-          Scanning receipt...
+          Scanning receipt
+        </p>
+        <ProgressBar stages={PROCESSING_STAGES} />
+      </div>
+    )
+  }
+
+  // --- Preparing state (resizing images) ---
+  if (phase === 'preparing') {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-center">
+        <div className="h-12 w-12 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
+        <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
+          Preparing images...
         </p>
         <p className="mt-2 text-body text-neutral-400">
-          Extracting items, prices, and store information.
+          Optimizing for faster processing.
         </p>
       </div>
     )
@@ -242,7 +400,6 @@ function ReceiptScanner() {
   // --- Capture state (default) ---
   return (
     <div className="flex flex-col gap-6">
-      {/* Hidden file input */}
       <input
         ref={fileInputRef}
         type="file"
@@ -252,7 +409,6 @@ function ReceiptScanner() {
         onChange={handleFileChange}
       />
 
-      {/* Empty state — large capture button */}
       {images.length === 0 && (
         <button
           type="button"
@@ -272,7 +428,6 @@ function ReceiptScanner() {
         </button>
       )}
 
-      {/* Thumbnail grid */}
       {images.length > 0 && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           {images.map((img, index) => (
@@ -282,11 +437,9 @@ function ReceiptScanner() {
                 alt={`Receipt page ${index + 1}`}
                 className="h-full w-full object-cover"
               />
-              {/* Page number badge */}
               <span className="absolute left-2 top-2 flex h-6 w-6 items-center justify-center rounded-md bg-neutral-900/70 text-small font-medium text-white">
                 {index + 1}
               </span>
-              {/* Remove button */}
               <button
                 type="button"
                 onClick={() => removeImage(index)}
@@ -302,12 +455,10 @@ function ReceiptScanner() {
         </div>
       )}
 
-      {/* Validation error */}
       {error && (
         <p className="text-caption text-expensive">{error}</p>
       )}
 
-      {/* Action buttons */}
       {images.length > 0 && (
         <div className="flex flex-col gap-3 sm:flex-row">
           {images.length < MAX_IMAGES && (
@@ -327,7 +478,6 @@ function ReceiptScanner() {
         </div>
       )}
 
-      {/* Image count hint */}
       {images.length > 0 && (
         <p className="text-center text-small text-neutral-400">
           {images.length} of {MAX_IMAGES} images

@@ -132,8 +132,22 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	if err != nil {
 		e.Logger.Fatal("create sub fs: ", err)
 	}
-	fileHandler := http.FileServer(http.FS(distFS))
-	e.GET("/*", echo.WrapHandler(fileHandler))
+	fsHandler := http.FileServer(http.FS(distFS))
+	indexHTML, _ := fs.ReadFile(distFS, "index.html")
+
+	e.GET("/*", func(c echo.Context) error {
+		path := c.Request().URL.Path[1:] // strip leading /
+		if path == "" {
+			path = "index.html"
+		}
+		// Check if the file exists in dist/
+		if _, err := fs.Stat(distFS, path); err == nil {
+			fsHandler.ServeHTTP(c.Response(), c.Request())
+			return nil
+		}
+		// SPA fallback: serve index.html for client-side routing
+		return c.HTMLBlob(http.StatusOK, indexHTML)
+	})
 
 	return e
 }
