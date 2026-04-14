@@ -33,7 +33,7 @@ export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocke
 
     // Invalidate relevant React Query caches based on message type
     switch (message.type) {
-      case 'receipt.processed':
+      case 'receipt.complete':
         void queryClient.invalidateQueries({ queryKey: ['receipts'] })
         break
       case 'list.updated':

@@ -198,6 +198,23 @@ function ReceiptScanner() {
     }
   }, [phase, navigate])
 
+  // Poll receipt status as fallback (WS may not deliver)
+  useEffect(() => {
+    if (phase !== 'processing' || !pendingReceiptId.current) return
+    const receiptId = pendingReceiptId.current
+    const interval = setInterval(async () => {
+      try {
+        const resp = await import('@/api/receipts').then((mod) => mod.getReceipt(receiptId))
+        if (resp.status !== 'pending' && resp.status !== 'processing') {
+          navigate(`/receipts/${receiptId}`)
+        }
+      } catch {
+        // Ignore fetch errors, keep polling
+      }
+    }, 3_000)
+    return () => clearInterval(interval)
+  }, [phase, navigate])
+
   // 3-minute timeout for processing phase
   useEffect(() => {
     if (phase !== 'processing') return
