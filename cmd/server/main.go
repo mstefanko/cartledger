@@ -47,27 +47,16 @@ func main() {
 	case "claude":
 		llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey)
 		log.Println("LLM provider: claude (direct API)")
-	case "claude-cli":
-		cli, err := llm.NewCLIClient()
-		if err != nil {
-			log.Fatalf("claude-cli provider: %v", err)
-		}
-		llmClient = cli
-		log.Println("LLM provider: claude-cli (subscription billing)")
 	case "mock":
 		llmClient = llm.NewMockClient()
 		log.Println("LLM provider: mock")
 	default:
-		// Auto-detect: use API if key is set, else try CLI, else mock.
+		// Auto-detect: use API if key is set, else fail clearly.
 		if cfg.AnthropicAPIKey != "" {
 			llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey)
-			log.Printf("LLM provider: claude (direct API, auto-detected key %s...)", cfg.AnthropicAPIKey[:20])
-		} else if cli, err := llm.NewCLIClient(); err == nil {
-			llmClient = cli
-			log.Println("LLM provider: claude-cli (no API key found, using subscription billing)")
+			log.Printf("LLM provider: claude (direct API)")
 		} else {
-			llmClient = llm.NewMockClient()
-			log.Println("LLM provider: mock (no API key or Claude CLI found)")
+			log.Fatal("ANTHROPIC_API_KEY is required. Set it in .env or as an environment variable.")
 		}
 	}
 

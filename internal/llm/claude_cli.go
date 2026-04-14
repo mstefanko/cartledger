@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -28,7 +29,7 @@ func NewCLIClient() (*CLIClient, error) {
 	return &CLIClient{
 		claudePath: path,
 		model:      "sonnet",
-		timeout:    90 * time.Second,
+		timeout:    180 * time.Second,
 	}, nil
 }
 
@@ -64,9 +65,9 @@ func (c *CLIClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error) 
 		"--print",
 		"--model", c.model,
 		"--output-format", "text",
-		"--tools", "",
 		"--effort", "low",
 		"--no-session-persistence",
+		"--settings", `{"hooks":{}}`,
 		"-",
 	)
 
@@ -75,15 +76,21 @@ func (c *CLIClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error) 
 	// Strip CLAUDECODE to avoid nesting error, ANTHROPIC_API_KEY for subscription billing.
 	cmd.Env = filterEnv(os.Environ(), "ANTHROPIC_API_KEY", "CLAUDECODE")
 
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
 	output, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("claude CLI timed out after %s", c.timeout)
+			return nil, fmt.Errorf("claude CLI timed out after %s (stderr: %s)", c.timeout, stderr.String())
 		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("claude CLI failed (exit %d): %s", exitErr.ExitCode(), string(exitErr.Stderr))
 		}
-		return nil, fmt.Errorf("claude CLI failed: %w", err)
+		return nil, fmt.Errorf("claude CLI failed: %w (stderr: %s)", err, stderr.String())
+	}
+	if stderr.Len() > 0 {
+		fmt.Fprintf(os.Stderr, "claude CLI stderr: %s\n", stderr.String())
 	}
 
 	// Parse JSON from the response.
