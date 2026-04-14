@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -153,30 +154,62 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	// 4. Find-or-create store.
 	var storeID string
 	if extraction.StoreName != "" {
+		// Phase 1: Exact name match (existing behavior)
 		err = tx.QueryRow(
 			"SELECT id FROM stores WHERE household_id = ? AND LOWER(name) = LOWER(?)",
 			job.HouseholdID, extraction.StoreName,
 		).Scan(&storeID)
+
+		// Phase 2: Store number + name prefix match
+		if err == sql.ErrNoRows && extraction.StoreNumber != nil {
+			baseName := strings.Fields(extraction.StoreName)[0]
+			err = tx.QueryRow(
+				`SELECT id FROM stores WHERE household_id = ? AND store_number = ? AND LOWER(name) LIKE LOWER(? || '%')`,
+				job.HouseholdID, *extraction.StoreNumber, baseName,
+			).Scan(&storeID)
+		}
+
 		if err == sql.ErrNoRows {
 			storeID = uuid.New().String()
 			_, err = tx.Exec(
-				"INSERT INTO stores (id, household_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-				storeID, job.HouseholdID, extraction.StoreName, now, now,
+				`INSERT INTO stores (id, household_id, name, address, city, state, zip, store_number, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				storeID, job.HouseholdID, extraction.StoreName,
+				extraction.StoreAddress, nilPtrStr(extraction.StoreCity),
+				nilPtrStr(extraction.StoreState), nilPtrStr(extraction.StoreZip),
+				nilPtrStr(extraction.StoreNumber), now, now,
 			)
 			if err != nil {
 				return fmt.Errorf("create store: %w", err)
 			}
 		} else if err != nil {
 			return fmt.Errorf("lookup store: %w", err)
+		} else {
+			// Progressive enrichment: fill NULL fields on existing store
+			_, _ = tx.Exec(`UPDATE stores SET
+				address = COALESCE(address, ?),
+				city = COALESCE(city, ?),
+				state = COALESCE(state, ?),
+				zip = COALESCE(zip, ?),
+				store_number = COALESCE(store_number, ?),
+				updated_at = ?
+				WHERE id = ?`,
+				extraction.StoreAddress, nilPtrStr(extraction.StoreCity),
+				nilPtrStr(extraction.StoreState), nilPtrStr(extraction.StoreZip),
+				nilPtrStr(extraction.StoreNumber), now, storeID)
 		}
 	}
 
 	// Update receipt with extraction data.
 	_, err = tx.Exec(
-		`UPDATE receipts SET store_id = ?, receipt_date = ?, subtotal = ?, tax = ?, total = ?,
+		`UPDATE receipts SET store_id = ?, receipt_date = ?, receipt_time = ?,
+		 subtotal = ?, tax = ?, total = ?,
+		 card_type = ?, card_last4 = ?,
 		 raw_llm_json = ?, llm_provider = ?, status = 'processing'
 		 WHERE id = ?`,
-		nilIfEmpty(storeID), receiptDate, subtotal.String(), tax.String(), total.String(),
+		nilIfEmpty(storeID), receiptDate, extraction.Time,
+		subtotal.String(), tax.String(), total.String(),
+		extraction.PaymentCardType, extraction.PaymentCardLast4,
 		rawJSONStr, provider, job.ReceiptID,
 	)
 	if err != nil {
@@ -199,6 +232,16 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			unitPrice = &up
 		}
 
+		var regularPrice, discountAmount *string
+		if item.RegularPrice != nil {
+			rp := decimal.NewFromFloat(*item.RegularPrice).String()
+			regularPrice = &rp
+		}
+		if item.DiscountAmount != nil {
+			da := decimal.NewFromFloat(*item.DiscountAmount).String()
+			discountAmount = &da
+		}
+
 		// Run matcher.
 		matchResult := w.matchEngine.Match(item.RawName, storeID, job.HouseholdID)
 
@@ -217,10 +260,11 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		lineNum := item.LineNumber
 
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, matched, confidence, line_number, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
+			regularPrice, discountAmount,
 			matched, confidence, lineNum, now,
 		)
 		if err != nil {
@@ -257,12 +301,14 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			}
 			up := totalPrice.Div(quantity)
 
+			isSale := regularPrice != nil && discountAmount != nil
 			priceID := uuid.New().String()
 			_, err = tx.Exec(
-				`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				priceID, *productID, storeID, job.ReceiptID,
-				receiptDate, quantity.String(), unit, up.String(), now,
+				receiptDate, quantity.String(), unit, up.String(),
+				regularPrice, discountAmount, isSale, now,
 			)
 			if err != nil {
 				return fmt.Errorf("insert product price: %w", err)
@@ -321,4 +367,13 @@ func nilIfEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// nilPtrStr dereferences a *string, returning nil if the pointer is nil.
+// Used to pass *string values from LLM extraction directly to SQL parameters.
+func nilPtrStr(s *string) interface{} {
+	if s == nil {
+		return nil
+	}
+	return *s
 }

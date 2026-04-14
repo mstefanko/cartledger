@@ -648,6 +648,9 @@ type priceHistoryEntry struct {
 	UnitPrice       string  `json:"unit_price"`
 	NormalizedPrice *string `json:"normalized_price,omitempty"`
 	NormalizedUnit  *string `json:"normalized_unit,omitempty"`
+	RegularPrice    *string `json:"regular_price,omitempty"`
+	DiscountAmount  *string `json:"discount_amount,omitempty"`
+	IsSale          bool    `json:"is_sale"`
 }
 
 type storeComparison struct {
@@ -663,6 +666,7 @@ type purchaseStats struct {
 	AvgPrice       *string `json:"avg_price,omitempty"`
 	MinPrice       *string `json:"min_price,omitempty"`
 	MaxPrice       *string `json:"max_price,omitempty"`
+	TotalSaved     *string `json:"total_saved,omitempty"`
 }
 
 type productAliasResponse struct {
@@ -761,7 +765,8 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 	// Fetch price history with store name.
 	priceRows, err := h.DB.Query(
 		`SELECT pp.id, pp.store_id, s.name, pp.receipt_id, pp.receipt_date,
-		        pp.quantity, pp.unit, pp.unit_price, pp.normalized_price, pp.normalized_unit
+		        pp.quantity, pp.unit, pp.unit_price, pp.normalized_price, pp.normalized_unit,
+		        pp.regular_price, pp.discount_amount, pp.is_sale
 		 FROM product_prices pp
 		 JOIN stores s ON pp.store_id = s.id
 		 WHERE pp.product_id = ?
@@ -777,7 +782,8 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 			var unitPrice float64
 			var normalizedPrice *float64
 			if priceRows.Scan(&e.ID, &e.StoreID, &e.StoreName, &e.ReceiptID, &receiptDate,
-				&quantity, &e.Unit, &unitPrice, &normalizedPrice, &e.NormalizedUnit) == nil {
+				&quantity, &e.Unit, &unitPrice, &normalizedPrice, &e.NormalizedUnit,
+				&e.RegularPrice, &e.DiscountAmount, &e.IsSale) == nil {
 				e.ReceiptDate = receiptDate.Format("2006-01-02")
 				e.Quantity = fmt.Sprintf("%g", quantity)
 				e.UnitPrice = fmt.Sprintf("%.2f", unitPrice)
@@ -844,6 +850,16 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 			s := fmt.Sprintf("%.2f", *maxPrice)
 			resp.Stats.MaxPrice = &s
 		}
+	}
+
+	// Total saved from sale items.
+	var totalSaved string
+	err = h.DB.QueryRow(
+		`SELECT COALESCE(SUM(CAST(discount_amount AS REAL)), 0) FROM product_prices WHERE product_id = ? AND is_sale = TRUE`,
+		productID,
+	).Scan(&totalSaved)
+	if err == nil {
+		resp.Stats.TotalSaved = &totalSaved
 	}
 
 	return c.JSON(http.StatusOK, resp)

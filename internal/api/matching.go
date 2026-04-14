@@ -99,13 +99,16 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 	var quantity decimal.Decimal
 	var unit *string
 	var totalPrice decimal.Decimal
+	var regularPrice, discountAmount sql.NullString
 	err := h.DB.QueryRow(
-		`SELECT li.raw_name, li.receipt_id, r.store_id, r.receipt_date, li.quantity, li.unit, li.total_price
+		`SELECT li.raw_name, li.receipt_id, r.store_id, r.receipt_date, li.quantity, li.unit, li.total_price,
+		        li.regular_price, li.discount_amount
 		 FROM line_items li
 		 JOIN receipts r ON li.receipt_id = r.id
 		 WHERE li.id = ? AND r.household_id = ?`,
 		lineItemID, householdID,
-	).Scan(&rawName, &receiptID, &storeID, &receiptDate, &quantity, &unit, &totalPrice)
+	).Scan(&rawName, &receiptID, &storeID, &receiptDate, &quantity, &unit, &totalPrice,
+		&regularPrice, &discountAmount)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
 	}
@@ -160,11 +163,22 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 		}
 		unitPrice := totalPrice.Div(quantity)
 
+		// Determine if this is a sale item.
+		isSale := regularPrice.Valid && discountAmount.Valid
+		var regPriceVal, discountVal interface{}
+		if regularPrice.Valid {
+			regPriceVal = regularPrice.String
+		}
+		if discountAmount.Valid {
+			discountVal = discountAmount.String
+		}
+
 		_, err = tx.Exec(
-			`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			uuid.New().String(), req.ProductID, *storeID, receiptID,
-			receiptDate, quantity.String(), unitStr, unitPrice.String(), now,
+			receiptDate, quantity.String(), unitStr, unitPrice.String(),
+			regPriceVal, discountVal, isSale, now,
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})

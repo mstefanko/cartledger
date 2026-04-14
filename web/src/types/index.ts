@@ -26,6 +26,14 @@ export interface Store {
   name: string
   display_order: number
   icon: string | null
+  address: string | null
+  city: string | null
+  state: string | null
+  zip: string | null
+  store_number: string | null
+  nickname: string | null
+  latitude: number | null
+  longitude: number | null
   created_at: string
   updated_at: string
 }
@@ -74,8 +82,11 @@ export interface Receipt {
   total: string | null
   image_paths: string | null
   raw_llm_json: string | null
-  status: 'pending' | 'matched' | 'reviewed'
+  status: 'pending' | 'matched' | 'reviewed' | 'processing' | 'error'
   llm_provider: string | null
+  card_type: string | null
+  card_last4: string | null
+  receipt_time: string | null
   created_at: string
 }
 
@@ -90,6 +101,8 @@ export interface LineItem {
   total_price: string
   matched: 'unmatched' | 'auto' | 'manual' | 'rule'
   confidence: number | null
+  regular_price: string | null
+  discount_amount: string | null
   line_number: number | null
   created_at: string
 }
@@ -105,6 +118,9 @@ export interface ProductPrice {
   unit_price: string
   normalized_price: string | null
   normalized_unit: string | null
+  regular_price: string | null
+  discount_amount: string | null
+  is_sale: boolean
   created_at: string
 }
 
@@ -170,6 +186,9 @@ export interface PriceHistoryEntry {
   unit: string
   unit_price: string
   total_price: string
+  regular_price: string | null
+  discount_amount: string | null
+  is_sale: boolean
 }
 
 export interface StorePriceComparison {
@@ -192,6 +211,7 @@ export interface ProductDetail {
     avg: string
     min: string
     max: string
+    total_saved?: string
   }
 }
 
@@ -270,6 +290,11 @@ export interface CreateStoreRequest {
 export interface UpdateStoreRequest {
   name?: string
   icon?: string
+  nickname?: string
+  address?: string
+  city?: string
+  state?: string
+  zip?: string
 }
 
 export interface ReorderStoresRequest {
@@ -523,6 +548,7 @@ export interface SparklinePoint {
   date: string
   price: string
   store: string
+  is_sale: boolean
 }
 
 export interface ProductTrend {
@@ -567,6 +593,7 @@ export interface Deal {
   current_price: string
   avg_price: string
   savings_percent: number
+  is_sale: boolean
 }
 
 export interface BuyAgainItem {

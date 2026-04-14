@@ -54,7 +54,7 @@ function AnalyticsPage() {
                     <th className="text-left text-caption font-semibold text-neutral-400 uppercase px-4 py-3">
                       Product
                     </th>
-                    <th className="text-left text-caption font-semibold text-neutral-400 uppercase px-4 py-3">
+                    <th className="text-left text-caption font-semibold text-neutral-400 uppercase px-4 py-3" title="Green = sale price">
                       Trend
                     </th>
                     <th className="text-right text-caption font-semibold text-neutral-400 uppercase px-4 py-3">
@@ -70,7 +70,9 @@ function AnalyticsPage() {
                 </thead>
                 <tbody className="divide-y divide-neutral-200">
                   {productsWithTrends.map(({ product, trend }) => {
-                    const sparkData = trend?.sparkline.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n)) ?? []
+                    const sparkPoints = trend?.sparkline ?? []
+                    const sparkData = sparkPoints.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
+                    const sparkHighlights = sparkPoints.map((p) => p.is_sale)
                     const pctChange = trend?.percent_change ?? 0
                     const changeVariant = pctChange > 0 ? 'warning' : pctChange < 0 ? 'success' : 'neutral'
 
@@ -89,7 +91,7 @@ function AnalyticsPage() {
                         </td>
                         <td className="px-4 py-3">
                           {sparkData.length >= 2 ? (
-                            <Sparkline data={sparkData} />
+                            <Sparkline data={sparkData} highlights={sparkHighlights} />
                           ) : (
                             <span className="text-small text-neutral-400">&mdash;</span>
                           )}

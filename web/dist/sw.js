@@ -1,6 +1,6 @@
 // CartLedger Service Worker — network-first with offline fallback
-// mnyu6y9a is replaced at build time by vite to bust the cache
-const CACHE_NAME = 'cartledger-mnyu6y9a'
+// mnywm018 is replaced at build time by vite to bust the cache
+const CACHE_NAME = 'cartledger-mnywm018'
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

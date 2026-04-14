@@ -12,6 +12,8 @@ const statusConfig: Record<Receipt['status'], { label: string; variant: BadgeVar
   pending: { label: 'Pending', variant: 'warning' },
   matched: { label: 'Matched', variant: 'neutral' },
   reviewed: { label: 'Reviewed', variant: 'success' },
+  processing: { label: 'Processing', variant: 'neutral' },
+  error: { label: 'Error', variant: 'error' },
 }
 
 function ReceiptsPage() {

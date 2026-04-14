@@ -174,14 +174,15 @@ function ProductsPage() {
       },
       {
         id: 'sparkline',
-        header: 'Trend',
+        header: () => <span title="Green = sale price">Trend</span>,
         size: 100,
         cell: ({ row }: CellContext<ProductRow, unknown>) => {
           const t = row.original.trend
           if (!t) return <span className="text-small text-neutral-400">&mdash;</span>
           const sparkData = t.sparkline.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
+          const sparkHighlights = t.sparkline.map((p) => p.is_sale)
           if (sparkData.length < 2) return <span className="text-small text-neutral-400">&mdash;</span>
-          return <Sparkline data={sparkData} />
+          return <Sparkline data={sparkData} highlights={sparkHighlights} />
         },
       },
       {

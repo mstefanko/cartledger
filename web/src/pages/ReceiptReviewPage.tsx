@@ -45,9 +45,30 @@ function ReceiptReviewPage() {
           &larr; Back to Receipts
         </Link>
       </div>
-      <h1 className="font-display text-subhead font-bold text-neutral-900 mb-6">
+      <h1 className="font-display text-subhead font-bold text-neutral-900 mb-4">
         Review Receipt
       </h1>
+
+      {receipt && (receipt.receipt_time || receipt.card_type) && (
+        <div className="flex items-center gap-3 text-sm text-neutral-500 mb-4">
+          {receipt.receipt_date && (
+            <span>
+              {new Date(receipt.receipt_date).toLocaleDateString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+              })}
+              {receipt.receipt_time && ` at ${receipt.receipt_time}`}
+            </span>
+          )}
+          {receipt.card_type && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-neutral-100 text-neutral-700">
+              {receipt.card_type}
+              {receipt.card_last4 ? ` \u00b7\u00b7\u00b7\u00b7${receipt.card_last4}` : ''}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* LEFT: Receipt images */}

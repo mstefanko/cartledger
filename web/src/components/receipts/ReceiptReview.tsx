@@ -287,14 +287,32 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
       {
         accessorKey: 'total_price',
         header: 'Price',
-        size: 90,
+        size: 120,
         meta: {
           editable: true,
           cellType: 'text' as const,
         },
         cell: ({ row }) => {
-          const price = row.original.total_price
+          const item = row.original
+          const price = item.total_price
           const formatted = price != null ? '$' + Number(price).toFixed(2) : '\u2014'
+
+          if (item.regular_price && item.discount_amount) {
+            return (
+              <div className="text-right">
+                <span className="tabular-nums">{formatted}</span>
+                <span className="block text-xs text-neutral-400">
+                  <span className="line-through">
+                    ${Number(item.regular_price).toFixed(2)}
+                  </span>
+                  <span className="text-green-600 ml-1">
+                    -${Number(item.discount_amount).toFixed(2)}
+                  </span>
+                </span>
+              </div>
+            )
+          }
+
           return <span className="tabular-nums">{formatted}</span>
         },
       },

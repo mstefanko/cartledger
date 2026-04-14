@@ -26,8 +26,13 @@ type createStoreRequest struct {
 }
 
 type updateStoreRequest struct {
-	Name string  `json:"name"`
-	Icon *string `json:"icon,omitempty"`
+	Name     string  `json:"name"`
+	Icon     *string `json:"icon,omitempty"`
+	Nickname *string `json:"nickname,omitempty"`
+	Address  *string `json:"address,omitempty"`
+	City     *string `json:"city,omitempty"`
+	State    *string `json:"state,omitempty"`
+	Zip      *string `json:"zip,omitempty"`
 }
 
 type reorderStoreItem struct {
@@ -47,6 +52,14 @@ type storeResponse struct {
 	Name         string    `json:"name"`
 	DisplayOrder int       `json:"display_order"`
 	Icon         *string   `json:"icon,omitempty"`
+	Address      *string   `json:"address,omitempty"`
+	City         *string   `json:"city,omitempty"`
+	State        *string   `json:"state,omitempty"`
+	Zip          *string   `json:"zip,omitempty"`
+	StoreNumber  *string   `json:"store_number,omitempty"`
+	Nickname     *string   `json:"nickname,omitempty"`
+	Latitude     *float64  `json:"latitude,omitempty"`
+	Longitude    *float64  `json:"longitude,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -67,7 +80,10 @@ func (h *StoreHandler) List(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 
 	rows, err := h.DB.Query(
-		"SELECT id, household_id, name, display_order, icon, created_at, updated_at FROM stores WHERE household_id = ? ORDER BY display_order, name",
+		`SELECT id, household_id, name, display_order, icon,
+		        address, city, state, zip, store_number, nickname, latitude, longitude,
+		        created_at, updated_at
+		 FROM stores WHERE household_id = ? ORDER BY display_order, name`,
 		householdID,
 	)
 	if err != nil {
@@ -78,7 +94,9 @@ func (h *StoreHandler) List(c echo.Context) error {
 	stores := make([]storeResponse, 0)
 	for rows.Next() {
 		var s storeResponse
-		if err := rows.Scan(&s.ID, &s.HouseholdID, &s.Name, &s.DisplayOrder, &s.Icon, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.HouseholdID, &s.Name, &s.DisplayOrder, &s.Icon,
+			&s.Address, &s.City, &s.State, &s.Zip, &s.StoreNumber, &s.Nickname, &s.Latitude, &s.Longitude,
+			&s.CreatedAt, &s.UpdatedAt); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		stores = append(stores, s)
@@ -112,6 +130,7 @@ func (h *StoreHandler) Create(c echo.Context) error {
 		 RETURNING id`,
 		householdID, req.Name, req.Icon, now, now,
 	).Scan(&id)
+	// Note: new columns (address, city, state, zip, etc.) default to NULL on insert
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "store name already exists"})
@@ -121,9 +140,14 @@ func (h *StoreHandler) Create(c echo.Context) error {
 
 	var s storeResponse
 	err = h.DB.QueryRow(
-		"SELECT id, household_id, name, display_order, icon, created_at, updated_at FROM stores WHERE id = ?",
+		`SELECT id, household_id, name, display_order, icon,
+		        address, city, state, zip, store_number, nickname, latitude, longitude,
+		        created_at, updated_at
+		 FROM stores WHERE id = ?`,
 		id,
-	).Scan(&s.ID, &s.HouseholdID, &s.Name, &s.DisplayOrder, &s.Icon, &s.CreatedAt, &s.UpdatedAt)
+	).Scan(&s.ID, &s.HouseholdID, &s.Name, &s.DisplayOrder, &s.Icon,
+		&s.Address, &s.City, &s.State, &s.Zip, &s.StoreNumber, &s.Nickname, &s.Latitude, &s.Longitude,
+		&s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -148,8 +172,11 @@ func (h *StoreHandler) Update(c echo.Context) error {
 
 	now := time.Now().UTC()
 	result, err := h.DB.Exec(
-		"UPDATE stores SET name = ?, icon = ?, updated_at = ? WHERE id = ? AND household_id = ?",
-		req.Name, req.Icon, now, storeID, householdID,
+		`UPDATE stores SET name = ?, icon = ?, nickname = ?, address = ?, city = ?, state = ?, zip = ?,
+		        updated_at = ?
+		 WHERE id = ? AND household_id = ?`,
+		req.Name, req.Icon, req.Nickname, req.Address, req.City, req.State, req.Zip,
+		now, storeID, householdID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -164,9 +191,14 @@ func (h *StoreHandler) Update(c echo.Context) error {
 
 	var s storeResponse
 	err = h.DB.QueryRow(
-		"SELECT id, household_id, name, display_order, icon, created_at, updated_at FROM stores WHERE id = ?",
+		`SELECT id, household_id, name, display_order, icon,
+		        address, city, state, zip, store_number, nickname, latitude, longitude,
+		        created_at, updated_at
+		 FROM stores WHERE id = ?`,
 		storeID,
-	).Scan(&s.ID, &s.HouseholdID, &s.Name, &s.DisplayOrder, &s.Icon, &s.CreatedAt, &s.UpdatedAt)
+	).Scan(&s.ID, &s.HouseholdID, &s.Name, &s.DisplayOrder, &s.Icon,
+		&s.Address, &s.City, &s.State, &s.Zip, &s.StoreNumber, &s.Nickname, &s.Latitude, &s.Longitude,
+		&s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}

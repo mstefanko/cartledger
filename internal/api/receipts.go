@@ -46,19 +46,21 @@ type receiptListItem struct {
 }
 
 type lineItemResponse struct {
-	ID          string   `json:"id"`
-	ReceiptID   string   `json:"receipt_id"`
-	ProductID   *string  `json:"product_id,omitempty"`
-	ProductName *string  `json:"product_name,omitempty"`
-	Category    *string  `json:"category,omitempty"`
-	RawName     string   `json:"raw_name"`
-	Quantity    string   `json:"quantity"`
-	Unit        *string  `json:"unit,omitempty"`
-	UnitPrice   *string  `json:"unit_price,omitempty"`
-	TotalPrice  string   `json:"total_price"`
-	Matched     string   `json:"matched"`
-	Confidence  *float64 `json:"confidence,omitempty"`
-	LineNumber  *int     `json:"line_number,omitempty"`
+	ID             string   `json:"id"`
+	ReceiptID      string   `json:"receipt_id"`
+	ProductID      *string  `json:"product_id,omitempty"`
+	ProductName    *string  `json:"product_name,omitempty"`
+	Category       *string  `json:"category,omitempty"`
+	RawName        string   `json:"raw_name"`
+	Quantity       string   `json:"quantity"`
+	Unit           *string  `json:"unit,omitempty"`
+	UnitPrice      *string  `json:"unit_price,omitempty"`
+	TotalPrice     string   `json:"total_price"`
+	RegularPrice   *string  `json:"regular_price,omitempty"`
+	DiscountAmount *string  `json:"discount_amount,omitempty"`
+	Matched        string   `json:"matched"`
+	Confidence     *float64 `json:"confidence,omitempty"`
+	LineNumber     *int     `json:"line_number,omitempty"`
 }
 
 type receiptDetailResponse struct {
@@ -73,6 +75,9 @@ type receiptDetailResponse struct {
 	Total       *string            `json:"total,omitempty"`
 	Status      string             `json:"status"`
 	LLMProvider *string            `json:"llm_provider,omitempty"`
+	CardType    *string            `json:"card_type,omitempty"`
+	CardLast4   *string            `json:"card_last4,omitempty"`
+	ReceiptTime *string            `json:"receipt_time,omitempty"`
 	CreatedAt   string             `json:"created_at"`
 	LineItems   []lineItemResponse `json:"line_items"`
 }
@@ -245,7 +250,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 
 	err := h.DB.QueryRow(
 		`SELECT r.id, r.household_id, r.store_id, s.name, r.scanned_by, r.receipt_date,
-		        r.subtotal, r.tax, r.total, r.status, r.llm_provider, r.created_at
+		        r.subtotal, r.tax, r.total, r.status, r.llm_provider,
+		        r.card_type, r.card_last4, r.receipt_time, r.created_at
 		 FROM receipts r
 		 LEFT JOIN stores s ON r.store_id = s.id
 		 WHERE r.id = ? AND r.household_id = ?`,
@@ -253,7 +259,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	).Scan(
 		&resp.ID, &resp.HouseholdID, &resp.StoreID, &resp.StoreName,
 		&resp.ScannedBy, &receiptDate, &subtotal, &tax, &total,
-		&resp.Status, &resp.LLMProvider, &createdAt,
+		&resp.Status, &resp.LLMProvider,
+		&resp.CardType, &resp.CardLast4, &resp.ReceiptTime, &createdAt,
 	)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
@@ -281,6 +288,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	rows, err := h.DB.Query(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
+		        li.regular_price, li.discount_amount,
 		        li.matched, li.confidence, li.line_number
 		 FROM line_items li
 		 LEFT JOIN products p ON li.product_id = p.id
@@ -301,6 +309,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		if err := rows.Scan(
 			&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
 			&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
+			&li.RegularPrice, &li.DiscountAmount,
 			&li.Matched, &li.Confidence, &li.LineNumber,
 		); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

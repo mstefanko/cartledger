@@ -39,10 +39,8 @@ function pctChange(history: ProductDetail['price_history']): { pct: number; dire
 function PriceTrendSection({ detail }: { detail: ProductDetail }) {
   const { pct, direction } = pctChange(detail.price_history)
   // Sparkline placeholder — real chart in Phase 5
-  const bars = detail.price_history
-    .slice(0, 12)
-    .reverse()
-    .map((e) => parseFloat(e.unit_price))
+  const recentHistory = detail.price_history.slice(0, 12).reverse()
+  const bars = recentHistory.map((e) => parseFloat(e.unit_price))
 
   const max = Math.max(...bars, 1)
   const min = Math.min(...bars, 0)
@@ -62,12 +60,13 @@ function PriceTrendSection({ detail }: { detail: ProductDetail }) {
         <div className="flex items-end gap-1 h-16">
           {bars.map((val, i) => {
             const height = ((val - min) / range) * 100
+            const isSale = recentHistory[i]?.is_sale ?? false
             return (
               <div
                 key={i}
-                className="flex-1 bg-brand rounded-sm min-h-[4px]"
+                className={`flex-1 rounded-sm min-h-[4px] ${isSale ? 'bg-green-500' : 'bg-brand'}`}
                 style={{ height: `${Math.max(height, 6)}%` }}
-                title={`$${isNaN(val) ? '0.00' : val.toFixed(2)}`}
+                title={isSale ? `Sale price: $${isNaN(val) ? '0.00' : val.toFixed(2)}` : `$${isNaN(val) ? '0.00' : val.toFixed(2)}`}
               />
             )
           })}
@@ -81,6 +80,11 @@ function PriceTrendSection({ detail }: { detail: ProductDetail }) {
           <span>Min: {formatPrice(detail.stats.min)}</span>
           <span>Max: {formatPrice(detail.stats.max)}</span>
           <span>{detail.stats.count} purchases</span>
+        </div>
+      )}
+      {detail.stats.total_saved && parseFloat(detail.stats.total_saved) > 0 && (
+        <div className="mt-2 text-sm text-green-600">
+          Total saved: ${Number(detail.stats.total_saved).toFixed(2)}
         </div>
       )}
     </div>
@@ -521,6 +525,9 @@ function TransactionsSection({ detail }: { detail: ProductDetail }) {
                 </td>
                 <td className="py-2.5 text-right text-caption font-medium text-neutral-900">
                   {formatPrice(entry.unit_price, entry.unit || unit)}
+                  {entry.is_sale && (
+                    <span className="ml-1 text-xs text-green-600 font-medium">Sale</span>
+                  )}
                 </td>
                 <td className="py-2.5 text-right text-caption text-neutral-600">
                   {formatPrice(entry.total_price)}

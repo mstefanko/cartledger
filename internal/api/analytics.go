@@ -47,6 +47,7 @@ type pricePoint struct {
 	Date            string  `json:"date"`
 	NormalizedPrice float64 `json:"normalized_price"`
 	Store           string  `json:"store"`
+	IsSale          bool    `json:"is_sale"`
 }
 
 type productTrendResponse struct {
@@ -110,6 +111,7 @@ type dealItem struct {
 	LatestPrice    float64 `json:"latest_price"`
 	AvgPrice       float64 `json:"avg_price"`
 	SavingsPercent float64 `json:"savings_percent"`
+	IsSale         bool    `json:"is_sale"`
 }
 
 type buyAgainItem struct {
@@ -196,7 +198,7 @@ func (h *AnalyticsHandler) ProductTrend(c echo.Context) error {
 	rows, err := h.DB.Query(
 		`SELECT pp.receipt_date,
 		        COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price,
-		        s.name
+		        s.name, pp.is_sale
 		 FROM product_prices pp
 		 JOIN stores s ON pp.store_id = s.id
 		 WHERE pp.product_id = ? AND pp.receipt_date >= ?
@@ -212,7 +214,7 @@ func (h *AnalyticsHandler) ProductTrend(c echo.Context) error {
 	for rows.Next() {
 		var pp pricePoint
 		var receiptDate time.Time
-		if err := rows.Scan(&receiptDate, &pp.NormalizedPrice, &pp.Store); err != nil {
+		if err := rows.Scan(&receiptDate, &pp.NormalizedPrice, &pp.Store, &pp.IsSale); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		pp.Date = receiptDate.Format("2006-01-02")
@@ -522,7 +524,7 @@ func (h *AnalyticsHandler) Deals(c echo.Context) error {
 	rows, err := h.DB.Query(
 		`SELECT p.id, p.name, s.name,
 		        COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) as latest_price,
-		        stats.avg_price
+		        stats.avg_price, latest_pp.is_sale
 		 FROM products p
 		 JOIN product_prices latest_pp ON latest_pp.product_id = p.id
 		   AND latest_pp.receipt_date = (
@@ -552,7 +554,7 @@ func (h *AnalyticsHandler) Deals(c echo.Context) error {
 	deals := make([]dealItem, 0)
 	for rows.Next() {
 		var d dealItem
-		if err := rows.Scan(&d.ProductID, &d.ProductName, &d.Store, &d.LatestPrice, &d.AvgPrice); err != nil {
+		if err := rows.Scan(&d.ProductID, &d.ProductName, &d.Store, &d.LatestPrice, &d.AvgPrice, &d.IsSale); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		d.AvgPrice = math.Round(d.AvgPrice*100) / 100

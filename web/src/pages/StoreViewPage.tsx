@@ -3,6 +3,14 @@ import { useQuery } from '@tanstack/react-query'
 import { getStoreSummary } from '@/api/analytics'
 import { Badge } from '@/components/ui/Badge'
 
+function formatAddress(store: { address: string | null; city: string | null; state: string | null; zip: string | null }) {
+  const parts = [store.address, store.city, store.state].filter(Boolean)
+  if (parts.length === 0) return null
+  let addr = parts.join(', ')
+  if (store.zip) addr += ` ${store.zip}`
+  return addr
+}
+
 function formatCurrency(value: string | undefined): string {
   if (!value) return '$0.00'
   const num = parseFloat(value)
@@ -50,9 +58,24 @@ function StoreViewPage() {
       </div>
       <div className="flex items-center gap-3">
         {summary.store.icon && <span className="text-section">{summary.store.icon}</span>}
-        <h1 className="font-display text-section font-bold text-neutral-900 tracking-tight">
-          {summary.store.name}
-        </h1>
+        <div>
+          <div className="flex items-center gap-2">
+            <h1 className="font-display text-section font-bold text-neutral-900 tracking-tight">
+              {summary.store.name}
+            </h1>
+            {summary.store.store_number && (
+              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-neutral-100 text-neutral-600">
+                Store #{summary.store.store_number}
+              </span>
+            )}
+          </div>
+          {summary.store.nickname && (
+            <p className="text-small text-neutral-500">{summary.store.nickname}</p>
+          )}
+          {formatAddress(summary.store) && (
+            <p className="text-small text-neutral-400">{formatAddress(summary.store)}</p>
+          )}
+        </div>
       </div>
 
       {/* Stats Cards */}
