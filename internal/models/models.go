@@ -44,6 +44,8 @@ type Product struct {
 	Notes           *string    `json:"notes,omitempty"`
 	LastPurchasedAt *time.Time `json:"last_purchased_at,omitempty"`
 	PurchaseCount   int        `json:"purchase_count"`
+	Brand           *string    `json:"brand,omitempty" db:"brand"`
+	ProductTags     *string    `json:"product_tags,omitempty" db:"product_tags"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 }
@@ -99,8 +101,11 @@ type LineItem struct {
 	TotalPrice decimal.Decimal  `json:"total_price"`
 	Matched    string           `json:"matched"`
 	Confidence *float64         `json:"confidence,omitempty"`
-	LineNumber *int             `json:"line_number,omitempty"`
-	CreatedAt  time.Time        `json:"created_at"`
+	LineNumber         *int             `json:"line_number,omitempty"`
+	SuggestedName      *string          `json:"suggested_name,omitempty" db:"suggested_name"`
+	SuggestedCategory  *string          `json:"suggested_category,omitempty" db:"suggested_category"`
+	SuggestedProductID *string          `json:"suggested_product_id,omitempty" db:"suggested_product_id"`
+	CreatedAt          time.Time        `json:"created_at"`
 }
 
 // ProductPrice stores a denormalized price record for analytics.

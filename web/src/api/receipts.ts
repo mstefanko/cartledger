@@ -1,8 +1,10 @@
-import { get, put, postMultipart } from './client'
+import { get, put, post, postMultipart } from './client'
 import type {
   Receipt,
   LineItem,
   UpdateLineItemRequest,
+  AcceptSuggestionsRequest,
+  AcceptSuggestionsResponse,
 } from '@/types'
 
 export async function scanReceipt(images: File[]): Promise<Receipt> {
@@ -32,6 +34,16 @@ export async function updateLineItem(
 ): Promise<LineItem> {
   return put<LineItem>(
     `/receipts/${encodeURIComponent(receiptId)}/line-items/${encodeURIComponent(itemId)}`,
+    data,
+  )
+}
+
+export async function acceptSuggestions(
+  receiptId: string,
+  data: AcceptSuggestionsRequest,
+): Promise<AcceptSuggestionsResponse> {
+  return post<AcceptSuggestionsResponse>(
+    `/receipts/${encodeURIComponent(receiptId)}/accept-suggestions`,
     data,
   )
 }

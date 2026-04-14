@@ -24,6 +24,8 @@ type ExtractedItem struct {
 	RawName           string  `json:"raw_name"`
 	SuggestedName     string  `json:"suggested_name"`
 	SuggestedCategory string  `json:"suggested_category"`
+	SuggestedBrand    string  `json:"suggested_brand"`
+	SuggestedTags     string  `json:"suggested_tags"`
 	Quantity          float64 `json:"quantity"`
 	Unit              *string `json:"unit"`
 	UnitPrice         *float64 `json:"unit_price"`

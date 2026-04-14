@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 // CreateRuleModal replaced by inline batch rule modal
-import { getReceipt, updateLineItem, type ReceiptDetail } from '@/api/receipts'
+import { getReceipt, updateLineItem, acceptSuggestions, type ReceiptDetail } from '@/api/receipts'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { LineItem, Product } from '@/types'
@@ -119,7 +119,7 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
     if (!receipt) return []
     return receipt.line_items.map((li) => ({
       ...li,
-      product_name: li.product_id ? productMap.get(li.product_id) ?? '' : '',
+      product_name: li.product_name ?? (li.product_id ? productMap.get(li.product_id) ?? '' : ''),
     }))
   }, [receipt, productMap])
 
@@ -128,10 +128,27 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
     () => rows.filter((r) => r.matched !== 'unmatched').length,
     [rows],
   )
-  const needsReviewCount = useMemo(
-    () => rows.filter((r) => r.matched === 'unmatched').length,
+  const suggestedRows = useMemo(
+    () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type != null),
     [rows],
   )
+  const suggestedCount = suggestedRows.length
+  const unmatchedCount = useMemo(
+    () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type == null).length,
+    [rows],
+  )
+
+  // --- Accept suggestions mutation ---
+  const acceptMutation = useMutation({
+    mutationFn: () => {
+      const ids = suggestedRows.map((r) => r.id)
+      return acceptSuggestions(receiptId, { line_item_ids: ids })
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
 
   // --- Cell update handler ---
   const handleCellUpdate = useCallback(
@@ -222,10 +239,32 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
               </span>
             )
           }
+          if (item.suggestion_type) {
+            return (
+              <span
+                className="flex items-center justify-center"
+                title={item.suggestion_type === 'existing_match' ? 'Suggested match' : 'Suggested new product'}
+              >
+                <svg
+                  className="w-4 h-4 text-amber-500"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={2.5}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"
+                  />
+                </svg>
+              </span>
+            )
+          }
           return (
             <span
               className="flex items-center justify-center"
-              title="Needs review"
+              title="Unmatched"
             >
               <svg
                 className="w-4 h-4 text-expensive"
@@ -248,6 +287,33 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         accessorKey: 'raw_name',
         header: 'Receipt Text',
         size: 200,
+      },
+      {
+        id: 'suggestion',
+        header: 'Suggestion',
+        size: 200,
+        cell: ({ row }) => {
+          const item = row.original
+          if (item.matched !== 'unmatched' || !item.suggestion_type) return null
+          const label = item.suggestion_type === 'existing_match' ? 'Match' : 'New'
+          const name = item.suggestion_type === 'existing_match'
+            ? item.suggested_product_name
+            : item.suggested_name
+          return (
+            <div className="flex items-center gap-1.5">
+              <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+                item.suggestion_type === 'existing_match'
+                  ? 'bg-amber-100 text-amber-700'
+                  : 'bg-blue-100 text-blue-700'
+              }`}>
+                {label}
+              </span>
+              <span className="text-caption text-neutral-700 truncate">
+                {name}
+              </span>
+            </div>
+          )
+        },
       },
       {
         accessorKey: 'product_id',
@@ -322,7 +388,11 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
 
   // --- Row class names for unmatched highlighting ---
   const getRowClassName = useCallback(
-    (row: LineItemRow) => (row.matched === 'unmatched' ? 'bg-expensive-subtle/30' : ''),
+    (row: LineItemRow) => {
+      if (row.matched !== 'unmatched') return ''
+      if (row.suggestion_type) return 'bg-amber-50/50'
+      return 'bg-expensive-subtle/30'
+    },
     [],
   )
 
@@ -351,8 +421,11 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Badge variant="success">{matchedCount} matched</Badge>
-          {needsReviewCount > 0 && (
-            <Badge variant="warning">{needsReviewCount} need review</Badge>
+          {suggestedCount > 0 && (
+            <Badge variant="warning">{suggestedCount} suggested</Badge>
+          )}
+          {unmatchedCount > 0 && (
+            <Badge variant="error">{unmatchedCount} unmatched</Badge>
           )}
           <span className="text-caption text-neutral-400">
             {receipt.status === 'reviewed' ? 'Reviewed' : receipt.status}
@@ -371,6 +444,18 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
           >
             View Raw JSON
           </Button>
+          {suggestedCount > 0 && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => acceptMutation.mutate()}
+              disabled={acceptMutation.isPending}
+            >
+              {acceptMutation.isPending
+                ? 'Accepting...'
+                : `Accept All Suggestions (${suggestedCount})`}
+            </Button>
+          )}
           <Button
             variant="primary"
             size="sm"

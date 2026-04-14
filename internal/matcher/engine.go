@@ -47,3 +47,55 @@ func (e *Engine) Match(rawName string, storeID string, householdID string) Match
 
 	return MatchResult{Method: "unmatched", Confidence: 0}
 }
+
+// MatchWithSuggestion extends the standard pipeline with suggested-name matching.
+// After the 3-stage pipeline fails on raw_name, it runs additional stages using
+// the LLM's suggested_name against existing product names and aliases.
+//
+// Stage 4: Exact match suggested_name against product names (case-insensitive).
+// Stage 5: Fuzzy match suggested_name against product names + aliases.
+//
+// Matches from stages 4-5 are returned with Method="suggested" — they are
+// proposals awaiting user confirmation, not finalized matches.
+func (e *Engine) MatchWithSuggestion(rawName, suggestedName, storeID, householdID string) MatchResult {
+	// Stages 1-3: standard pipeline on raw_name.
+	result := e.Match(rawName, storeID, householdID)
+	if result.Method != "unmatched" {
+		return result
+	}
+
+	if suggestedName == "" {
+		return result
+	}
+
+	// Stage 4: Exact match suggested_name against product names.
+	if r := matchNameExact(e.db, suggestedName, householdID); r != nil {
+		return *r
+	}
+
+	// Stage 5: Fuzzy match suggested_name against product names + aliases.
+	normalizedSuggestion := Normalize(suggestedName)
+	if r := matchByFuzzy(e.db, normalizedSuggestion, storeID, householdID); r != nil {
+		r.Method = "suggested"
+		return *r
+	}
+
+	return MatchResult{Method: "unmatched", Confidence: 0}
+}
+
+// matchNameExact does a case-insensitive exact match of suggestedName against product names.
+func matchNameExact(db *sql.DB, suggestedName string, householdID string) *MatchResult {
+	var productID string
+	err := db.QueryRow(
+		`SELECT id FROM products WHERE household_id = ? AND LOWER(name) = LOWER(?) LIMIT 1`,
+		householdID, suggestedName,
+	).Scan(&productID)
+	if err == nil {
+		return &MatchResult{
+			ProductID:  productID,
+			Confidence: 0.92,
+			Method:     "suggested",
+		}
+	}
+	return nil
+}

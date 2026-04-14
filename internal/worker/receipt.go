@@ -248,29 +248,44 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			discountAmount = &da
 		}
 
-		// Run matcher.
-		matchResult := w.matchEngine.Match(item.RawName, storeID, job.HouseholdID)
+		// Run matcher with suggested-name fallback.
+		matchResult := w.matchEngine.MatchWithSuggestion(item.RawName, item.SuggestedName, storeID, job.HouseholdID)
 
 		matched := matchResult.Method
-		if matched == "unmatched" {
+		if matched == "unmatched" || matched == "suggested" {
 			hasUnmatched = true
 		}
 
 		var productID *string
 		var confidence *float64
-		if matchResult.Method != "unmatched" {
+		var suggestedProductID *string
+		if matchResult.Method == "suggested" {
+			// Suggestion only — don't finalize, store as suggested_product_id.
+			suggestedProductID = &matchResult.ProductID
+			confidence = &matchResult.Confidence
+			matched = "unmatched" // remains unmatched until user accepts
+		} else if matchResult.Method != "unmatched" {
 			productID = &matchResult.ProductID
 			confidence = &matchResult.Confidence
 		}
 
 		lineNum := item.LineNumber
 
+		var suggestedName, suggestedCategory *string
+		if item.SuggestedName != "" {
+			suggestedName = &item.SuggestedName
+		}
+		if item.SuggestedCategory != "" {
+			suggestedCategory = &item.SuggestedCategory
+		}
+
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, suggested_name, suggested_category, suggested_product_id, matched, confidence, line_number, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
 			regularPrice, discountAmount,
+			suggestedName, suggestedCategory, suggestedProductID,
 			matched, confidence, lineNum, now,
 		)
 		if err != nil {

@@ -18,6 +18,8 @@ Return a JSON object with this exact structure:
     {
       "raw_name": "exact text from receipt",
       "suggested_name": "Human-readable canonical product name",
+      "suggested_brand": "Brand name or null if generic/store-brand not identifiable",
+      "suggested_tags": "comma-separated attributes: organic, frozen, canned, fresh, gluten-free, etc.",
       "suggested_category": "Meat|Produce|Dairy|Bakery|Frozen|Pantry|Snacks|Beverages|Household|Health|Other",
       "quantity": 1.0,
       "unit": "lb" | "oz" | "gal" | "each" | "pack" | null,
@@ -37,7 +39,17 @@ Return a JSON object with this exact structure:
 
 Rules:
 - raw_name must be EXACTLY as printed on receipt (preserve abbreviations)
-- suggested_name should be a clean, human-readable product name (e.g., "BNLS CHKN BRST" → "Chicken Breast, Boneless")
+- suggested_name: clean, human-readable canonical product name
+  - Include brand when identifiable (e.g., "Kirkland Organic Broccoli Florets")
+  - Expand store-brand abbreviations: KS = Kirkland Signature, GV = Great Value, 365 = 365 by Whole Foods
+  - Include relevant qualifiers: organic, boneless, skinless, frozen, etc.
+  - Do NOT include package size (that goes in quantity/unit)
+  - Format: "[Brand] [Qualifiers] Product [Form]" — e.g., "Kirkland Organic Broccoli Florets"
+- suggested_brand: the brand name expanded fully, or null for generic products
+  - "KS" → "Kirkland Signature", "GV" → "Great Value"
+- suggested_tags: comma-separated lowercase attributes extracted from the item
+  - Types: organic, conventional, gluten-free, sugar-free, low-fat, etc.
+  - Forms: fresh, frozen, canned, dried, whole, sliced, florets, ground, etc.
 - suggested_category must be one of the listed categories
 - If quantity and unit_price are visible, include both
 - If only total_price is visible, set unit_price to null and quantity to 1

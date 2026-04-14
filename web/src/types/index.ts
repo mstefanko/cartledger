@@ -94,6 +94,8 @@ export interface LineItem {
   id: string
   receipt_id: string
   product_id: string | null
+  product_name: string | null
+  category: string | null
   raw_name: string
   quantity: string
   unit: string | null
@@ -104,7 +106,24 @@ export interface LineItem {
   regular_price: string | null
   discount_amount: string | null
   line_number: number | null
+  suggested_name: string | null
+  suggested_category: string | null
+  suggested_product_id: string | null
+  suggested_product_name: string | null
+  suggestion_type: 'existing_match' | 'new_product' | null
   created_at: string
+}
+
+export interface AcceptSuggestionsRequest {
+  line_item_ids: string[]
+  edits?: Record<string, { name?: string; category?: string }>
+}
+
+export interface AcceptSuggestionsResponse {
+  created_count: number
+  matched_count: number
+  products_created: { id: string; name: string }[]
+  products_matched: { id: string; name: string }[]
 }
 
 export interface ProductPrice {

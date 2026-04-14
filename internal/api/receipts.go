@@ -16,6 +16,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
 
@@ -46,21 +47,26 @@ type receiptListItem struct {
 }
 
 type lineItemResponse struct {
-	ID             string   `json:"id"`
-	ReceiptID      string   `json:"receipt_id"`
-	ProductID      *string  `json:"product_id,omitempty"`
-	ProductName    *string  `json:"product_name,omitempty"`
-	Category       *string  `json:"category,omitempty"`
-	RawName        string   `json:"raw_name"`
-	Quantity       string   `json:"quantity"`
-	Unit           *string  `json:"unit,omitempty"`
-	UnitPrice      *string  `json:"unit_price,omitempty"`
-	TotalPrice     string   `json:"total_price"`
-	RegularPrice   *string  `json:"regular_price,omitempty"`
-	DiscountAmount *string  `json:"discount_amount,omitempty"`
-	Matched        string   `json:"matched"`
-	Confidence     *float64 `json:"confidence,omitempty"`
-	LineNumber     *int     `json:"line_number,omitempty"`
+	ID                   string   `json:"id"`
+	ReceiptID            string   `json:"receipt_id"`
+	ProductID            *string  `json:"product_id,omitempty"`
+	ProductName          *string  `json:"product_name,omitempty"`
+	Category             *string  `json:"category,omitempty"`
+	RawName              string   `json:"raw_name"`
+	Quantity             string   `json:"quantity"`
+	Unit                 *string  `json:"unit,omitempty"`
+	UnitPrice            *string  `json:"unit_price,omitempty"`
+	TotalPrice           string   `json:"total_price"`
+	RegularPrice         *string  `json:"regular_price,omitempty"`
+	DiscountAmount       *string  `json:"discount_amount,omitempty"`
+	Matched              string   `json:"matched"`
+	Confidence           *float64 `json:"confidence,omitempty"`
+	LineNumber           *int     `json:"line_number,omitempty"`
+	SuggestedName        *string  `json:"suggested_name,omitempty"`
+	SuggestedCategory    *string  `json:"suggested_category,omitempty"`
+	SuggestedProductID   *string  `json:"suggested_product_id,omitempty"`
+	SuggestedProductName *string  `json:"suggested_product_name,omitempty"`
+	SuggestionType       *string  `json:"suggestion_type,omitempty"`
 }
 
 type receiptDetailResponse struct {
@@ -89,6 +95,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.GET("", h.List)
 	receipts.GET("/:id", h.Get)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
+	receipts.POST("/:id/accept-suggestions", h.AcceptSuggestions)
 }
 
 // Scan handles multipart receipt image upload and submits for background processing.
@@ -284,14 +291,17 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		resp.Total = &s
 	}
 
-	// Fetch line items with product info.
+	// Fetch line items with product info and suggestion data.
 	rows, err := h.DB.Query(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount,
-		        li.matched, li.confidence, li.line_number
+		        li.matched, li.confidence, li.line_number,
+		        li.suggested_name, li.suggested_category,
+		        li.suggested_product_id, sp.name
 		 FROM line_items li
 		 LEFT JOIN products p ON li.product_id = p.id
+		 LEFT JOIN products sp ON li.suggested_product_id = sp.id
 		 WHERE li.receipt_id = ?
 		 ORDER BY li.line_number, li.created_at`,
 		receiptID,
@@ -311,6 +321,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 			&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
 			&li.RegularPrice, &li.DiscountAmount,
 			&li.Matched, &li.Confidence, &li.LineNumber,
+			&li.SuggestedName, &li.SuggestedCategory,
+			&li.SuggestedProductID, &li.SuggestedProductName,
 		); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
@@ -319,6 +331,16 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		if unitPrice != nil {
 			s := unitPrice.String()
 			li.UnitPrice = &s
+		}
+		// Compute suggestion_type for unmatched items with suggestions.
+		if li.Matched == "unmatched" && li.SuggestedName != nil {
+			if li.SuggestedProductID != nil {
+				st := "existing_match"
+				li.SuggestionType = &st
+			} else {
+				st := "new_product"
+				li.SuggestionType = &st
+			}
 		}
 		resp.LineItems = append(resp.LineItems, li)
 	}
@@ -392,4 +414,238 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// --- Accept Suggestions types ---
+
+type acceptSuggestionsRequest struct {
+	LineItemIDs []string                       `json:"line_item_ids"`
+	Edits       map[string]suggestionEditInput `json:"edits,omitempty"`
+}
+
+type suggestionEditInput struct {
+	Name     *string `json:"name,omitempty"`
+	Category *string `json:"category,omitempty"`
+}
+
+type acceptSuggestionsResponse struct {
+	CreatedCount    int              `json:"created_count"`
+	MatchedCount    int              `json:"matched_count"`
+	ProductsCreated []productBrief   `json:"products_created"`
+	ProductsMatched []productBrief   `json:"products_matched"`
+}
+
+type productBrief struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// AcceptSuggestions batch-accepts suggested matches and creates new products.
+// POST /api/v1/receipts/:id/accept-suggestions
+func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	var req acceptSuggestionsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.LineItemIDs) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "line_item_ids is required"})
+	}
+
+	// Verify receipt belongs to household.
+	var storeID *string
+	var receiptDate time.Time
+	err := h.DB.QueryRow(
+		"SELECT store_id, receipt_date FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&storeID, &receiptDate)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	resp := acceptSuggestionsResponse{
+		ProductsCreated: make([]productBrief, 0),
+		ProductsMatched: make([]productBrief, 0),
+	}
+
+	// Track created products by name to deduplicate within batch.
+	createdByName := make(map[string]string) // suggested_name -> product_id
+
+	for _, itemID := range req.LineItemIDs {
+		// Fetch line item with suggestion data.
+		var rawName string
+		var suggestedName, suggestedCategory, suggestedProductID *string
+		var quantity decimal.Decimal
+		var unit *string
+		var totalPrice decimal.Decimal
+		var regularPrice, discountAmount sql.NullString
+		err := tx.QueryRow(
+			`SELECT li.raw_name, li.suggested_name, li.suggested_category, li.suggested_product_id,
+			        li.quantity, li.unit, li.total_price, li.regular_price, li.discount_amount
+			 FROM line_items li
+			 WHERE li.id = ? AND li.receipt_id = ?`,
+			itemID, receiptID,
+		).Scan(&rawName, &suggestedName, &suggestedCategory, &suggestedProductID,
+			&quantity, &unit, &totalPrice, &regularPrice, &discountAmount)
+		if err == sql.ErrNoRows {
+			continue // skip invalid IDs
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+
+		// Apply per-item edits if provided.
+		edit := req.Edits[itemID]
+
+		var productID string
+		var productName string
+
+		if suggestedProductID != nil {
+			// Case 1: Match to existing product.
+			productID = *suggestedProductID
+			// Get product name for response.
+			_ = tx.QueryRow("SELECT name FROM products WHERE id = ?", productID).Scan(&productName)
+			resp.MatchedCount++
+			resp.ProductsMatched = append(resp.ProductsMatched, productBrief{ID: productID, Name: productName})
+		} else {
+			// Case 2: Create new product from suggestion.
+			name := ""
+			if edit.Name != nil {
+				name = *edit.Name
+			} else if suggestedName != nil {
+				name = *suggestedName
+			} else {
+				name = rawName // fallback
+			}
+
+			category := ""
+			if edit.Category != nil {
+				category = *edit.Category
+			} else if suggestedCategory != nil {
+				category = *suggestedCategory
+			}
+
+			// Deduplicate: check if we already created this product in this batch.
+			if existingID, ok := createdByName[strings.ToLower(name)]; ok {
+				productID = existingID
+				productName = name
+			} else {
+				// Check if product already exists in household.
+				err = tx.QueryRow(
+					"SELECT id FROM products WHERE household_id = ? AND LOWER(name) = LOWER(?)",
+					householdID, name,
+				).Scan(&productID)
+				if err == sql.ErrNoRows {
+					// Create new product.
+					productID = uuid.New().String()
+					var catPtr *string
+					if category != "" {
+						catPtr = &category
+					}
+					_, err = tx.Exec(
+						`INSERT INTO products (id, household_id, name, category, purchase_count, created_at, updated_at)
+						 VALUES (?, ?, ?, ?, 0, ?, ?)`,
+						productID, householdID, name, catPtr, now, now,
+					)
+					if err != nil {
+						return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create product"})
+					}
+					resp.CreatedCount++
+					resp.ProductsCreated = append(resp.ProductsCreated, productBrief{ID: productID, Name: name})
+				} else if err != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+				} else {
+					// Already exists — treat as match.
+					resp.MatchedCount++
+					resp.ProductsMatched = append(resp.ProductsMatched, productBrief{ID: productID, Name: name})
+				}
+				createdByName[strings.ToLower(name)] = productID
+			}
+			productName = name
+		}
+
+		// Finalize: set product_id, matched = 'auto', clear suggestion.
+		_, err = tx.Exec(
+			"UPDATE line_items SET product_id = ?, matched = 'auto', suggested_product_id = NULL WHERE id = ?",
+			productID, itemID,
+		)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update line item"})
+		}
+
+		// Create alias from raw_name -> product.
+		if storeID != nil {
+			normalized := matcher.Normalize(rawName)
+			var aliasExists int
+			_ = tx.QueryRow(
+				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
+				productID, normalized,
+			).Scan(&aliasExists)
+			if aliasExists == 0 {
+				_, _ = tx.Exec(
+					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					uuid.New().String(), productID, normalized, *storeID, now,
+				)
+			}
+
+			// Insert product_prices record.
+			unitStr := "each"
+			if unit != nil {
+				unitStr = *unit
+			}
+			if quantity.IsZero() {
+				quantity = decimal.NewFromInt(1)
+			}
+			unitPrice := totalPrice.Div(quantity)
+			isSale := regularPrice.Valid && discountAmount.Valid
+			var regPriceVal, discountVal interface{}
+			if regularPrice.Valid {
+				regPriceVal = regularPrice.String
+			}
+			if discountAmount.Valid {
+				discountVal = discountAmount.String
+			}
+			_, _ = tx.Exec(
+				`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				uuid.New().String(), productID, *storeID, receiptID,
+				receiptDate, quantity.String(), unitStr, unitPrice.String(),
+				regPriceVal, discountVal, isSale, now,
+			)
+		}
+
+		// Update product purchase stats.
+		_, _ = tx.Exec(
+			"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
+			receiptDate, now, productID,
+		)
+	}
+
+	// Check if all line items are now matched; update receipt status if so.
+	var unmatchedCount int
+	_ = tx.QueryRow(
+		"SELECT COUNT(*) FROM line_items WHERE receipt_id = ? AND matched = 'unmatched'",
+		receiptID,
+	).Scan(&unmatchedCount)
+	if unmatchedCount == 0 {
+		_, _ = tx.Exec("UPDATE receipts SET status = 'matched' WHERE id = ?", receiptID)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	return c.JSON(http.StatusOK, resp)
 }
