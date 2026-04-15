@@ -58,6 +58,7 @@ type productResponse struct {
 	Brand           *string    `json:"brand,omitempty"`
 	PackQuantity    *float64   `json:"pack_quantity,omitempty"`
 	PackUnit        *string    `json:"pack_unit,omitempty"`
+	ProductGroupID  *string    `json:"product_group_id,omitempty"`
 	LastPurchasedAt *time.Time `json:"last_purchased_at,omitempty"`
 	PurchaseCount   int        `json:"purchase_count"`
 	AliasCount      int        `json:"alias_count"`
@@ -91,14 +92,14 @@ func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
 	var p productResponse
 	err := h.DB.QueryRow(
 		`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-		        p.brand, p.pack_quantity, p.pack_unit,
+		        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
 		        p.last_purchased_at, p.purchase_count,
 		        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 		        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
 		        p.created_at, p.updated_at
 		 FROM products p WHERE p.id = ?`, id,
 	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.Brand, &p.PackQuantity, &p.PackUnit,
+		&p.Brand, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
 		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
 	return p, err
 }
@@ -135,7 +136,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 		if brandFilter != "" {
 			rows, err = h.DB.Query(
 				`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-				        p.brand, p.pack_quantity, p.pack_unit,
+				        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
 				        p.last_purchased_at, p.purchase_count,
 				        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 				        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
@@ -149,7 +150,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 		} else {
 			rows, err = h.DB.Query(
 				`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-				        p.brand, p.pack_quantity, p.pack_unit,
+				        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
 				        p.last_purchased_at, p.purchase_count,
 				        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 				        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
@@ -164,7 +165,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 	} else if brandFilter != "" {
 		rows, err = h.DB.Query(
 			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-			        p.brand, p.pack_quantity, p.pack_unit,
+			        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
 			        p.last_purchased_at, p.purchase_count,
 			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
@@ -175,7 +176,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 	} else {
 		rows, err = h.DB.Query(
 			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-			        p.brand, p.pack_quantity, p.pack_unit,
+			        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
 			        p.last_purchased_at, p.purchase_count,
 			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
@@ -193,7 +194,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 	for rows.Next() {
 		var p productResponse
 		if err := rows.Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-			&p.Brand, &p.PackQuantity, &p.PackUnit,
+			&p.Brand, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
 			&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
@@ -260,8 +261,35 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 	req.Name = strings.TrimSpace(req.Name)
+
+	// Support partial updates: if name is empty, merge with existing product data.
 	if req.Name == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+		existing, err := h.fetchProduct(productID)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		req.Name = existing.Name
+		if req.Category == nil {
+			req.Category = existing.Category
+		}
+		if req.DefaultUnit == nil {
+			req.DefaultUnit = existing.DefaultUnit
+		}
+		if req.Notes == nil {
+			req.Notes = existing.Notes
+		}
+		if req.Brand == nil {
+			req.Brand = existing.Brand
+		}
+		if req.PackQuantity == nil {
+			req.PackQuantity = existing.PackQuantity
+		}
+		if req.PackUnit == nil {
+			req.PackUnit = existing.PackUnit
+		}
+		if req.ProductGroupID == nil {
+			req.ProductGroupID = existing.ProductGroupID
+		}
 	}
 
 	// Normalize brand if provided.
