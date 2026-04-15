@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
@@ -6,6 +6,68 @@ import { getReceipt, deleteReceipt, type ReceiptDetail } from '@/api/receipts'
 import { getToken } from '@/api/client'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
+
+const LENS_SIZE = 180
+const ZOOM = 2.5
+
+function ReceiptMagnifier({ src, alt }: { src: string; alt: string }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [lens, setLens] = useState<{ x: number; y: number; bgX: number; bgY: number; show: boolean; imgW: number; imgH: number }>({
+    x: 0, y: 0, bgX: 0, bgY: 0, show: false, imgW: 0, imgH: 0,
+  })
+
+  const handleMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const container = containerRef.current
+    const img = container?.querySelector('img')
+    if (!container || !img) return
+    const rect = img.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    // clamp
+    if (x < 0 || y < 0 || x > rect.width || y > rect.height) {
+      setLens((p) => ({ ...p, show: false }))
+      return
+    }
+    // background position: scale mouse coords to natural image size
+    const ratioX = img.naturalWidth / rect.width
+    const ratioY = img.naturalHeight / rect.height
+    setLens({
+      x: e.clientX - container.getBoundingClientRect().left,
+      y: e.clientY - container.getBoundingClientRect().top,
+      bgX: x * ratioX * ZOOM - LENS_SIZE / 2,
+      bgY: y * ratioY * ZOOM - LENS_SIZE / 2,
+      show: true,
+      imgW: img.naturalWidth * ZOOM,
+      imgH: img.naturalHeight * ZOOM,
+    })
+  }, [])
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative cursor-crosshair"
+      onMouseMove={handleMove}
+      onMouseLeave={() => setLens((p) => ({ ...p, show: false }))}
+    >
+      <img src={src} alt={alt} className="w-full rounded-lg shadow-micro" loading="lazy" />
+      {lens.show && (
+        <div
+          className="pointer-events-none absolute border-2 border-white rounded-full shadow-lg z-10"
+          style={{
+            width: LENS_SIZE,
+            height: LENS_SIZE,
+            left: lens.x - LENS_SIZE / 2,
+            top: lens.y - LENS_SIZE / 2,
+            backgroundImage: `url(${src})`,
+            backgroundSize: `${lens.imgW}px ${lens.imgH}px`,
+            backgroundPosition: `-${lens.bgX}px -${lens.bgY}px`,
+            backgroundRepeat: 'no-repeat',
+          }}
+        />
+      )}
+    </div>
+  )
+}
 
 function ReceiptReviewPage() {
   const { id } = useParams<{ id: string }>()
@@ -120,14 +182,13 @@ function ReceiptReviewPage() {
           {imagePaths.length > 0 ? (
             <div className="flex flex-col gap-4 overflow-y-auto max-h-[80vh] rounded-lg border border-neutral-200 p-2 bg-neutral-50">
               {imagePaths.map((path, idx) => (
-                <img
+                <ReceiptMagnifier
                   key={idx}
                   src={`/api/v1/files/${path}?token=${encodeURIComponent(getToken() ?? '')}`}
                   alt={`Receipt page ${idx + 1}`}
-                  className="max-w-[280px] mx-auto rounded-lg shadow-micro"
-                  loading="lazy"
                 />
               ))}
+              <p className="text-xs text-neutral-400 text-center pb-1">Hover to magnify</p>
             </div>
           ) : (
             <div className="flex items-center justify-center h-64 rounded-lg border border-neutral-200 bg-neutral-50">

@@ -278,13 +278,13 @@ export interface ProductDetail {
   images: ProductImage[]
   links: ProductLink[]
   price_history: PriceHistoryEntry[]
-  store_prices: StorePriceComparison[]
+  store_comparison: StorePriceComparison[]
   price_per_unit?: number
   stats: {
-    count: number
-    avg: string
-    min: string
-    max: string
+    total_purchases: number
+    avg_price: string
+    min_price: string
+    max_price: string
     total_saved?: string
   }
 }

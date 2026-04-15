@@ -175,12 +175,12 @@ function PriceTrendSection({ detail }: { detail: ProductDetail }) {
       ) : (
         <p className="text-caption text-neutral-400">Not enough data for trend</p>
       )}
-      {detail.stats.count > 0 && (
+      {detail.stats.total_purchases > 0 && (
         <div className="flex gap-4 mt-3 text-small text-neutral-500">
-          <span>Avg: {formatPrice(detail.stats.avg)}</span>
-          <span>Min: {formatPrice(detail.stats.min)}</span>
-          <span>Max: {formatPrice(detail.stats.max)}</span>
-          <span>{detail.stats.count} purchases</span>
+          <span>Avg: {formatPrice(detail.stats.avg_price)}</span>
+          <span>Min: {formatPrice(detail.stats.min_price)}</span>
+          <span>Max: {formatPrice(detail.stats.max_price)}</span>
+          <span>{detail.stats.total_purchases} purchases</span>
         </div>
       )}
       {detail.stats.total_saved && parseFloat(detail.stats.total_saved) > 0 && (
@@ -530,7 +530,7 @@ function formatNormalizedPrice(rawPrice: string | null, rawUnit: string, normali
 }
 
 function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
-  if (detail.store_prices.length === 0) {
+  if (detail.store_comparison.length === 0) {
     return null
   }
 
@@ -566,7 +566,7 @@ function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
             </tr>
           </thead>
           <tbody>
-            {detail.store_prices.map((sp) => {
+            {detail.store_comparison.map((sp) => {
               const norm = storeNormalized.get(sp.store_id)
               return (
                 <tr
