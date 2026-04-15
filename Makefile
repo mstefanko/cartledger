@@ -15,7 +15,7 @@ kill:
 	@echo "port $(PORT) cleared"
 
 # Build frontend and run server
-run: kill
+run: kill build
 	go run ./cmd/server
 
 # Alias for run

@@ -141,6 +141,7 @@ function EditableTable<TData>({
           return (
             <td
               key={cell.id}
+              onClick={() => handleCellClick(rowIndex, colIndex)}
               className={['h-[36px] p-0 border-b border-neutral-200', rowClassName].join(' ')}
             >
               <AutocompleteCell
@@ -167,6 +168,7 @@ function EditableTable<TData>({
           return (
             <td
               key={cell.id}
+              onClick={() => handleCellClick(rowIndex, colIndex)}
               className={['h-[36px] p-0 border-b border-neutral-200', rowClassName].join(' ')}
             >
               <EditableCell

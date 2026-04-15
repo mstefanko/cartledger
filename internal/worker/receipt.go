@@ -99,8 +99,13 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	}
 
 	var images [][]byte
+	var processedPaths []string
 	for _, entry := range entries {
 		if entry.IsDir() {
+			continue
+		}
+		// Skip previously processed files on rescan.
+		if strings.HasPrefix(entry.Name(), "processed_") {
 			continue
 		}
 		imgPath := filepath.Join(job.ImageDir, entry.Name())
@@ -116,15 +121,31 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		log.Printf("worker: preprocessed %s (%d KB → %d KB)", entry.Name(), originalSize/1024, len(processed)/1024)
 
 		// Save preprocessed version alongside original.
-		processedPath := filepath.Join(job.ImageDir, "processed_"+entry.Name())
+		processedName := "processed_" + entry.Name()
+		processedPath := filepath.Join(job.ImageDir, processedName)
 		if err := os.WriteFile(processedPath, processed, 0644); err != nil {
 			log.Printf("WARN: failed to save preprocessed image: %v", err)
+			// Fall back to original path for display.
+			processedPaths = append(processedPaths, filepath.Join(job.ImageDir, entry.Name()))
+		} else {
+			processedPaths = append(processedPaths, processedPath)
 		}
 
 		images = append(images, processed)
 	}
 	if len(images) == 0 {
 		return fmt.Errorf("no images found in %s", job.ImageDir)
+	}
+
+	// Update image_paths to point to processed versions for frontend display.
+	if len(processedPaths) > 0 {
+		_, err := w.db.Exec(
+			"UPDATE receipts SET image_paths = ? WHERE id = ?",
+			strings.Join(processedPaths, ","), job.ReceiptID,
+		)
+		if err != nil {
+			log.Printf("WARN: failed to update image_paths: %v", err)
+		}
 	}
 
 	// Broadcast processing status.
