@@ -1,41 +1,6 @@
 package llm
 
-const receiptExtractionPrompt = `Extract all items from this grocery receipt image.
-Return a JSON object with this exact structure:
-
-{
-  "store_name": "string",
-  "store_address": "string or null",
-  "store_city": "string or null",
-  "store_state": "two-letter state code or null",
-  "store_zip": "string or null",
-  "store_number": "digits only, no '#' prefix (e.g., '749', '0123') or null",
-  "date": "YYYY-MM-DD",
-  "payment_card_type": "Visa|Mastercard|Amex|Discover|Debit|EBT|Cash|Check|null",
-  "payment_card_last4": "string (last 4 digits) or null — omit for Cash/Check",
-  "time": "HH:MM (24-hour) or null",
-  "items": [
-    {
-      "raw_name": "exact text from receipt",
-      "suggested_name": "Human-readable canonical product name",
-      "suggested_brand": "Brand name or null if generic/store-brand not identifiable",
-      "suggested_tags": "comma-separated attributes: organic, frozen, canned, fresh, gluten-free, etc.",
-      "suggested_category": "Meat|Produce|Dairy|Bakery|Frozen|Pantry|Snacks|Beverages|Household|Health|Other",
-      "quantity": 1.0,
-      "unit": "lb" | "oz" | "gal" | "each" | "pack" | null,
-      "unit_price": 3.49 or null,
-      "total_price": 3.49,
-      "regular_price": 14.99,
-      "discount_amount": 5.00,
-      "line_number": 1,
-      "confidence": 0.95
-    }
-  ],
-  "subtotal": 0.00,
-  "tax": 0.00,
-  "total": 0.00,
-  "confidence": 0.95
-}
+const receiptExtractionPrompt = `Extract all items from this grocery receipt image and call the extract_receipt tool with the results.
 
 Rules:
 - raw_name must be EXACTLY as printed on receipt (preserve abbreviations)
@@ -50,7 +15,7 @@ Rules:
 - suggested_tags: comma-separated lowercase attributes extracted from the item
   - Types: organic, conventional, gluten-free, sugar-free, low-fat, etc.
   - Forms: fresh, frozen, canned, dried, whole, sliced, florets, ground, etc.
-- suggested_category must be one of the listed categories
+- suggested_category must be one of: Meat, Produce, Dairy, Bakery, Frozen, Pantry, Snacks, Beverages, Household, Health, Other
 - If quantity and unit_price are visible, include both
 - If only total_price is visible, set unit_price to null and quantity to 1
 - If quantity/weight is embedded in the item name (e.g., "3LB" in "BNLS CHKN BRST 3LB"), extract it

@@ -105,6 +105,33 @@ func (c *CLIClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error) 
 	return &extraction, nil
 }
 
+// extractJSON attempts to extract a JSON object from text that may contain
+// markdown code fences or other surrounding content.
+func extractJSON(text string) string {
+	// Try to find JSON within code fences first.
+	if start := strings.Index(text, "```json"); start != -1 {
+		content := text[start+7:]
+		if end := strings.Index(content, "```"); end != -1 {
+			return strings.TrimSpace(content[:end])
+		}
+	}
+	if start := strings.Index(text, "```"); start != -1 {
+		content := text[start+3:]
+		if end := strings.Index(content, "```"); end != -1 {
+			return strings.TrimSpace(content[:end])
+		}
+	}
+
+	// Try to find a raw JSON object.
+	if start := strings.Index(text, "{"); start != -1 {
+		if end := strings.LastIndex(text, "}"); end != -1 {
+			return text[start : end+1]
+		}
+	}
+
+	return text
+}
+
 // filterEnv returns env vars with the specified keys removed.
 func filterEnv(env []string, removeKeys ...string) []string {
 	blocked := make(map[string]bool, len(removeKeys))

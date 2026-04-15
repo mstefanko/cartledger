@@ -45,16 +45,16 @@ func main() {
 	var llmClient llm.Client
 	switch cfg.LLMProvider {
 	case "claude":
-		llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey)
-		log.Println("LLM provider: claude (direct API)")
+		llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey, cfg.LLMModel)
+		log.Printf("LLM provider: claude (direct API, model=%s)", cfg.LLMModel)
 	case "mock":
 		llmClient = llm.NewMockClient()
 		log.Println("LLM provider: mock")
 	default:
 		// Auto-detect: use API if key is set, else fail clearly.
 		if cfg.AnthropicAPIKey != "" {
-			llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey)
-			log.Printf("LLM provider: claude (direct API)")
+			llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey, cfg.LLMModel)
+			log.Printf("LLM provider: claude (direct API, model=%s)", cfg.LLMModel)
 		} else {
 			log.Fatal("ANTHROPIC_API_KEY is required. Set it in .env or as an environment variable.")
 		}

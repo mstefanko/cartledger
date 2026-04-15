@@ -14,6 +14,7 @@ type Config struct {
 	AnthropicAPIKey string
 	GeminiAPIKey   string
 	LLMProvider    string // "claude", "claude-cli", "gemini", "mock" (empty = auto-detect)
+	LLMModel       string // Claude model ID (default: claude-sonnet-4-20250514)
 	JWTSecret      string
 	MealieURL      string
 	MealieToken    string
@@ -29,6 +30,7 @@ func Load() *Config {
 		AnthropicAPIKey: getEnv("ANTHROPIC_API_KEY", ""),
 		GeminiAPIKey:   getEnv("GEMINI_API_KEY", ""),
 		LLMProvider:    getEnv("LLM_PROVIDER", ""),
+		LLMModel:       getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
 		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-production"),
 		MealieURL:      getEnv("MEALIE_URL", ""),
 		MealieToken:    getEnv("MEALIE_TOKEN", ""),

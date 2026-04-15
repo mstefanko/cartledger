@@ -30,7 +30,8 @@ func main() {
 
 	// Use the real ClaudeClient
 	_ = option.WithAPIKey(key) // just to keep import
-	client := llm.NewClaudeClient(key)
+	model := os.Getenv("LLM_MODEL")
+	client := llm.NewClaudeClient(key, model)
 	fmt.Printf("Provider: %s\n", client.Provider())
 
 	fmt.Println("Calling ExtractReceipt...")
