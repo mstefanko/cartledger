@@ -24,7 +24,6 @@ type ClaudeClient struct {
 var receiptTool = anthropic.ToolParam{
 	Name:        "extract_receipt",
 	Description: param.NewOpt("Extract structured data from a grocery receipt image"),
-	Strict:      param.NewOpt(true),
 	InputSchema: anthropic.ToolInputSchemaParam{
 		Properties: map[string]any{
 			"store_name":         map[string]any{"type": "string"},
