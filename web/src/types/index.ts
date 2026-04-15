@@ -47,6 +47,7 @@ export interface Product {
   brand?: string
   pack_quantity?: number
   pack_unit?: string
+  product_group_id?: string
   notes: string | null
   last_purchased_at: string | null
   purchase_count: number
@@ -206,6 +207,48 @@ export interface ProductLink {
   created_at: string
 }
 
+// --- Product Group Types ---
+
+export interface GroupMember {
+  product_id: string
+  product_name: string
+  brand?: string
+  store_name?: string
+  pack_quantity?: number
+  pack_unit?: string
+  latest_price?: string
+  price_per_unit?: string
+  last_purchased?: string
+}
+
+export interface ProductGroup {
+  id: string
+  name: string
+  comparison_unit?: string
+  member_count: number
+  members?: GroupMember[]
+  units_mixed?: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateGroupRequest {
+  name: string
+  comparison_unit?: string
+}
+
+export interface UpdateGroupRequest {
+  name?: string
+  comparison_unit?: string
+}
+
+export interface GroupSuggestion {
+  group_id: string
+  group_name: string
+  member_count: number
+  reason: string
+}
+
 // --- Product Detail Types ---
 
 export interface PriceHistoryEntry {
@@ -351,6 +394,7 @@ export interface UpdateProductRequest {
   brand?: string
   pack_quantity?: number
   pack_unit?: string
+  product_group_id?: string | null
   notes?: string
 }
 

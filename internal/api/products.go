@@ -36,13 +36,14 @@ type createProductRequest struct {
 }
 
 type updateProductRequest struct {
-	Name         string   `json:"name"`
-	Category     *string  `json:"category,omitempty"`
-	DefaultUnit  *string  `json:"default_unit,omitempty"`
-	Notes        *string  `json:"notes,omitempty"`
-	Brand        *string  `json:"brand,omitempty"`
-	PackQuantity *float64 `json:"pack_quantity,omitempty"`
-	PackUnit     *string  `json:"pack_unit,omitempty"`
+	Name           string   `json:"name"`
+	Category       *string  `json:"category,omitempty"`
+	DefaultUnit    *string  `json:"default_unit,omitempty"`
+	Notes          *string  `json:"notes,omitempty"`
+	Brand          *string  `json:"brand,omitempty"`
+	PackQuantity   *float64 `json:"pack_quantity,omitempty"`
+	PackUnit       *string  `json:"pack_unit,omitempty"`
+	ProductGroupID *string  `json:"product_group_id,omitempty"`
 }
 
 // --- Response types ---
@@ -269,11 +270,23 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		req.Brand = &normalized
 	}
 
+	// Validate product_group_id belongs to this household if set.
+	if req.ProductGroupID != nil && *req.ProductGroupID != "" {
+		var groupHouseholdID string
+		err := h.DB.QueryRow("SELECT household_id FROM product_groups WHERE id = ?", *req.ProductGroupID).Scan(&groupHouseholdID)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "product group not found"})
+		}
+		if groupHouseholdID != householdID {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "product group belongs to another household"})
+		}
+	}
+
 	now := time.Now().UTC()
 	result, err := h.DB.Exec(
-		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, brand = ?, pack_quantity = ?, pack_unit = ?, updated_at = ?
+		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, brand = ?, pack_quantity = ?, pack_unit = ?, product_group_id = ?, updated_at = ?
 		 WHERE id = ? AND household_id = ?`,
-		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, now, productID, householdID,
+		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, req.ProductGroupID, now, productID, householdID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -734,9 +747,24 @@ type productAliasResponse struct {
 	StoreID *string `json:"store_id,omitempty"`
 }
 
+type productGroupInfo struct {
+	GroupID   string `json:"group_id"`
+	GroupName string `json:"group_name"`
+}
+
+type productSibling struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Brand        *string  `json:"brand,omitempty"`
+	PackQuantity *float64 `json:"pack_quantity,omitempty"`
+	PackUnit     *string  `json:"pack_unit,omitempty"`
+}
+
 type productDetailResponse struct {
 	Product      productResponse        `json:"product"`
 	PricePerUnit *string                `json:"price_per_unit,omitempty"`
+	Group        *productGroupInfo      `json:"group,omitempty"`
+	Siblings     []productSibling       `json:"siblings,omitempty"`
 	Aliases      []productAliasResponse `json:"aliases"`
 	Images       []productImageResponse `json:"images"`
 	Links        []productLinkResponse  `json:"links"`
@@ -787,6 +815,39 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 			ppu := lastPriceFloat / *p.PackQuantity
 			ppuStr := fmt.Sprintf("%.2f", ppu)
 			resp.PricePerUnit = &ppuStr
+		}
+	}
+
+	// Fetch group info and siblings if product is in a group.
+	var groupID *string
+	h.DB.QueryRow("SELECT product_group_id FROM products WHERE id = ?", productID).Scan(&groupID)
+	if groupID != nil && *groupID != "" {
+		var gi productGroupInfo
+		err := h.DB.QueryRow(
+			"SELECT id, name FROM product_groups WHERE id = ?", *groupID,
+		).Scan(&gi.GroupID, &gi.GroupName)
+		if err == nil {
+			resp.Group = &gi
+
+			// Fetch sibling products (same group, different product).
+			sibRows, err := h.DB.Query(
+				`SELECT id, name, brand, pack_quantity, pack_unit
+				 FROM products WHERE product_group_id = ? AND id != ? AND household_id = ? ORDER BY name`,
+				*groupID, productID, householdID,
+			)
+			if err == nil {
+				defer sibRows.Close()
+				siblings := make([]productSibling, 0)
+				for sibRows.Next() {
+					var s productSibling
+					if sibRows.Scan(&s.ID, &s.Name, &s.Brand, &s.PackQuantity, &s.PackUnit) == nil {
+						siblings = append(siblings, s)
+					}
+				}
+				if len(siblings) > 0 {
+					resp.Siblings = siblings
+				}
+			}
 		}
 	}
 

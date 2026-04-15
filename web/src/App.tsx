@@ -17,6 +17,7 @@ import ImportPage from '@/pages/ImportPage'
 import SettingsPage from '@/pages/SettingsPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import StoreViewPage from '@/pages/StoreViewPage'
+import ProductGroupPage from '@/pages/ProductGroupPage'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -108,6 +109,7 @@ function AppRoutes() {
         <Route path="analytics" element={<AnalyticsPage />} />
         <Route path="products" element={<ProductsPage />} />
         <Route path="products/:id" element={<ProductDetailPage />} />
+        <Route path="product-groups/:id" element={<ProductGroupPage />} />
         <Route path="lists" element={<ListsIndexPage />} />
         <Route path="lists/:id" element={<ShoppingListPage />} />
         <Route path="rules" element={<RulesPage />} />

@@ -9,12 +9,13 @@ import {
   createProductAlias,
   deleteProductAlias,
 } from '@/api/products'
+import { fetchGroups, fetchGroupSuggestions, createGroup } from '@/api/groups'
 import { listStores } from '@/api/stores'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
 import { ProductMerge } from '@/components/products/ProductMerge'
-import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry } from '@/types'
+import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry, ProductGroup, GroupSuggestion } from '@/types'
 
 // --- Helper ---
 
@@ -682,6 +683,192 @@ function MealieLinksSection({ detail }: { detail: ProductDetail }) {
   )
 }
 
+// --- Product Group Section ---
+
+function ProductGroupSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
+  const queryClient = useQueryClient()
+  const [showLinkModal, setShowLinkModal] = useState(false)
+  const [newGroupName, setNewGroupName] = useState('')
+
+  const product = detail.product
+  const hasGroup = !!product.product_group_id
+  const hasBrand = !!product.brand
+
+  const { data: groups } = useQuery({
+    queryKey: ['product-groups'],
+    queryFn: fetchGroups,
+    enabled: !hasGroup,
+  })
+
+  const { data: suggestions } = useQuery({
+    queryKey: ['group-suggestions', productId],
+    queryFn: () => fetchGroupSuggestions(productId),
+    enabled: !hasGroup && hasBrand,
+  })
+
+  const linkToGroupMutation = useMutation({
+    mutationFn: (groupId: string) =>
+      updateProduct(productId, { product_group_id: groupId }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+      setShowLinkModal(false)
+    },
+  })
+
+  const unlinkMutation = useMutation({
+    mutationFn: () =>
+      updateProduct(productId, { product_group_id: null }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+    },
+  })
+
+  const createAndLinkMutation = useMutation({
+    mutationFn: async (name: string) => {
+      const group = await createGroup({ name })
+      await updateProduct(productId, { product_group_id: group.id })
+      return group
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+      setShowLinkModal(false)
+      setNewGroupName('')
+    },
+  })
+
+  // If product is in a group, show group info
+  if (hasGroup) {
+    return (
+      <div className="bg-white rounded-2xl shadow-subtle p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-display text-feature font-semibold text-neutral-900">Product Group</h2>
+          <Button
+            size="sm"
+            variant="subtle"
+            className="text-expensive"
+            onClick={() => unlinkMutation.mutate()}
+            disabled={unlinkMutation.isPending}
+          >
+            {unlinkMutation.isPending ? 'Removing...' : 'Remove from Group'}
+          </Button>
+        </div>
+        <Link
+          to={`/product-groups/${product.product_group_id}`}
+          className="text-body text-brand hover:underline font-medium"
+        >
+          View group page
+        </Link>
+      </div>
+    )
+  }
+
+  // Product is not in a group
+  const suggestionList = suggestions ?? []
+  const groupList = groups ?? []
+
+  return (
+    <>
+      <div className="bg-white rounded-2xl shadow-subtle p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-display text-feature font-semibold text-neutral-900">Product Group</h2>
+          <Button size="sm" variant="subtle" onClick={() => setShowLinkModal(true)}>
+            Link to Group
+          </Button>
+        </div>
+
+        {suggestionList.length > 0 ? (
+          <div>
+            <p className="text-caption text-neutral-400 mb-2">Suggested groups based on brand:</p>
+            <div className="space-y-2">
+              {suggestionList.map((s: GroupSuggestion) => (
+                <div key={s.group_id} className="flex items-center justify-between p-2 bg-neutral-50 rounded-xl">
+                  <div>
+                    <span className="text-body text-neutral-900">{s.group_name}</span>
+                    <span className="ml-2 text-caption text-neutral-400">
+                      {s.member_count} member{s.member_count !== 1 ? 's' : ''} &middot; {s.reason}
+                    </span>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={() => linkToGroupMutation.mutate(s.group_id)}
+                    disabled={linkToGroupMutation.isPending}
+                  >
+                    Join
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <p className="text-caption text-neutral-400">
+            Not in a group. Link this product to a group to compare prices across brands and stores.
+          </p>
+        )}
+      </div>
+
+      {/* Link to Group Modal */}
+      <Modal open={showLinkModal} onClose={() => setShowLinkModal(false)} title="Link to Product Group">
+        <div className="space-y-4">
+          {/* Existing groups */}
+          {groupList.length > 0 && (
+            <div>
+              <p className="text-small font-medium text-neutral-400 mb-2">Existing groups</p>
+              <div className="max-h-48 overflow-y-auto space-y-1">
+                {groupList.map((g: ProductGroup) => (
+                  <button
+                    key={g.id}
+                    type="button"
+                    className="w-full text-left px-3 py-2 rounded-xl hover:bg-neutral-50 transition-colors flex items-center justify-between cursor-pointer"
+                    onClick={() => linkToGroupMutation.mutate(g.id)}
+                    disabled={linkToGroupMutation.isPending}
+                  >
+                    <div>
+                      <span className="text-body text-neutral-900">{g.name}</span>
+                      <span className="ml-2 text-caption text-neutral-400">
+                        {g.member_count} member{g.member_count !== 1 ? 's' : ''}
+                      </span>
+                    </div>
+                    <span className="text-caption text-brand">+ Add</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Create new group */}
+          <div>
+            <p className="text-small font-medium text-neutral-400 mb-2">Or create a new group</p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={newGroupName}
+                onChange={(e) => setNewGroupName(e.target.value)}
+                placeholder="Group name..."
+                className="flex-1 px-3 py-2 text-body border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && newGroupName.trim()) {
+                    createAndLinkMutation.mutate(newGroupName.trim())
+                  }
+                }}
+              />
+              <Button
+                size="sm"
+                onClick={() => newGroupName.trim() && createAndLinkMutation.mutate(newGroupName.trim())}
+                disabled={!newGroupName.trim() || createAndLinkMutation.isPending}
+              >
+                {createAndLinkMutation.isPending ? 'Creating...' : 'Create & Link'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+    </>
+  )
+}
+
 // --- Main Page ---
 
 function ProductDetailPage() {
@@ -756,6 +943,7 @@ function ProductDetailPage() {
       {/* Content sections */}
       <div className="space-y-5">
         <ProductInfoSection detail={detail} productId={productId} />
+        <ProductGroupSection detail={detail} productId={productId} />
         <PriceTrendSection detail={detail} />
         <PhotosSection detail={detail} productId={productId} />
         <AliasesSection detail={detail} productId={productId} stores={stores} />

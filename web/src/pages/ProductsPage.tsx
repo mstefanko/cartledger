@@ -1,8 +1,9 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { listProducts, createProduct, updateProduct } from '@/api/products'
-import type { ProductListItem } from '@/types'
+import { fetchGroups, createGroup } from '@/api/groups'
+import type { ProductListItem, ProductGroup } from '@/types'
 import { getProductsWithTrends } from '@/api/analytics'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
@@ -11,12 +12,100 @@ import { EditableTable } from '@/components/ui/EditableTable'
 import type { ColumnDef, CellContext } from '@tanstack/react-table'
 import type { ProductWithTrend } from '@/types'
 
+// --- Groups List View ---
+
+function GroupsView() {
+  const queryClient = useQueryClient()
+
+  const { data: groups, isLoading } = useQuery({
+    queryKey: ['product-groups'],
+    queryFn: fetchGroups,
+  })
+
+  const createMutation = useMutation({
+    mutationFn: (name: string) => createGroup({ name }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+    },
+  })
+
+  const handleCreateGroup = useCallback(() => {
+    const name = window.prompt('Group name:')
+    if (name && name.trim()) {
+      createMutation.mutate(name.trim())
+    }
+  }, [createMutation])
+
+  if (isLoading) {
+    return <p className="text-body text-neutral-400">Loading groups...</p>
+  }
+
+  const groupList = groups ?? []
+
+  if (groupList.length === 0) {
+    return (
+      <div className="text-center py-16">
+        <p className="text-body text-neutral-400">No product groups yet.</p>
+        <p className="text-caption text-neutral-400 mt-1">
+          Groups let you compare similar products across stores and brands.
+        </p>
+        <div className="mt-4">
+          <Button onClick={handleCreateGroup}>Create First Group</Button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <div className="flex justify-end mb-4">
+        <Button size="sm" onClick={handleCreateGroup}>Create Group</Button>
+      </div>
+      <div className="space-y-2">
+        {groupList.map((g: ProductGroup) => (
+          <Link
+            key={g.id}
+            to={`/product-groups/${g.id}`}
+            className="block bg-white rounded-2xl shadow-subtle p-4 hover:shadow-md transition-shadow"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-body-medium font-semibold text-neutral-900">{g.name}</h3>
+                <div className="flex items-center gap-3 mt-1">
+                  <span className="text-caption text-neutral-400">
+                    {g.member_count} product{g.member_count !== 1 ? 's' : ''}
+                  </span>
+                  {g.comparison_unit && (
+                    <span className="text-caption text-neutral-400">
+                      Compare by: {g.comparison_unit}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <svg className="w-5 h-5 text-neutral-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              </svg>
+            </div>
+          </Link>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// --- Products List View ---
+
 interface ProductRow extends ProductListItem {
   trend: ProductWithTrend | null
 }
 
 function ProductsPage() {
   const queryClient = useQueryClient()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const activeTab = searchParams.get('tab') === 'groups' ? 'groups' : 'products'
+  const setActiveTab = (tab: 'products' | 'groups') => {
+    setSearchParams(tab === 'groups' ? { tab: 'groups' } : {})
+  }
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [brandFilter, setBrandFilter] = useState('')
@@ -138,13 +227,18 @@ function ProductsPage() {
           const name = getValue() as string
           const product = row.original
           return (
-            <Link
-              to={`/products/${product.id}`}
-              className="text-brand hover:underline"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {name}
-            </Link>
+            <span className="flex items-center gap-1.5">
+              <Link
+                to={`/products/${product.id}`}
+                className="text-brand hover:underline"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {name}
+              </Link>
+              {product.product_group_id && (
+                <span className="inline-block w-2 h-2 rounded-full bg-brand flex-shrink-0" title="In a product group" />
+              )}
+            </span>
           )
         },
       },
@@ -239,11 +333,45 @@ function ProductsPage() {
         <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
           Products
         </h1>
-        <Button size="sm" onClick={handleAddProduct}>
-          Add Product
-        </Button>
+        <div className="flex items-center gap-2">
+          {activeTab === 'products' && (
+            <Button size="sm" onClick={handleAddProduct}>
+              Add Product
+            </Button>
+          )}
+        </div>
       </div>
 
+      {/* Tab toggle */}
+      <div className="flex gap-1 mb-6 bg-neutral-100 rounded-xl p-1 w-fit">
+        <button
+          type="button"
+          className={`px-4 py-2 text-body rounded-lg transition-colors cursor-pointer ${
+            activeTab === 'products'
+              ? 'bg-white shadow-sm text-neutral-900 font-medium'
+              : 'text-neutral-500 hover:text-neutral-700'
+          }`}
+          onClick={() => setActiveTab('products')}
+        >
+          All Products
+        </button>
+        <button
+          type="button"
+          className={`px-4 py-2 text-body rounded-lg transition-colors cursor-pointer ${
+            activeTab === 'groups'
+              ? 'bg-white shadow-sm text-neutral-900 font-medium'
+              : 'text-neutral-500 hover:text-neutral-700'
+          }`}
+          onClick={() => setActiveTab('groups')}
+        >
+          Groups
+        </button>
+      </div>
+
+      {activeTab === 'groups' ? (
+        <GroupsView />
+      ) : (
+      <>
       <div className="mb-4">
         <div className="flex items-center gap-3 flex-wrap">
           <input
@@ -305,6 +433,8 @@ function ProductsPage() {
           onCellUpdate={handleCellUpdate}
           virtualizeRows={rows.length > 100}
         />
+      )}
+      </>
       )}
     </div>
   )

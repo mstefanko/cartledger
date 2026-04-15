@@ -98,6 +98,9 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	productHandler := &ProductHandler{DB: database, Cfg: cfg}
 	productHandler.RegisterRoutes(protected)
 
+	groupHandler := &GroupHandler{DB: database, Cfg: cfg}
+	groupHandler.RegisterRoutes(protected)
+
 	aliasHandler := &AliasHandler{DB: database, Cfg: cfg}
 	aliasHandler.RegisterRoutes(protected)
 

@@ -29,6 +29,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"shopping_lists", "shopping_list_items", "unit_conversions",
 		"product_images", "product_links",
 		"products_fts", "product_aliases_fts",
+		"product_groups",
 	}
 	for _, table := range tables {
 		var name string
@@ -65,6 +66,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"idx_matching_rules_priority",
 		"idx_product_images_product",
 		"idx_product_links_product", "idx_product_links_source",
+		"idx_products_group",
 	}
 	for _, idx := range indexes {
 		var name string
