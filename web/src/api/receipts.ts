@@ -1,4 +1,4 @@
-import { get, put, post, postMultipart } from './client'
+import { get, put, post, del, postMultipart } from './client'
 import type {
   Receipt,
   LineItem,
@@ -46,6 +46,10 @@ export async function acceptSuggestions(
     `/receipts/${encodeURIComponent(receiptId)}/accept-suggestions`,
     data,
   )
+}
+
+export async function deleteReceipt(receiptId: string): Promise<{ status: string }> {
+  return del(`/receipts/${encodeURIComponent(receiptId)}`)
 }
 
 export async function confirmReceipt(

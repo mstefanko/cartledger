@@ -13,7 +13,6 @@ import type { LineItem, Product } from '@/types'
 
 interface ReceiptReviewProps {
   receiptId: string
-  onScrollToImage?: () => void
 }
 
 /** Row data for the editable table — extends LineItem with resolved product name */
@@ -21,7 +20,7 @@ interface LineItemRow extends LineItem {
   product_name: string
 }
 
-function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
+function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   const queryClient = useQueryClient()
 
   // --- Data fetching ---
@@ -90,14 +89,23 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
   // --- Raw JSON modal ---
   const [rawJsonOpen, setRawJsonOpen] = useState(false)
 
-  // --- Build product lookup map ---
+  // --- Build product lookup map (search results + API-provided names) ---
   const productMap = useMemo(() => {
     const map = new Map<string, string>()
+    // Include product names from the receipt's own line items (from API JOIN)
+    if (receipt) {
+      for (const li of receipt.line_items) {
+        if (li.product_id && li.product_name) {
+          map.set(li.product_id, li.product_name)
+        }
+      }
+    }
+    // Search results override (fresher data)
     for (const p of products) {
       map.set(p.id, p.name)
     }
     return map
-  }, [products])
+  }, [products, receipt])
 
   // --- Build autocomplete options ---
   const autocompleteOptions: AutocompleteOption[] = useMemo(
@@ -129,17 +137,23 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
     [rows],
   )
 
-  // --- Accept suggestions mutation ---
-  const acceptMutation = useMutation({
-    mutationFn: () => {
-      const ids = suggestedRows.map((r) => r.id)
-      return acceptSuggestions(receiptId, { line_item_ids: ids })
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
-      queryClient.invalidateQueries({ queryKey: ['products'] })
-    },
-  })
+  // --- Suggestion lookup map for inline display ---
+  const suggestionMap = useMemo(() => {
+    const map = new Map<string, { name: string; type: string }>()
+    if (!receipt) return map
+    for (const li of receipt.line_items) {
+      if (li.matched === 'unmatched' && li.suggestion_type) {
+        const name = li.suggestion_type === 'existing_match'
+          ? li.suggested_product_name
+          : li.suggested_name
+        if (name) map.set(li.id, { name, type: li.suggestion_type })
+      }
+    }
+    return map
+  }, [receipt])
+
+  // --- Combined confirm loading state ---
+  const [confirmLoading, setConfirmLoading] = useState(false)
 
   // --- Cell update handler ---
   const handleCellUpdate = useCallback(
@@ -231,13 +245,14 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
             )
           }
           if (item.suggestion_type) {
+            const isExisting = item.suggestion_type === 'existing_match'
             return (
               <span
                 className="flex items-center justify-center"
-                title={item.suggestion_type === 'existing_match' ? 'Suggested match' : 'Suggested new product'}
+                title={isExisting ? 'Suggested match' : 'Suggested new product'}
               >
                 <svg
-                  className="w-4 h-4 text-amber-500"
+                  className={`w-4 h-4 ${isExisting ? 'text-amber-500' : 'text-blue-500'}`}
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -280,33 +295,6 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         size: 200,
       },
       {
-        id: 'suggestion',
-        header: 'Suggestion',
-        size: 200,
-        cell: ({ row }) => {
-          const item = row.original
-          if (item.matched !== 'unmatched' || !item.suggestion_type) return null
-          const label = item.suggestion_type === 'existing_match' ? 'Match' : 'New'
-          const name = item.suggestion_type === 'existing_match'
-            ? item.suggested_product_name
-            : item.suggested_name
-          return (
-            <div className="flex items-center gap-1.5">
-              <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                item.suggestion_type === 'existing_match'
-                  ? 'bg-amber-100 text-amber-700'
-                  : 'bg-blue-100 text-blue-700'
-              }`}>
-                {label}
-              </span>
-              <span className="text-caption text-neutral-700 truncate">
-                {name}
-              </span>
-            </div>
-          )
-        },
-      },
-      {
         accessorKey: 'product_id',
         header: 'Product',
         size: 220,
@@ -320,6 +308,11 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
             const id = value as string | null
             if (!id) return ''
             return productMap.get(id) ?? ''
+          },
+          getSuggestedValue: (rowIndex: number) => {
+            const row = rows[rowIndex]
+            if (!row) return null
+            return suggestionMap.get(row.id) ?? null
           },
         },
       },
@@ -374,7 +367,7 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
         },
       },
     ],
-    [autocompleteOptions, productMap, handleAutocompleteCreate],
+    [autocompleteOptions, productMap, handleAutocompleteCreate, suggestionMap, rows],
   )
 
   // --- Row class names for unmatched highlighting ---
@@ -423,47 +416,49 @@ function ReceiptReview({ receiptId, onScrollToImage }: ReceiptReviewProps) {
           </span>
         </div>
         <div className="flex items-center gap-2">
-          {onScrollToImage && (
-            <Button variant="secondary" size="sm" onClick={onScrollToImage}>
-              View Original Receipt
-            </Button>
-          )}
-          <Button
-            variant="secondary"
-            size="sm"
+          <button
+            type="button"
             onClick={() => setRawJsonOpen(true)}
+            className="p-1.5 rounded text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100"
+            title="View Raw JSON"
           >
-            View Raw JSON
-          </Button>
-          {suggestedCount > 0 && (
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => acceptMutation.mutate()}
-              disabled={acceptMutation.isPending}
-            >
-              {acceptMutation.isPending
-                ? 'Accepting...'
-                : `Accept All Suggestions (${suggestedCount})`}
-            </Button>
-          )}
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+            </svg>
+          </button>
           <Button
             variant="primary"
             size="sm"
-            onClick={() => {
-              if (pendingRuleMatches.length > 0 && receipt.status !== 'reviewed') {
-                setBatchRuleModalOpen(true)
-              } else {
-                confirmMutation.mutate()
+            onClick={async () => {
+              setConfirmLoading(true)
+              try {
+                // Step 1: Accept any pending suggestions
+                if (suggestedRows.length > 0) {
+                  await acceptSuggestions(receiptId, { line_item_ids: suggestedRows.map(r => r.id) })
+                }
+                // Step 2: Check for pending rule matches (preserve batch rule modal)
+                if (pendingRuleMatches.length > 0 && receipt.status !== 'reviewed') {
+                  setBatchRuleModalOpen(true)
+                  return
+                }
+                // Step 3: Confirm receipt
+                await confirmReceipt(receiptId)
+                queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+                queryClient.invalidateQueries({ queryKey: ['products'] })
+              } catch (err) {
+                console.error('Confirm failed:', err)
+                alert('Failed to confirm receipt. Please try again.')
+              } finally {
+                setConfirmLoading(false)
               }
             }}
-            disabled={confirmMutation.isPending || receipt.status === 'reviewed'}
+            disabled={confirmLoading || confirmMutation.isPending || receipt.status === 'reviewed'}
           >
-            {confirmMutation.isPending
+            {confirmLoading || confirmMutation.isPending
               ? 'Confirming...'
               : receipt.status === 'reviewed'
                 ? 'Confirmed'
-                : 'Confirm All'}
+                : 'Confirm Receipt'}
           </Button>
         </div>
       </div>

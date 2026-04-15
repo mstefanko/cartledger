@@ -1,13 +1,18 @@
-import { useRef, useCallback } from 'react'
-import { useParams, Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
-import { getReceipt, type ReceiptDetail } from '@/api/receipts'
+import { getReceipt, deleteReceipt, type ReceiptDetail } from '@/api/receipts'
 import { getToken } from '@/api/client'
+import { Button } from '@/components/ui/Button'
+import { Modal } from '@/components/ui/Modal'
 
 function ReceiptReviewPage() {
   const { id } = useParams<{ id: string }>()
-  const imageRef = useRef<HTMLDivElement>(null)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [showDelete, setShowDelete] = useState(false)
+  const [showImage, setShowImage] = useState(false)
 
   const { data: receipt } = useQuery<ReceiptDetail>({
     queryKey: ['receipt', id],
@@ -15,9 +20,13 @@ function ReceiptReviewPage() {
     enabled: !!id,
   })
 
-  const handleScrollToImage = useCallback(() => {
-    imageRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }, [])
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteReceipt(id!),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['receipts'] })
+      navigate('/receipts')
+    },
+  })
 
   if (!id) {
     return (
@@ -41,10 +50,18 @@ function ReceiptReviewPage() {
 
   return (
     <div className="py-6">
-      <div className="mb-4">
+      <div className="mb-4 flex items-center justify-between">
         <Link to="/receipts" className="text-caption text-brand hover:underline">
           &larr; Back to Receipts
         </Link>
+        <Button
+          variant="secondary"
+          size="sm"
+          className="text-red-500 hover:text-red-700 hover:bg-red-50"
+          onClick={() => setShowDelete(true)}
+        >
+          Delete Receipt
+        </Button>
       </div>
       <h1 className="font-display text-subhead font-bold text-neutral-900 mb-4">
         Review Receipt
@@ -80,9 +97,23 @@ function ReceiptReviewPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* Mobile: toggle to show/hide receipt image */}
+      <div className="lg:hidden mb-3">
+        <button
+          type="button"
+          onClick={() => setShowImage((v) => !v)}
+          className="text-caption text-brand hover:underline flex items-center gap-1"
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+          {showImage ? 'Hide Receipt Image' : 'View Receipt Image'}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr] gap-6">
         {/* LEFT: Receipt images */}
-        <div ref={imageRef} className="flex flex-col gap-4">
+        <div className={`flex flex-col gap-4 ${showImage ? '' : 'hidden lg:flex'}`}>
           <h2 className="font-display text-feature font-semibold text-neutral-900">
             Receipt Image
           </h2>
@@ -93,7 +124,7 @@ function ReceiptReviewPage() {
                   key={idx}
                   src={`/api/v1/files/${path}?token=${encodeURIComponent(getToken() ?? '')}`}
                   alt={`Receipt page ${idx + 1}`}
-                  className="w-full rounded-lg shadow-micro"
+                  className="max-w-[280px] mx-auto rounded-lg shadow-micro"
                   loading="lazy"
                 />
               ))}
@@ -109,12 +140,34 @@ function ReceiptReviewPage() {
 
         {/* RIGHT: Editable line items table */}
         <div className="min-w-0">
-          <ReceiptReview
-            receiptId={id}
-            onScrollToImage={handleScrollToImage}
-          />
+          <ReceiptReview receiptId={id} />
         </div>
       </div>
+
+      <Modal
+        open={showDelete}
+        onClose={() => setShowDelete(false)}
+        title="Delete Receipt"
+        footer={
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setShowDelete(false)}>
+              Cancel
+            </Button>
+            <Button
+              className="bg-red-600 text-white hover:bg-red-700"
+              size="sm"
+              onClick={() => deleteMutation.mutate()}
+              disabled={deleteMutation.isPending}
+            >
+              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-body text-neutral-600">
+          Delete this receipt and all its line items? This cannot be undone.
+        </p>
+      </Modal>
     </div>
   )
 }

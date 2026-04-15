@@ -3,6 +3,7 @@ package api
 import (
 	"database/sql"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -73,6 +74,10 @@ func (h *AuthHandler) RegisterRoutes(public *echo.Group, publicRateLimited *echo
 	publicRateLimited.POST("/join", h.Join)
 
 	protected.POST("/invite", h.CreateInvite)
+	protected.GET("/profile", h.GetProfile)
+	protected.PUT("/profile", h.UpdateProfile)
+	protected.PUT("/household", h.UpdateHousehold)
+	protected.DELETE("/household/data", h.DeleteAllData)
 }
 
 // Status returns whether the app needs initial setup (no users exist).
@@ -328,4 +333,144 @@ func (h *AuthHandler) Join(c echo.Context) error {
 			Name:        req.UserName,
 		},
 	})
+}
+
+// GetProfile returns the current user's profile and household info.
+// GET /api/v1/profile
+func (h *AuthHandler) GetProfile(c echo.Context) error {
+	userID := auth.UserIDFrom(c)
+	householdID := auth.HouseholdIDFrom(c)
+
+	var user userResponse
+	err := h.DB.QueryRow(
+		"SELECT id, household_id, email, name FROM users WHERE id = ?", userID,
+	).Scan(&user.ID, &user.HouseholdID, &user.Email, &user.Name)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var householdName string
+	_ = h.DB.QueryRow("SELECT name FROM households WHERE id = ?", householdID).Scan(&householdName)
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"user":           user,
+		"household_name": householdName,
+	})
+}
+
+// UpdateProfile updates the current user's name and/or email.
+// PUT /api/v1/profile
+func (h *AuthHandler) UpdateProfile(c echo.Context) error {
+	userID := auth.UserIDFrom(c)
+
+	var req struct {
+		Name  *string `json:"name"`
+		Email *string `json:"email"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	setClauses := make([]string, 0)
+	args := make([]interface{}, 0)
+	if req.Name != nil && *req.Name != "" {
+		setClauses = append(setClauses, "name = ?")
+		args = append(args, *req.Name)
+	}
+	if req.Email != nil && *req.Email != "" {
+		email := strings.ToLower(strings.TrimSpace(*req.Email))
+		if !emailRegex.MatchString(email) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid email format"})
+		}
+		setClauses = append(setClauses, "email = ?")
+		args = append(args, email)
+	}
+	if len(setClauses) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "no fields to update"})
+	}
+
+	args = append(args, userID)
+	query := "UPDATE users SET " + strings.Join(setClauses, ", ") + " WHERE id = ?"
+	if _, err := h.DB.Exec(query, args...); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// UpdateHousehold updates the household name.
+// PUT /api/v1/household
+func (h *AuthHandler) UpdateHousehold(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+
+	if _, err := h.DB.Exec("UPDATE households SET name = ? WHERE id = ?", req.Name, householdID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// DeleteAllData removes all household data except users and the household itself.
+// DELETE /api/v1/household/data
+func (h *AuthHandler) DeleteAllData(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	// Order matters: delete children before parents.
+	tables := []string{
+		"shopping_list_items", "shopping_lists",
+		"product_prices", "line_items", "receipts",
+		"product_images", "product_links", "product_aliases",
+		"matching_rules", "unit_conversions",
+		"products", "stores",
+	}
+
+	for _, table := range tables {
+		var query string
+		switch table {
+		case "shopping_list_items":
+			query = "DELETE FROM shopping_list_items WHERE list_id IN (SELECT id FROM shopping_lists WHERE household_id = ?)"
+		case "product_prices":
+			query = "DELETE FROM product_prices WHERE receipt_id IN (SELECT id FROM receipts WHERE household_id = ?)"
+		case "line_items":
+			query = "DELETE FROM line_items WHERE receipt_id IN (SELECT id FROM receipts WHERE household_id = ?)"
+		case "product_images", "product_links":
+			query = "DELETE FROM " + table + " WHERE product_id IN (SELECT id FROM products WHERE household_id = ?)"
+		case "product_aliases":
+			query = "DELETE FROM product_aliases WHERE product_id IN (SELECT id FROM products WHERE household_id = ?)"
+		case "unit_conversions":
+			query = "DELETE FROM unit_conversions WHERE product_id IN (SELECT id FROM products WHERE household_id = ?)"
+		default:
+			query = "DELETE FROM " + table + " WHERE household_id = ?"
+		}
+		if _, err := tx.Exec(query, householdID); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clear " + table})
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	// Clean up receipt image directories.
+	dataDir := h.Cfg.DataDir
+	receiptsDir := dataDir + "/receipts"
+	_ = os.RemoveAll(receiptsDir)
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "all data deleted"})
 }

@@ -1,9 +1,10 @@
-import { useMemo } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { NavLink, useNavigate } from 'react-router-dom'
-import { listReceipts } from '@/api/receipts'
+import { listReceipts, deleteReceipt } from '@/api/receipts'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
+import { Modal } from '@/components/ui/Modal'
 import type { Receipt } from '@/types'
 import type { BadgeVariant } from '@/components/ui/Badge'
 
@@ -17,10 +18,20 @@ const statusConfig: Record<Receipt['status'], { label: string; variant: BadgeVar
 
 function ReceiptsPage() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [deleteTarget, setDeleteTarget] = useState<Receipt | null>(null)
 
   const { data: receipts, isLoading, error } = useQuery({
     queryKey: ['receipts'],
     queryFn: listReceipts,
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: deleteReceipt,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['receipts'] })
+      setDeleteTarget(null)
+    },
   })
 
   const sortedReceipts = useMemo(() => {
@@ -93,6 +104,7 @@ function ReceiptsPage() {
                 <th className="h-[36px] px-3 py-1 text-caption font-semibold text-neutral-600 text-center border-b border-neutral-200">
                   Status
                 </th>
+                <th className="h-[36px] px-3 py-1 w-10 border-b border-neutral-200"></th>
               </tr>
             </thead>
             <tbody>
@@ -117,6 +129,18 @@ function ReceiptsPage() {
                     <td className="h-[44px] px-3 py-2 text-center border-b border-neutral-200">
                       <Badge variant={config.variant}>{config.label}</Badge>
                     </td>
+                    <td className="h-[44px] px-1 py-2 border-b border-neutral-200">
+                      <button
+                        type="button"
+                        className="p-1.5 text-neutral-300 hover:text-red-500 rounded-lg hover:bg-neutral-50 transition-colors cursor-pointer"
+                        onClick={(e) => { e.stopPropagation(); setDeleteTarget(receipt) }}
+                        aria-label="Delete receipt"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </td>
                   </tr>
                 )
               })}
@@ -124,6 +148,36 @@ function ReceiptsPage() {
           </table>
         </div>
       )}
+
+      <Modal
+        open={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        title="Delete Receipt"
+        footer={
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setDeleteTarget(null)}>
+              Cancel
+            </Button>
+            <Button
+              className="bg-red-600 text-white hover:bg-red-700"
+              size="sm"
+              onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget.id)}
+              disabled={deleteMutation.isPending}
+            >
+              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+            </Button>
+          </>
+        }
+      >
+        {deleteTarget && (
+          <p className="text-body text-neutral-600">
+            Delete the receipt from{' '}
+            <span className="font-medium">{deleteTarget.store_name ?? 'Unknown'}</span>
+            {' '}on {formatDate(deleteTarget.receipt_date)}? This will also remove all line items
+            and price history for this receipt. This cannot be undone.
+          </p>
+        )}
+      </Modal>
     </div>
   )
 }

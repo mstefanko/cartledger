@@ -14,7 +14,7 @@ import RulesPage from '@/pages/RulesPage'
 import ListsIndexPage from '@/pages/ListsIndexPage'
 import ShoppingListPage from '@/pages/ShoppingListPage'
 import ImportPage from '@/pages/ImportPage'
-import ConversionsPage from '@/pages/ConversionsPage'
+import SettingsPage from '@/pages/SettingsPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import StoreViewPage from '@/pages/StoreViewPage'
 import type { ReactNode } from 'react'
@@ -114,7 +114,8 @@ function AppRoutes() {
         <Route path="receipts" element={<ReceiptsPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />
         <Route path="import" element={<ImportPage />} />
-        <Route path="conversions" element={<ConversionsPage />} />
+        <Route path="conversions" element={<Navigate to="/settings?tab=conversions" replace />} />
+        <Route path="settings" element={<SettingsPage />} />
         <Route path="scan" element={<ScanPage />} />
       </Route>
 

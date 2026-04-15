@@ -16,6 +16,7 @@ export interface AutocompleteOption {
 interface AutocompleteCellProps {
   value: string
   displayValue: string
+  suggestedValue?: { name: string; type: string } | null
   rowIndex: number
   columnId: string
   isActive: boolean
@@ -45,6 +46,7 @@ function highlightMatch(text: string, query: string): React.ReactNode {
 function AutocompleteCell({
   value,
   displayValue,
+  suggestedValue,
   rowIndex,
   columnId,
   isActive,
@@ -57,7 +59,9 @@ function AutocompleteCell({
   onKeyDown,
   onCancelEdit,
 }: AutocompleteCellProps) {
-  const [inputValue, setInputValue] = useState(displayValue)
+  // Pre-fill input with suggestion name when no matched product
+  const initialInput = displayValue || suggestedValue?.name || ''
+  const [inputValue, setInputValue] = useState(initialInput)
   const [highlightedIndex, setHighlightedIndex] = useState(0)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [dropdownPos, setDropdownPos] = useState<{ top: number; left: number; width: number }>({
@@ -83,9 +87,9 @@ function AutocompleteCell({
   // Sync display value when not editing
   useEffect(() => {
     if (!isEditing) {
-      setInputValue(displayValue)
+      setInputValue(displayValue || suggestedValue?.name || '')
     }
-  }, [displayValue, isEditing])
+  }, [displayValue, suggestedValue, isEditing])
 
   // Position dropdown and open when editing
   useEffect(() => {
@@ -154,7 +158,7 @@ function AutocompleteCell({
         }
       } else if (e.key === 'Escape') {
         e.preventDefault()
-        setInputValue(displayValue)
+        setInputValue(displayValue || suggestedValue?.name || '')
         setDropdownOpen(false)
         onCancelEdit()
       } else if (e.key === 'Tab') {
@@ -174,11 +178,11 @@ function AutocompleteCell({
     setTimeout(() => {
       if (isEditing) {
         setDropdownOpen(false)
-        setInputValue(displayValue)
+        setInputValue(displayValue || suggestedValue?.name || '')
         onCancelEdit()
       }
     }, 150)
-  }, [isEditing, displayValue, onCancelEdit])
+  }, [isEditing, displayValue, suggestedValue, onCancelEdit])
 
   // Scroll highlighted option into view
   useEffect(() => {
@@ -261,6 +265,12 @@ function AutocompleteCell({
     )
   }
 
+  // Determine view mode display based on whether a product is matched (value = product_id)
+  const hasMatch = !!value
+  const viewText = displayValue || suggestedValue?.name || 'Unmatched'
+  const isSuggested = !hasMatch && !!suggestedValue
+  const isUnmatched = !hasMatch && !suggestedValue
+
   return (
     <>
       <div
@@ -269,13 +279,19 @@ function AutocompleteCell({
         onClick={onStartEdit}
         onKeyDown={handleCellKeyDown}
         className={[
-          'w-full h-full px-2 py-1 text-caption font-body text-neutral-900 cursor-pointer truncate',
+          'w-full h-full px-2 py-1 text-caption font-body cursor-pointer truncate',
           'leading-[36px]',
           isActive ? 'ring-2 ring-brand ring-inset rounded-sm' : '',
-          !value ? 'text-neutral-400 italic' : '',
+          isSuggested
+            ? suggestedValue.type === 'new_product'
+              ? 'text-blue-600 italic'
+              : 'text-amber-600 italic'
+            : isUnmatched
+              ? 'text-neutral-400 italic'
+              : 'text-neutral-900',
         ].join(' ')}
       >
-        {displayValue || 'Unmatched'}
+        {viewText}
       </div>
       {dropdown}
     </>

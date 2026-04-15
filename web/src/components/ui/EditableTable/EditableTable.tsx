@@ -25,6 +25,8 @@ declare module '@tanstack/react-table' {
     onAutocompleteCreate?: (rowIndex: number, columnId: string, label: string) => void
     /** For autocomplete: a function to get display text from the raw cell value */
     getDisplayValue?: (value: TValue) => string
+    /** For autocomplete: a function to get a pending suggestion for this row */
+    getSuggestedValue?: (rowIndex: number) => { name: string; type: string } | null
   }
 }
 
@@ -133,6 +135,9 @@ function EditableTable<TData>({
           const displayValue = meta.getDisplayValue
             ? meta.getDisplayValue(cell.getValue())
             : cellValue
+          const suggestedValue = meta.getSuggestedValue
+            ? meta.getSuggestedValue(rowIndex)
+            : null
           return (
             <td
               key={cell.id}
@@ -141,6 +146,7 @@ function EditableTable<TData>({
               <AutocompleteCell
                 value={cellValue}
                 displayValue={displayValue}
+                suggestedValue={suggestedValue}
                 rowIndex={rowIndex}
                 columnId={cell.column.id}
                 isActive={isActive}

@@ -14,6 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/units"
@@ -102,11 +103,25 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		if entry.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(job.ImageDir, entry.Name()))
+		imgPath := filepath.Join(job.ImageDir, entry.Name())
+		data, err := os.ReadFile(imgPath)
 		if err != nil {
 			return fmt.Errorf("read image %s: %w", entry.Name(), err)
 		}
-		images = append(images, data)
+
+		// Preprocess: resize, grayscale, contrast, sharpen, crop.
+		// Falls back to raw image on any error.
+		originalSize := len(data)
+		processed, _ := imaging.PreprocessReceipt(data)
+		log.Printf("worker: preprocessed %s (%d KB → %d KB)", entry.Name(), originalSize/1024, len(processed)/1024)
+
+		// Save preprocessed version alongside original.
+		processedPath := filepath.Join(job.ImageDir, "processed_"+entry.Name())
+		if err := os.WriteFile(processedPath, processed, 0644); err != nil {
+			log.Printf("WARN: failed to save preprocessed image: %v", err)
+		}
+
+		images = append(images, processed)
 	}
 	if len(images) == 0 {
 		return fmt.Errorf("no images found in %s", job.ImageDir)

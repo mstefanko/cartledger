@@ -99,6 +99,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
 	receipts.POST("/:id/accept-suggestions", h.AcceptSuggestions)
 	receipts.PUT("/:id", h.UpdateReceipt)
+	receipts.DELETE("/:id", h.Delete)
 }
 
 // Scan handles multipart receipt image upload and submits for background processing.
@@ -686,4 +687,54 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, resp)
+}
+
+// Delete removes a receipt and its associated data.
+// DELETE /api/v1/receipts/:id
+func (h *ReceiptHandler) Delete(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	// Verify receipt belongs to household and get image_paths for cleanup.
+	var imagePaths *string
+	err := h.DB.QueryRow(
+		"SELECT image_paths FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&imagePaths)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec("DELETE FROM product_prices WHERE receipt_id = ?", receiptID)
+	_, _ = tx.Exec("DELETE FROM line_items WHERE receipt_id = ?", receiptID)
+	_, err = tx.Exec("DELETE FROM receipts WHERE id = ?", receiptID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	// Clean up image files.
+	if imagePaths != nil {
+		for _, p := range strings.Split(*imagePaths, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				_ = os.RemoveAll(filepath.Dir(p))
+				break // all images in same dir
+			}
+		}
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
 }

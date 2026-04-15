@@ -3,7 +3,6 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { listStores } from '@/api/stores'
 import { listLists, createList } from '@/api/lists'
-import { InviteModal } from '@/components/ui/InviteModal'
 
 interface SidebarProps {
   open: boolean
@@ -51,7 +50,6 @@ function Sidebar({ open, onClose }: SidebarProps) {
   const queryClient = useQueryClient()
   const [creatingList, setCreatingList] = useState(false)
   const [newListName, setNewListName] = useState('')
-  const [showInvite, setShowInvite] = useState(false)
 
   const storesQuery = useQuery({
     queryKey: ['stores'],
@@ -196,24 +194,13 @@ function Sidebar({ open, onClose }: SidebarProps) {
           </div>
         </div>
 
-        {/* Settings section */}
+        {/* Settings */}
         <div>
-          <p className="px-3 mb-2 text-small font-semibold text-neutral-400 uppercase tracking-wide">
-            Settings
-          </p>
           <div className="flex flex-col gap-0.5">
-            <NavLink to="/conversions" className={navLinkClass} onClick={onClose}>
-              <span className="text-sm leading-none font-mono">{'\u21C4'}</span>
-              Unit Conversions
+            <NavLink to="/settings" className={navLinkClass} onClick={onClose}>
+              <span className="text-sm leading-none font-mono">{'\u2699'}</span>
+              Settings
             </NavLink>
-            <button
-              type="button"
-              className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-caption font-medium transition-colors text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 w-full text-left"
-              onClick={() => setShowInvite(true)}
-            >
-              <span className="text-sm leading-none font-mono">{'\u2709'}</span>
-              Invite to Household
-            </button>
           </div>
         </div>
       </div>
@@ -229,8 +216,6 @@ function Sidebar({ open, onClose }: SidebarProps) {
         </NavLink>
       </div>
 
-      {/* Invite Modal */}
-      <InviteModal open={showInvite} onClose={() => setShowInvite(false)} />
     </nav>
   )
 
