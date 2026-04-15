@@ -1,0 +1,1 @@
+-- No-op: the old CHECK was too restrictive.
