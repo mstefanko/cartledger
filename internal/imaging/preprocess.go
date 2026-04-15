@@ -26,7 +26,7 @@ type Options struct {
 	MaxEdge       int     // Long edge max pixels (default 1568 — Claude's native limit)
 	JPEGQuality   int     // Output JPEG quality (default 85)
 	ContrastBoost float64 // Contrast adjustment -1.0 to 1.0 (default 0.2)
-	CropThreshold uint8   // Binary threshold for border cropping (default 200)
+	CropThreshold uint8   // Binary threshold for border cropping (default 170)
 	CropMinRatio  float64 // Skip crop if bounding box covers > this ratio (default 0.9)
 }
 
@@ -36,7 +36,7 @@ func DefaultOptions() Options {
 		MaxEdge:       1568,
 		JPEGQuality:   85,
 		ContrastBoost: 0.2,
-		CropThreshold: 200,
+		CropThreshold: 170,
 		CropMinRatio:  0.9,
 	}
 }
@@ -87,14 +87,15 @@ func doPreprocess(raw []byte, opts Options) ([]byte, error) {
 	// Step 3: Grayscale.
 	img = effect.Grayscale(img)
 
-	// Step 4: Contrast boost.
+	// Step 4: Border crop — run on clean grayscale BEFORE contrast/sharpen
+	// to avoid bright artifacts fooling the threshold.
+	img = cropBorders(img, opts.CropThreshold, opts.CropMinRatio)
+
+	// Step 5: Contrast boost.
 	img = adjust.Contrast(img, opts.ContrastBoost)
 
-	// Step 5: Sharpen — helps with thermal print text.
+	// Step 6: Sharpen — helps with thermal print text.
 	img = effect.Sharpen(img)
-
-	// Step 6: Border crop — trim dark background around receipt paper.
-	img = cropBorders(img, opts.CropThreshold, opts.CropMinRatio)
 
 	// Step 7: Re-encode as JPEG.
 	var buf bytes.Buffer
@@ -107,44 +108,65 @@ func doPreprocess(raw []byte, opts Options) ([]byte, error) {
 
 // cropBorders uses thresholding to find the receipt paper region and crops
 // away dark borders. Skips if the bounding box covers most of the image.
+//
+// Uses column/row projection: a column (or row) is considered "paper" only if
+// at least 15% of its pixels are above the threshold. This filters out isolated
+// bright specks from table reflections/wood grain.
 func cropBorders(img image.Image, threshold uint8, minRatio float64) image.Image {
 	// Binarize: pixels brighter than threshold → white, else black.
 	binary := segment.Threshold(img, threshold)
 
 	bounds := binary.Bounds()
 	imgW, imgH := bounds.Dx(), bounds.Dy()
+	minDensity := 0.15 // 15% of pixels in a row/col must be bright to count
 
-	// Find bounding box of white (paper) pixels.
-	minX, minY := imgW, imgH
-	maxX, maxY := 0, 0
-
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+	// Column projection: for each x, count bright pixels.
+	colMinX, colMaxX := imgW, 0
+	for x := bounds.Min.X; x < bounds.Max.X; x++ {
+		bright := 0
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 			r, _, _, _ := binary.At(x, y).RGBA()
-			if r > 0 { // White pixel in binary image.
-				if x < minX {
-					minX = x
-				}
-				if x > maxX {
-					maxX = x
-				}
-				if y < minY {
-					minY = y
-				}
-				if y > maxY {
-					maxY = y
-				}
+			if r > 0 {
+				bright++
+			}
+		}
+		if float64(bright)/float64(imgH) >= minDensity {
+			if x < colMinX {
+				colMinX = x
+			}
+			if x > colMaxX {
+				colMaxX = x
 			}
 		}
 	}
 
-	// No white pixels found — return original.
-	if maxX <= minX || maxY <= minY {
+	// Row projection: for each y, count bright pixels.
+	rowMinY, rowMaxY := imgH, 0
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		bright := 0
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, _, _, _ := binary.At(x, y).RGBA()
+			if r > 0 {
+				bright++
+			}
+		}
+		if float64(bright)/float64(imgW) >= minDensity {
+			if y < rowMinY {
+				rowMinY = y
+			}
+			if y > rowMaxY {
+				rowMaxY = y
+			}
+		}
+	}
+
+	// No paper region found — return original.
+	if colMaxX <= colMinX || rowMaxY <= rowMinY {
 		return img
 	}
 
-	boxW := maxX - minX
-	boxH := maxY - minY
+	boxW := colMaxX - colMinX
+	boxH := rowMaxY - rowMinY
 	coverageRatio := float64(boxW*boxH) / float64(imgW*imgH)
 
 	// Skip crop if box covers most of the image (no clear background).
@@ -156,10 +178,10 @@ func cropBorders(img image.Image, threshold uint8, minRatio float64) image.Image
 	padX := imgW / 50
 	padY := imgH / 50
 	cropRect := image.Rect(
-		max(minX-padX, bounds.Min.X),
-		max(minY-padY, bounds.Min.Y),
-		min(maxX+padX, bounds.Max.X),
-		min(maxY+padY, bounds.Max.Y),
+		max(colMinX-padX, bounds.Min.X),
+		max(rowMinY-padY, bounds.Min.Y),
+		min(colMaxX+padX, bounds.Max.X),
+		min(rowMaxY+padY, bounds.Max.Y),
 	)
 
 	return transform.Crop(img, cropRect)

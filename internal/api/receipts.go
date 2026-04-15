@@ -665,11 +665,17 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 			)
 		}
 
-		// Update product purchase stats.
+		// Update product purchase stats and set default_unit if not yet set.
 		_, _ = tx.Exec(
 			"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
 			receiptDate, now, productID,
 		)
+		if unit != nil && *unit != "" {
+			_, _ = tx.Exec(
+				"UPDATE products SET default_unit = ? WHERE id = ? AND default_unit IS NULL",
+				*unit, productID,
+			)
+		}
 	}
 
 	// Check if all line items are now matched; update receipt status if so.

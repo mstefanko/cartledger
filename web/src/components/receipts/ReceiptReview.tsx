@@ -131,7 +131,14 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type != null),
     [rows],
   )
-  const suggestedCount = suggestedRows.length
+  const suggestedMatchCount = useMemo(
+    () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type === 'existing_match').length,
+    [rows],
+  )
+  const suggestedNewCount = useMemo(
+    () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type === 'new_product').length,
+    [rows],
+  )
   const unmatchedCount = useMemo(
     () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type == null).length,
     [rows],
@@ -244,25 +251,20 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               </span>
             )
           }
-          if (item.suggestion_type) {
-            const isExisting = item.suggestion_type === 'existing_match'
+          if (item.suggestion_type === 'existing_match') {
             return (
-              <span
-                className="flex items-center justify-center"
-                title={isExisting ? 'Suggested match' : 'Suggested new product'}
-              >
-                <svg
-                  className={`w-4 h-4 ${isExisting ? 'text-amber-500' : 'text-blue-500'}`}
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2.5}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"
-                  />
+              <span className="flex items-center justify-center" title="Suggested match to existing product">
+                <svg className="w-4 h-4 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                </svg>
+              </span>
+            )
+          }
+          if (item.suggestion_type === 'new_product') {
+            return (
+              <span className="flex items-center justify-center" title="Will create new product">
+                <svg className="w-4 h-4 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v6m3-3H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </span>
             )
@@ -405,8 +407,13 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Badge variant="success">{matchedCount} matched</Badge>
-          {suggestedCount > 0 && (
-            <Badge variant="warning">{suggestedCount} suggested</Badge>
+          {suggestedMatchCount > 0 && (
+            <Badge variant="warning">{suggestedMatchCount} suggested</Badge>
+          )}
+          {suggestedNewCount > 0 && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">
+              {suggestedNewCount} new
+            </span>
           )}
           {unmatchedCount > 0 && (
             <Badge variant="error">{unmatchedCount} unmatched</Badge>

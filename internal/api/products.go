@@ -49,6 +49,8 @@ type productResponse struct {
 	Notes           *string    `json:"notes,omitempty"`
 	LastPurchasedAt *time.Time `json:"last_purchased_at,omitempty"`
 	PurchaseCount   int        `json:"purchase_count"`
+	AliasCount      int        `json:"alias_count"`
+	LastPrice       *string    `json:"last_price,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 }
@@ -71,6 +73,21 @@ type productLinkResponse struct {
 	URL        string    `json:"url"`
 	Label      *string   `json:"label,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// fetchProduct loads a single product with computed alias_count and last_price.
+func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
+	var p productResponse
+	err := h.DB.QueryRow(
+		`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+		        p.last_purchased_at, p.purchase_count,
+		        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
+		        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
+		        p.created_at, p.updated_at
+		 FROM products p WHERE p.id = ?`, id,
+	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
+		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
+	return p, err
 }
 
 // RegisterRoutes mounts product endpoints onto the protected group.
@@ -104,7 +121,10 @@ func (h *ProductHandler) List(c echo.Context) error {
 		// FTS5 search — scope to household via JOIN.
 		rows, err = h.DB.Query(
 			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-			        p.last_purchased_at, p.purchase_count, p.created_at, p.updated_at
+			        p.last_purchased_at, p.purchase_count,
+			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
+			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
+			        p.created_at, p.updated_at
 			 FROM products p
 			 JOIN products_fts f ON p.rowid = f.rowid
 			 WHERE products_fts MATCH ? AND p.household_id = ?
@@ -113,9 +133,12 @@ func (h *ProductHandler) List(c echo.Context) error {
 		)
 	} else {
 		rows, err = h.DB.Query(
-			`SELECT id, household_id, name, category, default_unit, notes,
-			        last_purchased_at, purchase_count, created_at, updated_at
-			 FROM products WHERE household_id = ? ORDER BY name`,
+			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+			        p.last_purchased_at, p.purchase_count,
+			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
+			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
+			        p.created_at, p.updated_at
+			 FROM products p WHERE p.household_id = ? ORDER BY p.name`,
 			householdID,
 		)
 	}
@@ -128,7 +151,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 	for rows.Next() {
 		var p productResponse
 		if err := rows.Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-			&p.LastPurchasedAt, &p.PurchaseCount, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		products = append(products, p)
@@ -169,13 +192,7 @@ func (h *ProductHandler) Create(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	var p productResponse
-	err = h.DB.QueryRow(
-		`SELECT id, household_id, name, category, default_unit, notes,
-		        last_purchased_at, purchase_count, created_at, updated_at
-		 FROM products WHERE id = ?`, id,
-	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.LastPurchasedAt, &p.PurchaseCount, &p.CreatedAt, &p.UpdatedAt)
+	p, err := h.fetchProduct(id)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -215,13 +232,7 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
 	}
 
-	var p productResponse
-	err = h.DB.QueryRow(
-		`SELECT id, household_id, name, category, default_unit, notes,
-		        last_purchased_at, purchase_count, created_at, updated_at
-		 FROM products WHERE id = ?`, productID,
-	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.LastPurchasedAt, &p.PurchaseCount, &p.CreatedAt, &p.UpdatedAt)
+	p, err := h.fetchProduct(productID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -621,13 +632,7 @@ func (h *ProductHandler) Merge(c echo.Context) error {
 	}
 
 	// Return the kept product.
-	var p productResponse
-	err = h.DB.QueryRow(
-		`SELECT id, household_id, name, category, default_unit, notes,
-		        last_purchased_at, purchase_count, created_at, updated_at
-		 FROM products WHERE id = ?`, req.KeepID,
-	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.LastPurchasedAt, &p.PurchaseCount, &p.CreatedAt, &p.UpdatedAt)
+	p, err := h.fetchProduct(req.KeepID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -692,18 +697,21 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
 
-	// Fetch product.
-	var p productResponse
+	// Verify product belongs to household.
+	var exists int
 	err := h.DB.QueryRow(
-		`SELECT id, household_id, name, category, default_unit, notes,
-		        last_purchased_at, purchase_count, created_at, updated_at
-		 FROM products WHERE id = ? AND household_id = ?`,
+		"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
 		productID, householdID,
-	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.LastPurchasedAt, &p.PurchaseCount, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&exists)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
 	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// Fetch product with computed fields.
+	p, err := h.fetchProduct(productID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}

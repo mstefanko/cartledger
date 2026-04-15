@@ -1,6 +1,7 @@
 import { get, post, put, del, postMultipart } from './client'
 import type {
   Product,
+  ProductListItem,
   ProductAlias,
   ProductImage,
   ProductLink,
@@ -10,13 +11,13 @@ import type {
   CreateAliasRequest,
 } from '@/types'
 
-export async function listProducts(params?: { search?: string }): Promise<Product[]> {
+export async function listProducts(params?: { search?: string }): Promise<ProductListItem[]> {
   const searchParams = new URLSearchParams()
   if (params?.search) {
-    searchParams.set('search', params.search)
+    searchParams.set('q', params.search)
   }
   const query = searchParams.toString()
-  return get<Product[]>(`/products${query ? `?${query}` : ''}`)
+  return get<ProductListItem[]>(`/products${query ? `?${query}` : ''}`)
 }
 
 export async function createProduct(data: CreateProductRequest): Promise<Product> {

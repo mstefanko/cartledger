@@ -1,7 +1,6 @@
 import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { getStoreSummary } from '@/api/analytics'
-import { Badge } from '@/components/ui/Badge'
 
 function formatAddress(store: { address: string | null; city: string | null; state: string | null; zip: string | null }) {
   const parts = [store.address, store.city, store.state].filter(Boolean)
@@ -11,9 +10,9 @@ function formatAddress(store: { address: string | null; city: string | null; sta
   return addr
 }
 
-function formatCurrency(value: string | undefined): string {
-  if (!value) return '$0.00'
-  const num = parseFloat(value)
+function formatCurrency(value: string | number | undefined): string {
+  if (value == null) return '$0.00'
+  const num = typeof value === 'number' ? value : parseFloat(value)
   if (isNaN(num)) return '$0.00'
   return `$${num.toFixed(2)}`
 }
@@ -79,17 +78,11 @@ function StoreViewPage() {
       </div>
 
       {/* Stats Cards */}
-      <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div className="p-4 rounded-2xl border border-neutral-200 bg-white shadow-subtle">
           <p className="text-caption font-semibold text-neutral-400 uppercase">Total Spent</p>
           <p className="mt-1 font-display text-subhead font-bold text-neutral-900">
             {formatCurrency(summary.total_spent)}
-          </p>
-        </div>
-        <div className="p-4 rounded-2xl border border-neutral-200 bg-white shadow-subtle">
-          <p className="text-caption font-semibold text-neutral-400 uppercase">Items Tracked</p>
-          <p className="mt-1 font-display text-subhead font-bold text-neutral-900">
-            {summary.item_count}
           </p>
         </div>
         <div className="p-4 rounded-2xl border border-neutral-200 bg-white shadow-subtle">
@@ -119,14 +112,9 @@ function StoreViewPage() {
             summary.price_leaders.map((leader, i) => (
               <div key={i} className="flex items-center justify-between p-4">
                 <span className="text-body text-neutral-900">{leader.product_name}</span>
-                <div className="flex items-center gap-2">
-                  <span className="text-body font-bold text-neutral-900">
-                    {formatCurrency(leader.price)}
-                  </span>
-                  <Badge variant="success">
-                    saves {formatCurrency(leader.savings)}
-                  </Badge>
-                </div>
+                <span className="text-body font-bold text-neutral-900">
+                  {formatCurrency(leader.avg_price)}
+                </span>
               </div>
             ))
           ) : (

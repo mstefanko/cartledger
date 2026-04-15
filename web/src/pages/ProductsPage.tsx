@@ -2,18 +2,17 @@ import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { listProducts, createProduct, updateProduct } from '@/api/products'
+import type { ProductListItem } from '@/types'
 import { getProductsWithTrends } from '@/api/analytics'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { EditableTable } from '@/components/ui/EditableTable'
 import type { ColumnDef, CellContext } from '@tanstack/react-table'
-import type { Product, ProductTrend } from '@/types'
+import type { ProductWithTrend } from '@/types'
 
-interface ProductRow extends Product {
-  alias_count: number
-  last_price: string | null
-  trend: ProductTrend | null
+interface ProductRow extends ProductListItem {
+  trend: ProductWithTrend | null
 }
 
 function ProductsPage() {
@@ -62,10 +61,10 @@ function ProductsPage() {
   })
 
   const trendMap = useMemo(() => {
-    const map = new Map<string, ProductTrend>()
+    const map = new Map<string, ProductWithTrend>()
     if (productsWithTrends) {
       for (const pwt of productsWithTrends) {
-        if (pwt.trend) map.set(pwt.product.id, pwt.trend)
+        map.set(pwt.id, pwt)
       }
     }
     return map
@@ -75,8 +74,6 @@ function ProductsPage() {
     if (!products || !Array.isArray(products)) return []
     return products.map((p) => ({
       ...p,
-      alias_count: 0,
-      last_price: null,
       trend: trendMap.get(p.id) ?? null,
     }))
   }, [products, trendMap])
@@ -179,8 +176,9 @@ function ProductsPage() {
         cell: ({ row }: CellContext<ProductRow, unknown>) => {
           const t = row.original.trend
           if (!t) return <span className="text-small text-neutral-400">&mdash;</span>
-          const sparkData = t.sparkline.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
-          const sparkHighlights = t.sparkline.map((p) => p.is_sale)
+          const points = t.sparkline ?? []
+          const sparkData = points.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
+          const sparkHighlights = points.map((p) => p.is_sale)
           if (sparkData.length < 2) return <span className="text-small text-neutral-400">&mdash;</span>
           return <Sparkline data={sparkData} highlights={sparkHighlights} />
         },

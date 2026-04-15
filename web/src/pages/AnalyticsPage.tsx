@@ -69,24 +69,24 @@ function AnalyticsPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-200">
-                  {productsWithTrends.map(({ product, trend }) => {
-                    const sparkPoints = trend?.sparkline ?? []
+                  {productsWithTrends.map((item) => {
+                    const sparkPoints = item.sparkline ?? []
                     const sparkData = sparkPoints.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
                     const sparkHighlights = sparkPoints.map((p) => p.is_sale)
-                    const pctChange = trend?.percent_change ?? 0
+                    const pctChange = item.percent_change ?? 0
                     const changeVariant = pctChange > 0 ? 'warning' : pctChange < 0 ? 'success' : 'neutral'
 
                     return (
-                      <tr key={product.id} className="hover:bg-neutral-50">
+                      <tr key={item.id} className="hover:bg-neutral-50">
                         <td className="px-4 py-3">
                           <Link
-                            to={`/products/${product.id}`}
+                            to={`/products/${item.id}`}
                             className="text-body text-brand hover:underline"
                           >
-                            {product.name}
+                            {item.name}
                           </Link>
-                          {product.category && (
-                            <p className="text-small text-neutral-400">{product.category}</p>
+                          {item.category && (
+                            <p className="text-small text-neutral-400">{item.category}</p>
                           )}
                         </td>
                         <td className="px-4 py-3">
@@ -97,21 +97,17 @@ function AnalyticsPage() {
                           )}
                         </td>
                         <td className="px-4 py-3 text-right text-body font-medium text-neutral-900">
-                          {trend?.current_price ? `$${parseFloat(trend.current_price).toFixed(2)}` : '\u2014'}
+                          {item.latest_price ? `$${item.latest_price.toFixed(2)}` : '\u2014'}
                         </td>
                         <td className="px-4 py-3 text-right">
-                          {trend ? (
-                            <Badge variant={changeVariant}>
-                              {pctChange > 0 ? '+' : ''}
-                              {pctChange.toFixed(1)}%
-                            </Badge>
-                          ) : (
-                            <span className="text-small text-neutral-400">&mdash;</span>
-                          )}
+                          <Badge variant={changeVariant}>
+                            {pctChange > 0 ? '+' : ''}
+                            {pctChange.toFixed(1)}%
+                          </Badge>
                         </td>
                         <td className="px-4 py-3 text-right text-small text-neutral-400">
-                          {trend?.min_price && trend?.max_price
-                            ? `$${parseFloat(trend.min_price).toFixed(2)} / $${parseFloat(trend.max_price).toFixed(2)}`
+                          {item.min_price != null && item.max_price != null
+                            ? `$${item.min_price.toFixed(2)} / $${item.max_price.toFixed(2)}`
                             : '\u2014'}
                         </td>
                       </tr>

@@ -88,7 +88,20 @@ type storeRecentTrip struct {
 	ItemCount   int     `json:"item_count"`
 }
 
+type storeSummaryStore struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Icon        *string `json:"icon"`
+	Nickname    *string `json:"nickname"`
+	StoreNumber *string `json:"store_number"`
+	Address     *string `json:"address"`
+	City        *string `json:"city"`
+	State       *string `json:"state"`
+	Zip         *string `json:"zip"`
+}
+
 type storeSummaryResponse struct {
+	Store        storeSummaryStore  `json:"store"`
 	TotalSpent   float64            `json:"total_spent"`
 	TripCount    int                `json:"trip_count"`
 	AvgTripCost  float64            `json:"avg_trip_cost"`
@@ -379,12 +392,14 @@ func (h *AnalyticsHandler) StoreSummary(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	storeID := c.Param("id")
 
-	// Verify store belongs to household.
-	var exists int
+	// Fetch store details and verify it belongs to household.
+	var store storeSummaryStore
 	err := h.DB.QueryRow(
-		"SELECT 1 FROM stores WHERE id = ? AND household_id = ?",
+		`SELECT id, name, icon, nickname, store_number, address, city, state, zip
+		 FROM stores WHERE id = ? AND household_id = ?`,
 		storeID, householdID,
-	).Scan(&exists)
+	).Scan(&store.ID, &store.Name, &store.Icon, &store.Nickname,
+		&store.StoreNumber, &store.Address, &store.City, &store.State, &store.Zip)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "store not found"})
 	}
@@ -393,6 +408,7 @@ func (h *AnalyticsHandler) StoreSummary(c echo.Context) error {
 	}
 
 	resp := storeSummaryResponse{
+		Store:        store,
 		PriceLeaders: make([]storePriceLeader, 0),
 		RecentTrips:  make([]storeRecentTrip, 0),
 	}

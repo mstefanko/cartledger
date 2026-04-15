@@ -6,6 +6,7 @@ data/
 
 # Build output
 cartledger
+web/dist/
 
 # Claude Code local settings
 .claude/
@@ -16,5 +17,6 @@ cartledger
 # Planning docs (not shipped)
 PLAN-*.md
 REVIEW-*.md
+ANALYSIS-*.md
 UX-AUDIT-*.md
 WORK-BREAKDOWN-*.md

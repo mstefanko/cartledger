@@ -51,6 +51,12 @@ export interface Product {
   updated_at: string
 }
 
+// Extended product returned by the list endpoint (includes computed fields)
+export interface ProductListItem extends Product {
+  alias_count: number
+  last_price: string | null
+}
+
 export interface ProductAlias {
   id: string
   product_id: string
@@ -582,19 +588,27 @@ export interface ProductTrend {
   current_price: string
 }
 
+// Backend returns flat product+trend shape from /analytics/products
 export interface ProductWithTrend {
-  product: Product
-  trend: ProductTrend | null
+  id: string
+  name: string
+  category?: string
+  latest_price: number
+  avg_price: number
+  percent_change: number
+  last_purchased?: string
+  sparkline?: SparklinePoint[]
+  min_price?: number
+  max_price?: number
 }
 
 export interface StoreSummary {
   store: Store
-  total_spent: string
-  item_count: number
+  total_spent: number
   trip_count: number
-  avg_trip_cost: string
-  price_leaders: { product_name: string; price: string; savings: string }[]
-  recent_trips: Trip[]
+  avg_trip_cost: number
+  price_leaders: { product_id: string; product_name: string; avg_price: number }[]
+  recent_trips: { receipt_id: string; date: string; total: number; item_count: number }[]
 }
 
 export interface Trip {
