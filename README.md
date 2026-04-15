@@ -16,14 +16,14 @@ Self-hosted app to track grocery receipts, compare prices, and build smart shopp
 
 ## Tech Stack
 
-- **Backend:** Go 1.25, Echo framework, SQLite
+- **Backend:** Go 1.26, Echo framework, SQLite
 - **Frontend:** React 19, TypeScript, Vite, Tailwind CSS 4
 
 ## Prerequisites
 
-- [Go 1.25+](https://go.dev/dl/)
+- [Go 1.26+](https://go.dev/dl/)
 - [Node.js 18+](https://nodejs.org/) (for frontend development)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) **or** an API key for [Anthropic Claude](https://console.anthropic.com/) / [Google Gemini](https://ai.google.dev/) (for receipt scanning)
+- An API key for [Anthropic Claude](https://console.anthropic.com/) (for receipt scanning)
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ cd cartledger
 cp .env.example .env
 ```
 
-Edit `.env` — if you have the Claude Code CLI installed, **no API key is needed**. The server auto-detects the CLI and uses your subscription billing. Otherwise, set `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`.
+Edit `.env` — set `ANTHROPIC_API_KEY` for receipt scanning.
 
 ### 2. Run with Docker (recommended)
 
@@ -43,7 +43,7 @@ Edit `.env` — if you have the Claude Code CLI installed, **no API key is neede
 docker-compose up --build
 ```
 
-The app will be available at `http://localhost:8080`.
+The app will be available at `http://localhost:8079`.
 
 ### 3. Run locally (development)
 
@@ -53,7 +53,7 @@ The app will be available at `http://localhost:8080`.
 go run ./cmd/server
 ```
 
-The server starts on port 8080 by default and serves the built frontend.
+The server starts on port 8079 by default.
 
 **Frontend (dev mode with hot reload):**
 
@@ -80,22 +80,15 @@ npm run build
 go test ./...
 ```
 
-**Frontend:**
-
-```bash
-cd web
-npm test
-```
-
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8080` | Server port |
+| `PORT` | `8079` | Server port |
 | `DATA_DIR` | `./data` | SQLite DB and uploads directory |
-| `LLM_PROVIDER` | *(auto)* | `claude-cli` (CLI subscription), `claude` (API), `gemini`, `mock`, or empty for auto-detect |
-| `ANTHROPIC_API_KEY` | — | Required if `LLM_PROVIDER=claude` |
-| `GEMINI_API_KEY` | — | Required if `LLM_PROVIDER=gemini` |
+| `LLM_PROVIDER` | *(auto)* | `claude` (API), `mock`, or empty for auto-detect |
+| `LLM_MODEL` | `claude-sonnet-4-20250514` | Claude model ID (e.g., `claude-haiku-4-5-20251001` for cheaper/faster) |
+| `ANTHROPIC_API_KEY` | — | Required for receipt scanning |
 | `JWT_SECRET` | `change-me-in-production` | JWT signing key |
 | `MEALIE_URL` | — | Optional Mealie instance URL |
 | `MEALIE_TOKEN` | — | Optional Mealie API token |
@@ -115,6 +108,5 @@ internal/
   units/             Unit conversion engine
   worker/            Background job processing
   ws/                WebSocket hub
-migrations/          SQL migration files
 web/                 React frontend (Vite + TypeScript)
 ```
