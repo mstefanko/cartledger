@@ -44,6 +44,9 @@ export interface Product {
   name: string
   category: string | null
   default_unit: string | null
+  brand?: string
+  pack_quantity?: number
+  pack_unit?: string
   notes: string | null
   last_purchased_at: string | null
   purchase_count: number
@@ -55,6 +58,7 @@ export interface Product {
 export interface ProductListItem extends Product {
   alias_count: number
   last_price: string | null
+  brand?: string
 }
 
 export interface ProductAlias {
@@ -117,7 +121,7 @@ export interface LineItem {
   suggested_category: string | null
   suggested_product_id: string | null
   suggested_product_name: string | null
-  suggestion_type: 'existing_match' | 'new_product' | null
+  suggestion_type: 'existing_match' | 'new_product' | 'cross_store_match' | null
   created_at: string
 }
 
@@ -232,6 +236,7 @@ export interface ProductDetail {
   links: ProductLink[]
   price_history: PriceHistoryEntry[]
   store_prices: StorePriceComparison[]
+  price_per_unit?: number
   stats: {
     count: number
     avg: string
@@ -333,6 +338,9 @@ export interface CreateProductRequest {
   name: string
   category?: string
   default_unit?: string
+  brand?: string
+  pack_quantity?: number
+  pack_unit?: string
   notes?: string
 }
 
@@ -340,6 +348,9 @@ export interface UpdateProductRequest {
   name?: string
   category?: string
   default_unit?: string
+  brand?: string
+  pack_quantity?: number
+  pack_unit?: string
   notes?: string
 }
 

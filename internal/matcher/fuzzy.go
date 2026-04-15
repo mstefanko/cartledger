@@ -192,3 +192,41 @@ func min(a, b, c int) int {
 	}
 	return a
 }
+
+// storeHistoryState represents the 3-state result of productHasStoreHistory.
+type storeHistoryState int
+
+const (
+	storeHistoryNone       storeHistoryState = iota // no price history anywhere
+	storeHistoryThisStore                           // has history at the given store
+	storeHistoryOtherStore                          // has history at other stores only
+)
+
+// productHasStoreHistory checks whether a product has price history at the given store,
+// at other stores only, or nowhere at all.
+func productHasStoreHistory(db *sql.DB, productID string, storeID string) storeHistoryState {
+	rows, err := db.Query(
+		`SELECT store_id FROM product_prices WHERE product_id = ? GROUP BY store_id`,
+		productID,
+	)
+	if err != nil {
+		return storeHistoryNone
+	}
+	defer rows.Close()
+
+	hasAny := false
+	for rows.Next() {
+		var sid string
+		if rows.Scan(&sid) != nil {
+			continue
+		}
+		hasAny = true
+		if sid == storeID {
+			return storeHistoryThisStore
+		}
+	}
+	if hasAny {
+		return storeHistoryOtherStore
+	}
+	return storeHistoryNone
+}

@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getProductDetail,
+  updateProduct,
   uploadProductImage,
   deleteProductImage,
   createProductAlias,
@@ -35,6 +36,105 @@ function pctChange(history: ProductDetail['price_history']): { pct: number; dire
 }
 
 // --- Sub-components ---
+
+function ProductInfoSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
+  const queryClient = useQueryClient()
+  const [brand, setBrand] = useState(detail.product.brand ?? '')
+  const [packQuantity, setPackQuantity] = useState(detail.product.pack_quantity?.toString() ?? '')
+  const [packUnit, setPackUnit] = useState(detail.product.pack_unit ?? '')
+
+  const updateMutation = useMutation({
+    mutationFn: (data: { brand?: string; pack_quantity?: number; pack_unit?: string }) =>
+      updateProduct(productId, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
+
+  const handleSaveBrand = useCallback(() => {
+    updateMutation.mutate({ brand: brand || undefined })
+  }, [brand, updateMutation])
+
+  const handleSavePackInfo = useCallback(() => {
+    const qty = packQuantity ? parseFloat(packQuantity) : undefined
+    updateMutation.mutate({
+      pack_quantity: qty,
+      pack_unit: packUnit || undefined,
+    })
+  }, [packQuantity, packUnit, updateMutation])
+
+  // Compute price per unit from latest price
+  const latestPrice = detail.price_history.length > 0
+    ? parseFloat(detail.price_history[0]?.unit_price ?? '0')
+    : null
+  const packQty = detail.product.pack_quantity
+  const pricePerUnit = (latestPrice && packQty && packQty > 0)
+    ? latestPrice / packQty
+    : null
+
+  return (
+    <div className="bg-white rounded-2xl shadow-subtle p-5">
+      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Product Info</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {/* Brand */}
+        <div>
+          <label className="block text-small font-medium text-neutral-400 mb-1">Brand</label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={brand}
+              onChange={(e) => setBrand(e.target.value)}
+              placeholder="e.g., Kirkland, Great Value"
+              className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+              onBlur={handleSaveBrand}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBrand() }}
+            />
+          </div>
+        </div>
+
+        {/* Pack Quantity */}
+        <div>
+          <label className="block text-small font-medium text-neutral-400 mb-1">Pack Size</label>
+          <div className="flex gap-2">
+            <input
+              type="number"
+              value={packQuantity}
+              onChange={(e) => setPackQuantity(e.target.value)}
+              placeholder="e.g., 12"
+              min="0"
+              step="any"
+              className="w-24 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+              onBlur={handleSavePackInfo}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleSavePackInfo() }}
+            />
+            <input
+              type="text"
+              value={packUnit}
+              onChange={(e) => setPackUnit(e.target.value)}
+              placeholder="unit (e.g., oz, ct)"
+              className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+              onBlur={handleSavePackInfo}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleSavePackInfo() }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Price per unit display */}
+      <div className="mt-4">
+        {pricePerUnit != null ? (
+          <p className="text-body font-medium text-success-dark">
+            Price per unit: ${pricePerUnit.toFixed(2)} / {detail.product.pack_unit ?? 'unit'}
+          </p>
+        ) : (
+          <p className="text-caption text-neutral-400">
+            Set pack size to see per-unit price
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
 
 function PriceTrendSection({ detail }: { detail: ProductDetail }) {
   const { pct, direction } = pctChange(detail.price_history)
@@ -643,6 +743,7 @@ function ProductDetailPage() {
           </Button>
         </div>
         <div className="flex items-center gap-3 mt-2">
+          {product.brand && <Badge variant="neutral">{product.brand}</Badge>}
           {product.category && <Badge variant="neutral">{product.category}</Badge>}
           {product.default_unit && (
             <span className="text-caption text-neutral-400">
@@ -654,6 +755,7 @@ function ProductDetailPage() {
 
       {/* Content sections */}
       <div className="space-y-5">
+        <ProductInfoSection detail={detail} productId={productId} />
         <PriceTrendSection detail={detail} />
         <PhotosSection detail={detail} productId={productId} />
         <AliasesSection detail={detail} productId={productId} stores={stores} />

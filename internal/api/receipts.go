@@ -347,6 +347,9 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 				st := "new_product"
 				li.SuggestionType = &st
 			}
+		} else if li.Matched == "cross_store_match" && li.SuggestedProductID != nil {
+			st := "cross_store_match"
+			li.SuggestionType = &st
 		}
 		resp.LineItems = append(resp.LineItems, li)
 	}
@@ -525,19 +528,21 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 	for _, itemID := range req.LineItemIDs {
 		// Fetch line item with suggestion data.
 		var rawName string
-		var suggestedName, suggestedCategory, suggestedProductID *string
+		var suggestedName, suggestedCategory, suggestedProductID, suggestedBrand *string
 		var quantity decimal.Decimal
 		var unit *string
 		var totalPrice decimal.Decimal
 		var regularPrice, discountAmount sql.NullString
 		err := tx.QueryRow(
 			`SELECT li.raw_name, li.suggested_name, li.suggested_category, li.suggested_product_id,
-			        li.quantity, li.unit, li.total_price, li.regular_price, li.discount_amount
+			        li.quantity, li.unit, li.total_price, li.regular_price, li.discount_amount,
+			        li.suggested_brand
 			 FROM line_items li
 			 WHERE li.id = ? AND li.receipt_id = ?`,
 			itemID, receiptID,
 		).Scan(&rawName, &suggestedName, &suggestedCategory, &suggestedProductID,
-			&quantity, &unit, &totalPrice, &regularPrice, &discountAmount)
+			&quantity, &unit, &totalPrice, &regularPrice, &discountAmount,
+			&suggestedBrand)
 		if err == sql.ErrNoRows {
 			continue // skip invalid IDs
 		}
@@ -593,10 +598,16 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 					if category != "" {
 						catPtr = &category
 					}
+					// Normalize brand from suggested_brand if available.
+					var brandPtr *string
+					if suggestedBrand != nil && *suggestedBrand != "" {
+						normalized := matcher.NormalizeBrand(*suggestedBrand)
+						brandPtr = &normalized
+					}
 					_, err = tx.Exec(
-						`INSERT INTO products (id, household_id, name, category, purchase_count, created_at, updated_at)
-						 VALUES (?, ?, ?, ?, 0, ?, ?)`,
-						productID, householdID, name, catPtr, now, now,
+						`INSERT INTO products (id, household_id, name, category, brand, purchase_count, created_at, updated_at)
+						 VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
+						productID, householdID, name, catPtr, brandPtr, now, now,
 					)
 					if err != nil {
 						return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create product"})

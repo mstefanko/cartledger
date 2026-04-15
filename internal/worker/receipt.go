@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,9 @@ import (
 	"github.com/mstefanko/cartledger/internal/units"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
+
+// packPattern detects multi-pack indicators like "12PK", "24 CT", "6 COUNT", "8 PACK".
+var packPattern = regexp.MustCompile(`(?i)\d+\s*(PK|CT|COUNT|PACK)\b`)
 
 // ReceiptJob represents a receipt processing job submitted to the worker pool.
 type ReceiptJob struct {
@@ -258,9 +262,45 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		return fmt.Errorf("update receipt: %w", err)
 	}
 
-	// 5. Process each extracted item.
+	// 5. "Each" overload detection: identify items that look like multi-packs sold as quantity=1.
+	// Build a map of flagged item indices and their confidence caps.
+	// Applied AFTER matching (step 6) so the matcher doesn't overwrite the cap.
+	noFlagCategories := map[string]bool{
+		"meat": true, "produce": true, "dairy": true, "bakery": true,
+	}
+	priceFlagCategories := map[string]bool{
+		"beverages": true, "snacks": true, "household": true,
+	}
+	packOverloadCaps := make(map[int]float64) // index → max confidence
+
+	for i := range extraction.Items {
+		item := &extraction.Items[i]
+		cat := strings.ToLower(item.SuggestedCategory)
+
+		// Rule 1: Raw name matches multi-pack pattern AND quantity=1.
+		if packPattern.MatchString(item.RawName) && item.Quantity == 1 {
+			packOverloadCaps[i] = 0.6
+			log.Printf("worker: flagged pack overload (pattern) for %q", item.RawName)
+		}
+
+		// Rule 2: unit="each" AND quantity=1 AND total_price > 8.0 AND category in flaggable set.
+		if !noFlagCategories[cat] && priceFlagCategories[cat] {
+			unitStr := "each"
+			if item.Unit != nil {
+				unitStr = *item.Unit
+			}
+			if strings.EqualFold(unitStr, "each") && item.Quantity == 1 && item.TotalPrice > 8.0 {
+				if _, already := packOverloadCaps[i]; !already {
+					packOverloadCaps[i] = 0.7
+				}
+				log.Printf("worker: flagged pack overload (price) for %q ($%.2f)", item.RawName, item.TotalPrice)
+			}
+		}
+	}
+
+	// 6. Process each extracted item.
 	hasUnmatched := false
-	for _, item := range extraction.Items {
+	for i, item := range extraction.Items {
 		lineItemID := uuid.New().String()
 		quantity := decimal.NewFromFloat(item.Quantity)
 		if quantity.IsZero() {
@@ -288,14 +328,14 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		matchResult := w.matchEngine.MatchWithSuggestion(item.RawName, item.SuggestedName, storeID, job.HouseholdID)
 
 		matched := matchResult.Method
-		if matched == "unmatched" || matched == "suggested" {
+		if matched == "unmatched" || matched == "suggested" || matched == "cross_store_match" {
 			hasUnmatched = true
 		}
 
 		var productID *string
 		var confidence *float64
 		var suggestedProductID *string
-		if matchResult.Method == "suggested" {
+		if matchResult.Method == "suggested" || matchResult.Method == "cross_store_match" {
 			// Suggestion only — don't finalize, store as suggested_product_id.
 			suggestedProductID = &matchResult.ProductID
 			confidence = &matchResult.Confidence
@@ -305,23 +345,32 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			confidence = &matchResult.Confidence
 		}
 
+		// Apply "each" overload confidence cap AFTER matching (so matcher doesn't overwrite it).
+		if cap, flagged := packOverloadCaps[i]; flagged && confidence != nil && *confidence > cap {
+			capped := cap
+			confidence = &capped
+		}
+
 		lineNum := item.LineNumber
 
-		var suggestedName, suggestedCategory *string
+		var suggestedName, suggestedCategory, suggestedBrand *string
 		if item.SuggestedName != "" {
 			suggestedName = &item.SuggestedName
 		}
 		if item.SuggestedCategory != "" {
 			suggestedCategory = &item.SuggestedCategory
 		}
+		if item.SuggestedBrand != "" {
+			suggestedBrand = &item.SuggestedBrand
+		}
 
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, suggested_name, suggested_category, suggested_product_id, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
 			regularPrice, discountAmount,
-			suggestedName, suggestedCategory, suggestedProductID,
+			suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
 			matched, confidence, lineNum, now,
 		)
 		if err != nil {
@@ -391,7 +440,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		}
 	}
 
-	// 6. Update receipt status.
+	// 7. Update receipt status.
 	// "matched" = all items matched to products, "review" = some items need user attention.
 	// Never set back to "pending" — that means LLM hasn't processed yet.
 	finalStatus := "matched"
@@ -407,7 +456,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	// 7. Broadcast completion.
+	// 8. Broadcast completion.
 	w.hub.Broadcast(ws.Message{
 		Type:      ws.EventReceiptComplete,
 		Household: job.HouseholdID,

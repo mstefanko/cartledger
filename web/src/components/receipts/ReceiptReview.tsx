@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
 import { EditableTable, type AutocompleteOption } from '@/components/ui/EditableTable'
 import { Badge } from '@/components/ui/Badge'
@@ -89,6 +90,9 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   // --- Raw JSON modal ---
   const [rawJsonOpen, setRawJsonOpen] = useState(false)
 
+  // --- Cross-store confirmation modal ---
+  const [crossStoreConfirmOpen, setCrossStoreConfirmOpen] = useState(false)
+
   // --- Build product lookup map (search results + API-provided names) ---
   const productMap = useMemo(() => {
     const map = new Map<string, string>()
@@ -139,6 +143,10 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type === 'new_product').length,
     [rows],
   )
+  const crossStoreMatchCount = useMemo(
+    () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type === 'cross_store_match').length,
+    [rows],
+  )
   const unmatchedCount = useMemo(
     () => rows.filter((r) => r.matched === 'unmatched' && r.suggestion_type == null).length,
     [rows],
@@ -150,7 +158,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     if (!receipt) return map
     for (const li of receipt.line_items) {
       if (li.matched === 'unmatched' && li.suggestion_type) {
-        const name = li.suggestion_type === 'existing_match'
+        const name = (li.suggestion_type === 'existing_match' || li.suggestion_type === 'cross_store_match')
           ? li.suggested_product_name
           : li.suggested_name
         if (name) map.set(li.id, { name, type: li.suggestion_type })
@@ -269,6 +277,15 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               </span>
             )
           }
+          if (item.suggestion_type === 'cross_store_match') {
+            return (
+              <span className="flex items-center justify-center" title="Similar product found at another store">
+                <svg className="w-4 h-4 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                </svg>
+              </span>
+            )
+          }
           return (
             <span
               className="flex items-center justify-center"
@@ -295,6 +312,23 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         accessorKey: 'raw_name',
         header: 'Receipt Text',
         size: 200,
+        cell: ({ row }) => {
+          const item = row.original
+          return (
+            <div>
+              <span>{item.raw_name}</span>
+              {item.product_id && item.product_name && (
+                <Link
+                  to={`/products/${item.product_id}`}
+                  className="block text-xs text-brand hover:underline mt-0.5"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {item.product_name}
+                </Link>
+              )}
+            </div>
+          )
+        },
       },
       {
         accessorKey: 'product_id',
@@ -415,6 +449,11 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               {suggestedNewCount} new
             </span>
           )}
+          {crossStoreMatchCount > 0 && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-700">
+              {crossStoreMatchCount} cross-store
+            </span>
+          )}
           {unmatchedCount > 0 && (
             <Badge variant="error">{unmatchedCount} unmatched</Badge>
           )}
@@ -437,6 +476,11 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             variant="primary"
             size="sm"
             onClick={async () => {
+              // If cross-store matches exist, show confirmation dialog first
+              if (crossStoreMatchCount > 0 && !crossStoreConfirmOpen) {
+                setCrossStoreConfirmOpen(true)
+                return
+              }
               setConfirmLoading(true)
               try {
                 // Step 1: Accept any pending suggestions
@@ -490,6 +534,55 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             ? JSON.stringify(JSON.parse(receipt.raw_llm_json), null, 2)
             : 'No raw JSON available'}
         </pre>
+      </Modal>
+
+      {/* Cross-store match confirmation modal */}
+      <Modal
+        open={crossStoreConfirmOpen}
+        onClose={() => setCrossStoreConfirmOpen(false)}
+        title="Cross-Store Matches"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setCrossStoreConfirmOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={async () => {
+                setCrossStoreConfirmOpen(false)
+                setConfirmLoading(true)
+                try {
+                  if (suggestedRows.length > 0) {
+                    await acceptSuggestions(receiptId, { line_item_ids: suggestedRows.map(r => r.id) })
+                  }
+                  if (pendingRuleMatches.length > 0 && receipt.status !== 'reviewed') {
+                    setBatchRuleModalOpen(true)
+                    return
+                  }
+                  await confirmReceipt(receiptId)
+                  queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+                  queryClient.invalidateQueries({ queryKey: ['products'] })
+                } catch (err) {
+                  console.error('Confirm failed:', err)
+                  alert('Failed to confirm receipt. Please try again.')
+                } finally {
+                  setConfirmLoading(false)
+                }
+              }}
+            >
+              Confirm All
+            </Button>
+          </>
+        }
+      >
+        <p className="text-body text-neutral-600">
+          {crossStoreMatchCount} {crossStoreMatchCount === 1 ? 'item was' : 'items were'} matched to products from other stores — confirm these too?
+        </p>
       </Modal>
 
       {/* Batch rule creation modal — shown after Confirm All */}

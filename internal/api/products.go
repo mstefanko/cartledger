@@ -14,6 +14,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/matcher"
 )
 
 // ProductHandler holds dependencies for product-related endpoints.
@@ -25,17 +26,23 @@ type ProductHandler struct {
 // --- Request types ---
 
 type createProductRequest struct {
-	Name        string  `json:"name"`
-	Category    *string `json:"category,omitempty"`
-	DefaultUnit *string `json:"default_unit,omitempty"`
-	Notes       *string `json:"notes,omitempty"`
+	Name         string   `json:"name"`
+	Category     *string  `json:"category,omitempty"`
+	DefaultUnit  *string  `json:"default_unit,omitempty"`
+	Notes        *string  `json:"notes,omitempty"`
+	Brand        *string  `json:"brand,omitempty"`
+	PackQuantity *float64 `json:"pack_quantity,omitempty"`
+	PackUnit     *string  `json:"pack_unit,omitempty"`
 }
 
 type updateProductRequest struct {
-	Name        string  `json:"name"`
-	Category    *string `json:"category,omitempty"`
-	DefaultUnit *string `json:"default_unit,omitempty"`
-	Notes       *string `json:"notes,omitempty"`
+	Name         string   `json:"name"`
+	Category     *string  `json:"category,omitempty"`
+	DefaultUnit  *string  `json:"default_unit,omitempty"`
+	Notes        *string  `json:"notes,omitempty"`
+	Brand        *string  `json:"brand,omitempty"`
+	PackQuantity *float64 `json:"pack_quantity,omitempty"`
+	PackUnit     *string  `json:"pack_unit,omitempty"`
 }
 
 // --- Response types ---
@@ -47,6 +54,9 @@ type productResponse struct {
 	Category        *string    `json:"category,omitempty"`
 	DefaultUnit     *string    `json:"default_unit,omitempty"`
 	Notes           *string    `json:"notes,omitempty"`
+	Brand           *string    `json:"brand,omitempty"`
+	PackQuantity    *float64   `json:"pack_quantity,omitempty"`
+	PackUnit        *string    `json:"pack_unit,omitempty"`
 	LastPurchasedAt *time.Time `json:"last_purchased_at,omitempty"`
 	PurchaseCount   int        `json:"purchase_count"`
 	AliasCount      int        `json:"alias_count"`
@@ -80,12 +90,14 @@ func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
 	var p productResponse
 	err := h.DB.QueryRow(
 		`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+		        p.brand, p.pack_quantity, p.pack_unit,
 		        p.last_purchased_at, p.purchase_count,
 		        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 		        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
 		        p.created_at, p.updated_at
 		 FROM products p WHERE p.id = ?`, id,
 	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
+		&p.Brand, &p.PackQuantity, &p.PackUnit,
 		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
 	return p, err
 }
@@ -109,6 +121,7 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 func (h *ProductHandler) List(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	q := strings.TrimSpace(c.QueryParam("q"))
+	brandFilter := strings.TrimSpace(c.QueryParam("brand"))
 
 	var rows *sql.Rows
 	var err error
@@ -118,22 +131,50 @@ func (h *ProductHandler) List(c echo.Context) error {
 		// escaping any embedded double quotes. This prevents FTS5 operator injection.
 		sanitizedQ := `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
 
-		// FTS5 search — scope to household via JOIN.
+		if brandFilter != "" {
+			rows, err = h.DB.Query(
+				`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+				        p.brand, p.pack_quantity, p.pack_unit,
+				        p.last_purchased_at, p.purchase_count,
+				        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
+				        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
+				        p.created_at, p.updated_at
+				 FROM products p
+				 JOIN products_fts f ON p.rowid = f.rowid
+				 WHERE products_fts MATCH ? AND p.household_id = ? AND LOWER(p.brand) = LOWER(?)
+				 ORDER BY rank`,
+				sanitizedQ, householdID, brandFilter,
+			)
+		} else {
+			rows, err = h.DB.Query(
+				`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+				        p.brand, p.pack_quantity, p.pack_unit,
+				        p.last_purchased_at, p.purchase_count,
+				        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
+				        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
+				        p.created_at, p.updated_at
+				 FROM products p
+				 JOIN products_fts f ON p.rowid = f.rowid
+				 WHERE products_fts MATCH ? AND p.household_id = ?
+				 ORDER BY rank`,
+				sanitizedQ, householdID,
+			)
+		}
+	} else if brandFilter != "" {
 		rows, err = h.DB.Query(
 			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+			        p.brand, p.pack_quantity, p.pack_unit,
 			        p.last_purchased_at, p.purchase_count,
 			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
 			        p.created_at, p.updated_at
-			 FROM products p
-			 JOIN products_fts f ON p.rowid = f.rowid
-			 WHERE products_fts MATCH ? AND p.household_id = ?
-			 ORDER BY rank`,
-			sanitizedQ, householdID,
+			 FROM products p WHERE p.household_id = ? AND LOWER(p.brand) = LOWER(?) ORDER BY p.name`,
+			householdID, brandFilter,
 		)
 	} else {
 		rows, err = h.DB.Query(
 			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+			        p.brand, p.pack_quantity, p.pack_unit,
 			        p.last_purchased_at, p.purchase_count,
 			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
@@ -151,6 +192,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 	for rows.Next() {
 		var p productResponse
 		if err := rows.Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
+			&p.Brand, &p.PackQuantity, &p.PackUnit,
 			&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
@@ -177,13 +219,19 @@ func (h *ProductHandler) Create(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
+	// Normalize brand if provided.
+	if req.Brand != nil {
+		normalized := matcher.NormalizeBrand(*req.Brand)
+		req.Brand = &normalized
+	}
+
 	now := time.Now().UTC()
 	var id string
 	err := h.DB.QueryRow(
-		`INSERT INTO products (id, household_id, name, category, default_unit, notes, created_at, updated_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO products (id, household_id, name, category, default_unit, notes, brand, pack_quantity, pack_unit, created_at, updated_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
-		householdID, req.Name, req.Category, req.DefaultUnit, req.Notes, now, now,
+		householdID, req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, now, now,
 	).Scan(&id)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -215,11 +263,17 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
+	// Normalize brand if provided.
+	if req.Brand != nil {
+		normalized := matcher.NormalizeBrand(*req.Brand)
+		req.Brand = &normalized
+	}
+
 	now := time.Now().UTC()
 	result, err := h.DB.Exec(
-		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, updated_at = ?
+		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, brand = ?, pack_quantity = ?, pack_unit = ?, updated_at = ?
 		 WHERE id = ? AND household_id = ?`,
-		req.Name, req.Category, req.DefaultUnit, req.Notes, now, productID, householdID,
+		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, now, productID, householdID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -681,7 +735,8 @@ type productAliasResponse struct {
 }
 
 type productDetailResponse struct {
-	Product      productResponse       `json:"product"`
+	Product      productResponse        `json:"product"`
+	PricePerUnit *string                `json:"price_per_unit,omitempty"`
 	Aliases      []productAliasResponse `json:"aliases"`
 	Images       []productImageResponse `json:"images"`
 	Links        []productLinkResponse  `json:"links"`
@@ -723,6 +778,16 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 		Links:        make([]productLinkResponse, 0),
 		PriceHistory: make([]priceHistoryEntry, 0),
 		StoreCompare: make([]storeComparison, 0),
+	}
+
+	// Compute price_per_unit when pack_quantity is available.
+	if p.PackQuantity != nil && *p.PackQuantity > 0 && p.LastPrice != nil {
+		var lastPriceFloat float64
+		if _, err := fmt.Sscanf(*p.LastPrice, "%f", &lastPriceFloat); err == nil {
+			ppu := lastPriceFloat / *p.PackQuantity
+			ppuStr := fmt.Sprintf("%.2f", ppu)
+			resp.PricePerUnit = &ppuStr
+		}
 	}
 
 	// Fetch aliases.

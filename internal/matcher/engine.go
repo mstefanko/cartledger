@@ -70,13 +70,24 @@ func (e *Engine) MatchWithSuggestion(rawName, suggestedName, storeID, householdI
 
 	// Stage 4: Exact match suggested_name against product names.
 	if r := matchNameExact(e.db, suggestedName, householdID); r != nil {
+		// Check store history: reduce confidence for cross-store matches.
+		if hist := productHasStoreHistory(e.db, r.ProductID, storeID); hist == storeHistoryOtherStore {
+			r.Confidence = 0.7
+			r.Method = "cross_store_match"
+		}
 		return *r
 	}
 
 	// Stage 5: Fuzzy match suggested_name against product names + aliases.
 	normalizedSuggestion := Normalize(suggestedName)
 	if r := matchByFuzzy(e.db, normalizedSuggestion, storeID, householdID); r != nil {
-		r.Method = "suggested"
+		// Check store history: reduce confidence for cross-store matches.
+		if hist := productHasStoreHistory(e.db, r.ProductID, storeID); hist == storeHistoryOtherStore {
+			r.Confidence = 0.6
+			r.Method = "cross_store_match"
+		} else {
+			r.Method = "suggested"
+		}
 		return *r
 	}
 

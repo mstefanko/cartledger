@@ -19,6 +19,8 @@ function ProductsPage() {
   const queryClient = useQueryClient()
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [brandFilter, setBrandFilter] = useState('')
+  const [missingFilter, setMissingFilter] = useState<'' | 'missing_brand' | 'missing_pack'>('')
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
@@ -46,7 +48,7 @@ function ProductsPage() {
   })
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: { name?: string; category?: string; default_unit?: string } }) =>
+    mutationFn: ({ id, data }: { id: string; data: { name?: string; category?: string; default_unit?: string; brand?: string } }) =>
       updateProduct(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['products'] })
@@ -70,13 +72,30 @@ function ProductsPage() {
     return map
   }, [productsWithTrends])
 
+  // Distinct brands for filter dropdown
+  const distinctBrands = useMemo(() => {
+    if (!products || !Array.isArray(products)) return []
+    const brands = new Set<string>()
+    for (const p of products) {
+      if (p.brand) brands.add(p.brand)
+    }
+    return Array.from(brands).sort()
+  }, [products])
+
   const rows: ProductRow[] = useMemo(() => {
     if (!products || !Array.isArray(products)) return []
-    return products.map((p) => ({
-      ...p,
-      trend: trendMap.get(p.id) ?? null,
-    }))
-  }, [products, trendMap])
+    return products
+      .filter((p) => {
+        if (brandFilter && p.brand !== brandFilter) return false
+        if (missingFilter === 'missing_brand' && p.brand) return false
+        if (missingFilter === 'missing_pack' && p.pack_quantity != null) return false
+        return true
+      })
+      .map((p) => ({
+        ...p,
+        trend: trendMap.get(p.id) ?? null,
+      }))
+  }, [products, trendMap, brandFilter, missingFilter])
 
   const handleCellUpdate = useCallback(
     (rowIndex: number, columnId: string, value: string) => {
@@ -87,6 +106,7 @@ function ProductsPage() {
         name: 'name',
         category: 'category',
         default_unit: 'default_unit',
+        brand: 'brand',
       }
 
       const field = fieldMap[columnId]
@@ -126,6 +146,16 @@ function ProductsPage() {
               {name}
             </Link>
           )
+        },
+      },
+      {
+        accessorKey: 'brand',
+        header: 'Brand',
+        size: 130,
+        meta: { editable: true, cellType: 'text' as const },
+        cell: ({ getValue }) => {
+          const val = getValue() as string | undefined
+          return val ?? '\u2014'
         },
       },
       {
@@ -215,7 +245,7 @@ function ProductsPage() {
       </div>
 
       <div className="mb-4">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <input
             type="text"
             value={searchTerm}
@@ -223,6 +253,25 @@ function ProductsPage() {
             placeholder="Search products and aliases..."
             className="w-full max-w-sm px-3 py-2 text-body border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
           />
+          <select
+            value={brandFilter}
+            onChange={(e) => setBrandFilter(e.target.value)}
+            className="px-3 py-2 text-body border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand"
+          >
+            <option value="">All brands</option>
+            {distinctBrands.map((b) => (
+              <option key={b} value={b}>{b}</option>
+            ))}
+          </select>
+          <select
+            value={missingFilter}
+            onChange={(e) => setMissingFilter(e.target.value as '' | 'missing_brand' | 'missing_pack')}
+            className="px-3 py-2 text-body border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand"
+          >
+            <option value="">All products</option>
+            <option value="missing_brand">Missing brand</option>
+            <option value="missing_pack">Missing pack size</option>
+          </select>
           {debouncedSearch && !isLoading && (
             <span className="text-caption text-neutral-400">
               {rows.length} result{rows.length !== 1 ? 's' : ''}
