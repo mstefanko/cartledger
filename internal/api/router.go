@@ -125,6 +125,9 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	analyticsHandler := &AnalyticsHandler{DB: database, Cfg: cfg}
 	analyticsHandler.RegisterRoutes(protected)
 
+	reviewHandler := &ReviewHandler{DB: database, Cfg: cfg, Hub: hub}
+	reviewHandler.RegisterRoutes(protected)
+
 	// Serve uploaded receipt images. Accepts JWT via Authorization header
 	// or ?token= query param (needed for <img> tags which can't send headers).
 	v1.GET("/files/*", func(c echo.Context) error {
