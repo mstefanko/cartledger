@@ -136,6 +136,8 @@ type buyAgainItem struct {
 	DaysSinceLast  float64 `json:"days_since_last"`
 	UrgencyRatio   float64 `json:"urgency_ratio"`
 	Urgency        string  `json:"urgency"`
+	LastPrice      *string `json:"last_price,omitempty"`
+	LastStoreName  *string `json:"last_store_name,omitempty"`
 }
 
 // Overview returns spending summary for the household.
@@ -691,11 +693,16 @@ func (h *AnalyticsHandler) GroupTrend(c echo.Context) error {
 func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 
+	// last_price/last_store_name: join once to the latest product_prices row per
+	// product (deterministic tiebreaker: receipt_date, created_at, id — same as
+	// productListColumns in internal/api/products.go), then LEFT JOIN stores.
 	rows, err := h.DB.Query(
 		`SELECT sub.product_id, p.name,
 		        AVG(sub.days_gap) / AVG(sub.quantity) as avg_days_per_unit,
 		        sub.last_qty * (AVG(sub.days_gap) / AVG(sub.quantity)) as est_supply_days,
-		        julianday('now') - julianday(sub.last_date) as days_since_last
+		        julianday('now') - julianday(sub.last_date) as days_since_last,
+		        PRINTF('%.2f', latest.unit_price) as last_price,
+		        s.name as last_store_name
 		 FROM (
 		     SELECT pp.product_id,
 		            CAST(pp.quantity AS REAL) as quantity,
@@ -716,6 +723,13 @@ func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 		                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
 		 ) sub
 		 JOIN products p ON p.id = sub.product_id
+		 LEFT JOIN (
+		     SELECT pp2.product_id, pp2.unit_price, pp2.store_id,
+		            ROW_NUMBER() OVER (PARTITION BY pp2.product_id
+		                               ORDER BY pp2.receipt_date DESC, pp2.created_at DESC, pp2.id DESC) AS rn
+		     FROM product_prices pp2
+		 ) latest ON latest.product_id = sub.product_id AND latest.rn = 1
+		 LEFT JOIN stores s ON s.id = latest.store_id
 		 WHERE sub.days_gap IS NOT NULL
 		 GROUP BY sub.product_id
 		 HAVING COUNT(*) >= 2
@@ -732,7 +746,8 @@ func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 	for rows.Next() {
 		var item buyAgainItem
 		if err := rows.Scan(&item.ProductID, &item.ProductName,
-			&item.AvgDaysPerUnit, &item.EstSupplyDays, &item.DaysSinceLast); err != nil {
+			&item.AvgDaysPerUnit, &item.EstSupplyDays, &item.DaysSinceLast,
+			&item.LastPrice, &item.LastStoreName); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 
