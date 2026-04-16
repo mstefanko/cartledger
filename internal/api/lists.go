@@ -28,8 +28,9 @@ type createListRequest struct {
 }
 
 type updateListRequest struct {
-	Name   *string `json:"name,omitempty"`
-	Status *string `json:"status,omitempty"`
+	Name            *string `json:"name,omitempty"`
+	Status          *string `json:"status,omitempty"`
+	PreferredStoreID *string `json:"preferred_store_id"`
 }
 
 type createListItemRequest struct {
@@ -77,14 +78,16 @@ type listSummaryResponse struct {
 }
 
 type listDetailResponse struct {
-	ID          string             `json:"id"`
-	HouseholdID string            `json:"household_id"`
-	Name        string             `json:"name"`
-	CreatedBy   *string            `json:"created_by,omitempty"`
-	Status      string             `json:"status"`
-	Items       []listItemResponse `json:"items"`
-	CreatedAt   time.Time          `json:"created_at"`
-	UpdatedAt   time.Time          `json:"updated_at"`
+	ID                 string             `json:"id"`
+	HouseholdID        string             `json:"household_id"`
+	Name               string             `json:"name"`
+	CreatedBy          *string            `json:"created_by,omitempty"`
+	Status             string             `json:"status"`
+	PreferredStoreID   *string            `json:"preferred_store_id,omitempty"`
+	PreferredStoreName *string            `json:"preferred_store_name,omitempty"`
+	Items              []listItemResponse `json:"items"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
 }
 
 type listItemResponse struct {
@@ -105,6 +108,8 @@ type listItemResponse struct {
 	ProductGroupID    *string `json:"product_group_id,omitempty"`
 	ProductGroupName  *string `json:"product_group_name,omitempty"`
 	CheapestProductID *string `json:"cheapest_product_id,omitempty"`
+	StorePrice        *string `json:"store_price,omitempty"`
+	StorePriceStore   *string `json:"store_price_store,omitempty"`
 	CreatedAt         string  `json:"created_at"`
 }
 
@@ -206,11 +211,14 @@ func (h *ListHandler) Get(c echo.Context) error {
 
 	var resp listDetailResponse
 	err := h.DB.QueryRow(
-		`SELECT id, household_id, name, created_by, status, created_at, updated_at
-		 FROM shopping_lists WHERE id = ? AND household_id = ?`,
+		`SELECT sl.id, sl.household_id, sl.name, sl.created_by, sl.status,
+		        sl.created_at, sl.updated_at, sl.preferred_store_id, s.name
+		 FROM shopping_lists sl
+		 LEFT JOIN stores s ON sl.preferred_store_id = s.id
+		 WHERE sl.id = ? AND sl.household_id = ?`,
 		listID, householdID,
 	).Scan(&resp.ID, &resp.HouseholdID, &resp.Name, &resp.CreatedBy, &resp.Status,
-		&resp.CreatedAt, &resp.UpdatedAt)
+		&resp.CreatedAt, &resp.UpdatedAt, &resp.PreferredStoreID, &resp.PreferredStoreName)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
 	}
@@ -332,6 +340,39 @@ func (h *ListHandler) Get(c echo.Context) error {
 		}
 	}
 
+	// Q1b: preferred store price for items with a product_id.
+	storePriceMap := map[string]string{}
+	if resp.PreferredStoreID != nil && len(productIDs) > 0 {
+		placeholders := strings.Repeat("?,", len(productIDs))
+		placeholders = placeholders[:len(placeholders)-1]
+		q1b := fmt.Sprintf(`
+			SELECT pp.product_id, PRINTF('%%.2f', pp.unit_price)
+			FROM product_prices pp
+			WHERE pp.product_id IN (%s)
+			  AND pp.store_id = ?
+			  AND pp.receipt_date = (
+			      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+			      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+			  )`, placeholders)
+		args1b := make([]interface{}, len(productIDs)+1)
+		for i, id := range productIDs {
+			args1b[i] = id
+		}
+		args1b[len(productIDs)] = *resp.PreferredStoreID
+		rows1b, err := h.DB.QueryContext(c.Request().Context(), q1b, args1b...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch store prices")
+		}
+		defer rows1b.Close()
+		for rows1b.Next() {
+			var productID, price string
+			if err := rows1b.Scan(&productID, &price); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan store prices")
+			}
+			storePriceMap[productID] = price
+		}
+	}
+
 	// Batch query: find cheapest product+store for all items with a product_group_id.
 	type groupPriceInfo struct {
 		CheapestStore     string
@@ -382,7 +423,42 @@ func (h *ListHandler) Get(c echo.Context) error {
 		}
 	}
 
-	// Apply group price info to items.
+	// Q2b: preferred store price for items with a product_group_id.
+	groupStorePriceMap := map[string]string{}
+	if resp.PreferredStoreID != nil && len(groupIDs) > 0 {
+		placeholders := strings.Repeat("?,", len(groupIDs))
+		placeholders = placeholders[:len(placeholders)-1]
+		q2b := fmt.Sprintf(`
+			SELECT p.product_group_id, PRINTF('%%.2f', MIN(pp.unit_price))
+			FROM product_prices pp
+			JOIN products p ON p.id = pp.product_id
+			WHERE p.product_group_id IN (%s)
+			  AND pp.store_id = ?
+			  AND pp.receipt_date = (
+			      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+			      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+			  )
+			GROUP BY p.product_group_id`, placeholders)
+		args2b := make([]interface{}, len(groupIDs)+1)
+		for i, id := range groupIDs {
+			args2b[i] = id
+		}
+		args2b[len(groupIDs)] = *resp.PreferredStoreID
+		rows2b, err := h.DB.QueryContext(c.Request().Context(), q2b, args2b...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch group store prices")
+		}
+		defer rows2b.Close()
+		for rows2b.Next() {
+			var groupID, price string
+			if err := rows2b.Scan(&groupID, &price); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan group store prices")
+			}
+			groupStorePriceMap[groupID] = price
+		}
+	}
+
+	// Apply group price info to items, then store price info.
 	for i, item := range resp.Items {
 		if item.ProductGroupID != nil {
 			if info, ok := groupPriceMap[*item.ProductGroupID]; ok {
@@ -390,6 +466,18 @@ func (h *ListHandler) Get(c echo.Context) error {
 				resp.Items[i].CheapestPrice = &info.CheapestPrice
 				resp.Items[i].CheapestProductID = &info.CheapestProductID
 				resp.Items[i].EstimatedPrice = &info.CheapestPrice
+			}
+			if price, ok := groupStorePriceMap[*item.ProductGroupID]; ok {
+				p := price
+				resp.Items[i].StorePrice = &p
+				resp.Items[i].StorePriceStore = resp.PreferredStoreName
+			}
+		}
+		if item.ProductID != nil {
+			if price, ok := storePriceMap[*item.ProductID]; ok {
+				p := price
+				resp.Items[i].StorePrice = &p
+				resp.Items[i].StorePriceStore = resp.PreferredStoreName
 			}
 		}
 	}
@@ -426,6 +514,14 @@ func (h *ListHandler) Update(c echo.Context) error {
 		}
 		setClauses = append(setClauses, "status = ?")
 		args = append(args, status)
+	}
+	if req.PreferredStoreID != nil {
+		if *req.PreferredStoreID == "" {
+			setClauses = append(setClauses, "preferred_store_id = NULL")
+		} else {
+			setClauses = append(setClauses, "preferred_store_id = ?")
+			args = append(args, *req.PreferredStoreID)
+		}
 	}
 
 	if len(setClauses) == 0 {

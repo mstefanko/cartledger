@@ -4,11 +4,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getList, updateList, updateItem, addItem, deleteItem } from '@/api/lists'
 import { listProducts } from '@/api/products'
 import { fetchGroups, createGroup } from '@/api/groups'
+import { listStores } from '@/api/stores'
 import { useAuth } from '@/hooks/useAuth'
 import { useListWebSocket } from '@/hooks/useWebSocket'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { ShareListModal } from '@/components/lists/ShareListModal'
+import { StorePicker } from '@/components/lists/StorePicker'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -58,6 +60,12 @@ function ShoppingListPage() {
     enabled: !!listId,
   })
 
+  // Fetch stores for store picker
+  const storesQuery = useQuery({
+    queryKey: ['stores'],
+    queryFn: listStores,
+  })
+
   // Product search for autocomplete
   const productsQuery = useQuery({
     queryKey: ['products', { search: searchQuery }],
@@ -92,12 +100,11 @@ function ShoppingListPage() {
     return { uncheckedItems: unchecked, checkedItems: checked }
   }, [list])
 
-  // Estimated total for unchecked items
+  // Estimated total for unchecked items — prefers store_price when a preferred store is set
   const estimatedTotal = useMemo(() => {
     return uncheckedItems.reduce((sum, item) => {
-      if (item.estimated_price) {
-        return sum + parseFloat(item.estimated_price)
-      }
+      const price = item.store_price ?? item.estimated_price
+      if (price) return sum + parseFloat(price)
       return sum
     }, 0)
   }, [uncheckedItems])
@@ -109,6 +116,15 @@ function ShoppingListPage() {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
       void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
       setEditingName(false)
+    },
+  })
+
+  // Update preferred store mutation
+  const updateStoreMutation = useMutation({
+    mutationFn: (storeId: string | null) =>
+      updateList(listId!, { preferred_store_id: storeId ?? '' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
     },
   })
 
@@ -366,6 +382,12 @@ function ShoppingListPage() {
           )}
           <div className="flex items-center gap-2 mt-1">
             <Badge variant={statusVariant}>{list.status}</Badge>
+            <StorePicker
+              preferredStoreId={list.preferred_store_id}
+              stores={storesQuery.data ?? []}
+              onChange={(storeId) => updateStoreMutation.mutate(storeId)}
+              disabled={updateStoreMutation.isPending}
+            />
             {estimatedTotal > 0 && (
               <span className="text-caption font-medium text-brand">
                 Est. ${estimatedTotal.toFixed(2)}
@@ -645,12 +667,29 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
               <span className="text-small text-neutral-400 shrink-0">{qtyUnit}</span>
             )}
           </div>
-          {/* Cheapest store indicator */}
-          {item.cheapest_store && item.cheapest_price && !item.checked && (
-            <p className="text-small text-success-dark mt-0.5">
-              Best at {item.cheapest_store} ${item.cheapest_price}
-              {item.unit ? `/${item.unit}` : ''}
-            </p>
+          {/* Store price indicator */}
+          {!item.checked && (
+            <>
+              {item.store_price && item.store_price_store ? (
+                <>
+                  <p className="text-small text-success-dark mt-0.5">
+                    At {item.store_price_store}{item.unit ? `/${item.unit}` : ''} ${item.store_price}
+                  </p>
+                  {item.cheapest_price && item.cheapest_store &&
+                   item.store_price !== item.cheapest_price && (
+                    <p className="text-small text-neutral-400 mt-0.5">
+                      Best at {item.cheapest_store} ${item.cheapest_price}
+                    </p>
+                  )}
+                </>
+              ) : (
+                item.cheapest_store && item.cheapest_price && (
+                  <p className="text-small text-success-dark mt-0.5">
+                    Best at {item.cheapest_store}{item.unit ? `/${item.unit}` : ''} ${item.cheapest_price}
+                  </p>
+                )
+              )}
+            </>
           )}
         </div>
 

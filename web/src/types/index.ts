@@ -161,6 +161,7 @@ export interface ShoppingList {
   name: string
   created_by: string | null
   status: 'active' | 'completed' | 'archived'
+  preferred_store_id: string | null
   created_at: string
   updated_at: string
 }
@@ -464,6 +465,8 @@ export interface ListItemWithPrice {
   estimated_price: string | null
   cheapest_store: string | null
   cheapest_price: string | null
+  store_price: string | null
+  store_price_store: string | null
   created_at: string
   product_group_id: string | null
   product_group_name: string | null
@@ -476,6 +479,8 @@ export interface ShoppingListDetail {
   name: string
   created_by: string | null
   status: 'active' | 'completed' | 'archived'
+  preferred_store_id: string | null
+  preferred_store_name: string | null
   items: ListItemWithPrice[]
   created_at: string
   updated_at: string
@@ -488,6 +493,7 @@ export interface CreateListRequest {
 export interface UpdateListRequest {
   name?: string
   status?: 'active' | 'completed' | 'archived'
+  preferred_store_id?: string | null
 }
 
 export interface CreateListItemRequest {
