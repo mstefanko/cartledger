@@ -210,15 +210,15 @@ export interface ProductLink {
 // --- Product Group Types ---
 
 export interface GroupMember {
-  product_id: string
-  product_name: string
+  id: string
+  name: string
   brand?: string
   store_name?: string
   pack_quantity?: number
   pack_unit?: string
   latest_price?: string
   price_per_unit?: string
-  last_purchased?: string
+  receipt_date?: string
 }
 
 export interface ProductGroup {

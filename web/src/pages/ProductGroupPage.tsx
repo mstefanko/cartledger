@@ -24,8 +24,8 @@ function MemberRow({ member, isBestDeal, onRemove, removing }: {
   return (
     <tr className={`border-b border-neutral-200 last:border-0 ${isBestDeal ? 'bg-success-subtle/30' : ''}`}>
       <td className="py-2.5 text-body-medium text-neutral-900">
-        <Link to={`/products/${member.product_id}`} className="text-brand hover:underline">
-          {member.product_name}
+        <Link to={`/products/${member.id}`} className="text-brand hover:underline">
+          {member.name}
         </Link>
       </td>
       <td className="py-2.5 text-caption text-neutral-600">{member.brand ?? '\u2014'}</td>
@@ -41,7 +41,7 @@ function MemberRow({ member, isBestDeal, onRemove, removing }: {
         {isBestDeal && <Badge variant="success" className="ml-2">Best</Badge>}
       </td>
       <td className="py-2.5 text-right text-caption text-neutral-400">
-        {member.last_purchased ?? '\u2014'}
+        {member.receipt_date ?? '\u2014'}
       </td>
       <td className="py-2.5 text-right">
         <Button size="sm" variant="subtle" onClick={onRemove} disabled={removing}>
@@ -216,7 +216,7 @@ function ProductGroupPage() {
   }
 
   const members = group.members ?? []
-  const existingMemberIds = new Set(members.map((m) => m.product_id))
+  const existingMemberIds = new Set(members.map((m) => m.id))
 
   // Find best deal (lowest price_per_unit)
   let bestDealId: string | null = null
@@ -226,7 +226,7 @@ function ProductGroupPage() {
       const ppu = parseFloat(m.price_per_unit)
       if (!isNaN(ppu) && ppu < lowestPPU) {
         lowestPPU = ppu
-        bestDealId = m.product_id
+        bestDealId = m.id
       }
     }
   }
@@ -339,10 +339,10 @@ function ProductGroupPage() {
               <tbody>
                 {members.map((member) => (
                   <MemberRow
-                    key={member.product_id}
+                    key={member.id}
                     member={member}
-                    isBestDeal={member.product_id === bestDealId}
-                    onRemove={() => removeMemberMutation.mutate(member.product_id)}
+                    isBestDeal={member.id === bestDealId}
+                    onRemove={() => removeMemberMutation.mutate(member.id)}
                     removing={removeMemberMutation.isPending}
                   />
                 ))}
