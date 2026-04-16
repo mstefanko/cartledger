@@ -12,6 +12,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/search"
 )
 
 // GroupHandler holds dependencies for product-group endpoints.
@@ -127,38 +128,85 @@ func (h *GroupHandler) Create(c echo.Context) error {
 	})
 }
 
+// groupListSelect is the projection shared by every List branch.
+// Held as a const because the alias/subquery spelling is fiddly and we do not
+// want a divergence between the q-set and q-empty SQL.
+const groupListSelect = `SELECT g.id, g.household_id, g.name, g.comparison_unit,
+	        (SELECT COUNT(*) FROM products p WHERE p.product_group_id = g.id) as member_count,
+	        (SELECT PRINTF('%.2f', MIN(CAST(pp.unit_price AS REAL)))
+	         FROM products p2
+	         JOIN (
+	             SELECT product_id, unit_price,
+	                    ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY receipt_date DESC) rn
+	             FROM product_prices
+	         ) pp ON pp.product_id = p2.id AND pp.rn = 1
+	         WHERE p2.product_group_id = g.id
+	        ) as best_price,
+	        g.created_at, g.updated_at
+	 FROM product_groups g`
+
 // List returns all product groups for the household with member count and best price.
+// Supports fuzzy search via internal/search.GroupIDs (in-memory rank, no FTS).
 // GET /api/v1/product-groups
 func (h *GroupHandler) List(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	q := strings.TrimSpace(c.QueryParam("q"))
+	ctx := c.Request().Context()
 
-	whereClause := "WHERE g.household_id = ?"
-	queryArgs := []interface{}{householdID}
-	limitClause := ""
+	// --- Search branch: delegate ranking, hydrate by ID, re-order by rank.
 	if q != "" {
-		whereClause += " AND LOWER(g.name) LIKE LOWER(?)"
-		queryArgs = append(queryArgs, "%"+q+"%")
-		limitClause = " LIMIT 50"
+		ids, err := search.GroupIDs(ctx, h.DB, householdID, q, 50)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if len(ids) == 0 {
+			return c.JSON(http.StatusOK, make([]groupListItem, 0))
+		}
+
+		placeholders := make([]string, len(ids))
+		args := make([]interface{}, 0, len(ids)+1)
+		args = append(args, householdID)
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query := groupListSelect + ` WHERE g.household_id = ? AND g.id IN (` + strings.Join(placeholders, ",") + `)`
+
+		rows, err := h.DB.QueryContext(ctx, query, args...)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		defer rows.Close()
+
+		byID := make(map[string]groupListItem, len(ids))
+		for rows.Next() {
+			var g groupListItem
+			var createdAt, updatedAt time.Time
+			if err := rows.Scan(&g.ID, &g.HouseholdID, &g.Name, &g.ComparisonUnit,
+				&g.MemberCount, &g.BestPrice, &createdAt, &updatedAt); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+			}
+			g.CreatedAt = createdAt.Format(time.RFC3339)
+			g.UpdatedAt = updatedAt.Format(time.RFC3339)
+			byID[g.ID] = g
+		}
+		if err := rows.Err(); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+
+		groups := make([]groupListItem, 0, len(ids))
+		for _, id := range ids {
+			if g, ok := byID[id]; ok {
+				groups = append(groups, g)
+			}
+		}
+		return c.JSON(http.StatusOK, groups)
 	}
 
-	rows, err := h.DB.Query(
-		fmt.Sprintf(`SELECT g.id, g.household_id, g.name, g.comparison_unit,
-		        (SELECT COUNT(*) FROM products p WHERE p.product_group_id = g.id) as member_count,
-		        (SELECT PRINTF('%%.2f', MIN(CAST(pp.unit_price AS REAL)))
-		         FROM products p2
-		         JOIN (
-		             SELECT product_id, unit_price,
-		                    ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY receipt_date DESC) rn
-		             FROM product_prices
-		         ) pp ON pp.product_id = p2.id AND pp.rn = 1
-		         WHERE p2.product_group_id = g.id
-		        ) as best_price,
-		        g.created_at, g.updated_at
-		 FROM product_groups g
-		 %s
-		 ORDER BY g.name%s`, whereClause, limitClause),
-		queryArgs...,
+	// --- Non-search branch: original ORDER BY name behaviour.
+	rows, err := h.DB.QueryContext(ctx,
+		groupListSelect+` WHERE g.household_id = ? ORDER BY g.name`,
+		householdID,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

@@ -15,6 +15,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/search"
 )
 
 // ProductHandler holds dependencies for product-related endpoints.
@@ -107,7 +108,8 @@ func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
 // RegisterRoutes mounts product endpoints onto the protected group.
 func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products := protected.Group("/products")
-	products.POST("/merge", h.Merge) // Must be before /:id to avoid "merge" matching as an ID.
+	products.POST("/merge", h.Merge)           // Must be before /:id to avoid "merge" matching as an ID.
+	products.POST("/bulk-group", h.BulkGroup) // Must be before /:id.
 	products.GET("", h.List)
 	products.POST("", h.Create)
 	products.PUT("/:id", h.Update)
@@ -116,72 +118,124 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products.DELETE("/:id/images/:imageId", h.DeleteImage)
 	products.GET("/:id/links", h.ListLinks)
 	products.GET("/:id/detail", h.Detail)
+	products.GET("/:id/usage", h.GetProductUsage)
 }
 
-// List returns products for the household. If query param `q` is provided, uses FTS5 search.
+// productListColumns is the projection shared by every List branch.
+// Kept as a const so query variants stay byte-identical and reviewers can
+// diff the WHERE/ORDER BY clauses without re-reading a 14-column tuple.
+const productListColumns = `p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
+	        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
+	        p.last_purchased_at, p.purchase_count,
+	        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
+	        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
+	        p.created_at, p.updated_at`
+
+// scanProductRow reads one row into a productResponse using the
+// productListColumns projection. Extracted so every List branch uses the
+// same Scan signature — a divergence here would be silent and awful to
+// debug.
+func scanProductRow(rows *sql.Rows, p *productResponse) error {
+	return rows.Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
+		&p.Brand, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
+		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
+}
+
+// List returns products for the household.
+//
+// Query params:
+//   - q: fuzzy search term (FTS5 prefix + in-memory rerank via internal/search).
+//   - brand: exact brand filter (case-insensitive).
+//   - sort=last_purchased_at: when q is empty, order by most-recently-purchased
+//     first (NULLs last), falling back to name.
+//
 // GET /api/v1/products
 func (h *ProductHandler) List(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	q := strings.TrimSpace(c.QueryParam("q"))
 	brandFilter := strings.TrimSpace(c.QueryParam("brand"))
+	sortParam := strings.TrimSpace(c.QueryParam("sort"))
+	ctx := c.Request().Context()
 
+	// --- Search branch: delegate ranking to internal/search, then hydrate.
+	if q != "" {
+		// limit=0 → no cap. The List endpoint historically returned every
+		// match and the frontend scrolls; preserve that.
+		ids, err := search.ProductIDs(ctx, h.DB, householdID, q, 0)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if len(ids) == 0 {
+			return c.JSON(http.StatusOK, make([]productResponse, 0))
+		}
+
+		// Hydrate in one IN(...) query, then re-order by rank from `ids`.
+		placeholders := make([]string, len(ids))
+		args := make([]interface{}, 0, len(ids)+2)
+		args = append(args, householdID)
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query := `SELECT ` + productListColumns + `
+		 FROM products p
+		 WHERE p.household_id = ? AND p.id IN (` + strings.Join(placeholders, ",") + `)`
+		if brandFilter != "" {
+			query += ` AND LOWER(p.brand) = LOWER(?)`
+			args = append(args, brandFilter)
+		}
+
+		rows, err := h.DB.QueryContext(ctx, query, args...)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		defer rows.Close()
+
+		// Bucket by id so we can emit in the rank order returned by search.ProductIDs.
+		byID := make(map[string]productResponse, len(ids))
+		for rows.Next() {
+			var p productResponse
+			if err := scanProductRow(rows, &p); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+			}
+			byID[p.ID] = p
+		}
+		if err := rows.Err(); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+
+		products := make([]productResponse, 0, len(ids))
+		for _, id := range ids {
+			if p, ok := byID[id]; ok {
+				products = append(products, p)
+			}
+		}
+		return c.JSON(http.StatusOK, products)
+	}
+
+	// --- Non-search branches.
 	var rows *sql.Rows
 	var err error
 
-	if q != "" {
-		// Sanitize search input: wrap in double quotes to treat as literal phrase,
-		// escaping any embedded double quotes. This prevents FTS5 operator injection.
-		sanitizedQ := `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
+	// Pick ORDER BY based on sort param. Only `last_purchased_at` is recognised;
+	// anything else (including unset) falls back to name.
+	orderBy := "p.name"
+	if sortParam == "last_purchased_at" {
+		// SQLite treats NULL as smaller than any value; `DESC NULLS LAST` puts
+		// never-purchased products at the bottom.
+		orderBy = "p.last_purchased_at DESC NULLS LAST, p.name"
+	}
 
-		if brandFilter != "" {
-			rows, err = h.DB.Query(
-				`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-				        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
-				        p.last_purchased_at, p.purchase_count,
-				        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
-				        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
-				        p.created_at, p.updated_at
-				 FROM products p
-				 JOIN products_fts f ON p.rowid = f.rowid
-				 WHERE products_fts MATCH ? AND p.household_id = ? AND LOWER(p.brand) = LOWER(?)
-				 ORDER BY rank`,
-				sanitizedQ, householdID, brandFilter,
-			)
-		} else {
-			rows, err = h.DB.Query(
-				`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-				        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
-				        p.last_purchased_at, p.purchase_count,
-				        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
-				        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
-				        p.created_at, p.updated_at
-				 FROM products p
-				 JOIN products_fts f ON p.rowid = f.rowid
-				 WHERE products_fts MATCH ? AND p.household_id = ?
-				 ORDER BY rank`,
-				sanitizedQ, householdID,
-			)
-		}
-	} else if brandFilter != "" {
-		rows, err = h.DB.Query(
-			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-			        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
-			        p.last_purchased_at, p.purchase_count,
-			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
-			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
-			        p.created_at, p.updated_at
-			 FROM products p WHERE p.household_id = ? AND LOWER(p.brand) = LOWER(?) ORDER BY p.name`,
+	if brandFilter != "" {
+		rows, err = h.DB.QueryContext(ctx,
+			`SELECT `+productListColumns+`
+			 FROM products p WHERE p.household_id = ? AND LOWER(p.brand) = LOWER(?) ORDER BY `+orderBy,
 			householdID, brandFilter,
 		)
 	} else {
-		rows, err = h.DB.Query(
-			`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-			        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
-			        p.last_purchased_at, p.purchase_count,
-			        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
-			        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
-			        p.created_at, p.updated_at
-			 FROM products p WHERE p.household_id = ? ORDER BY p.name`,
+		rows, err = h.DB.QueryContext(ctx,
+			`SELECT `+productListColumns+`
+			 FROM products p WHERE p.household_id = ? ORDER BY `+orderBy,
 			householdID,
 		)
 	}
@@ -193,9 +247,7 @@ func (h *ProductHandler) List(c echo.Context) error {
 	products := make([]productResponse, 0)
 	for rows.Next() {
 		var p productResponse
-		if err := rows.Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-			&p.Brand, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
-			&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := scanProductRow(rows, &p); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		products = append(products, p)
@@ -335,13 +387,115 @@ func (h *ProductHandler) Update(c echo.Context) error {
 	return c.JSON(http.StatusOK, p)
 }
 
-// Delete removes a product. CASCADE handles aliases, images, and links.
+// Delete removes a product and all dependent records in a single transaction.
+// Line items that referenced this product are unmatched (product_id set to NULL).
 // DELETE /api/v1/products/:id
 func (h *ProductHandler) Delete(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
 
-	// Verify the product exists and belongs to this household BEFORE touching files.
+	// 1. Verify the product exists and stash its product_group_id.
+	var groupID *string
+	err := h.DB.QueryRow(
+		"SELECT product_group_id FROM products WHERE id = ? AND household_id = ?",
+		productID, householdID,
+	).Scan(&groupID)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	// 2. Count line_items referencing this product (for response).
+	var unmatchedCount int
+	if err := tx.QueryRow(
+		"SELECT COUNT(*) FROM line_items WHERE product_id = ?", productID,
+	).Scan(&unmatchedCount); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 3. Unmatch line_items that reference this product.
+	if _, err := tx.Exec(
+		"UPDATE line_items SET product_id = NULL, matched = 'unmatched', confidence = NULL WHERE product_id = ?",
+		productID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 4. Clear suggested_product_id references.
+	if _, err := tx.Exec(
+		"UPDATE line_items SET suggested_product_id = NULL, suggested_name = NULL, suggested_category = NULL WHERE suggested_product_id = ?",
+		productID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 5. Delete product_prices.
+	if _, err := tx.Exec("DELETE FROM product_prices WHERE product_id = ?", productID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 6. Delete matching_rules.
+	if _, err := tx.Exec("DELETE FROM matching_rules WHERE product_id = ?", productID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 7. Delete shopping_list_items.
+	if _, err := tx.Exec("DELETE FROM shopping_list_items WHERE product_id = ?", productID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 8. Delete unit_conversions.
+	if _, err := tx.Exec("DELETE FROM unit_conversions WHERE product_id = ?", productID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 9. Delete the product itself (CASCADE handles aliases, images, links).
+	if _, err := tx.Exec(
+		"DELETE FROM products WHERE id = ? AND household_id = ?",
+		productID, householdID,
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 10. If the product belonged to a group and is now the last member, delete the group.
+	if groupID != nil {
+		if _, err := tx.Exec(
+			"DELETE FROM product_groups WHERE id = ? AND NOT EXISTS (SELECT 1 FROM products WHERE product_group_id = ?)",
+			*groupID, *groupID,
+		); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// After commit: clean up on-disk image files.
+	productDir := filepath.Join(h.Cfg.DataDir, "products", productID)
+	os.RemoveAll(productDir)
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"deleted":              true,
+		"unmatched_line_items": unmatchedCount,
+	})
+}
+
+// GetProductUsage returns usage counts for a product.
+// GET /api/v1/products/:id/usage
+func (h *ProductHandler) GetProductUsage(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+
+	// Verify the product exists and belongs to this household.
 	var exists int
 	err := h.DB.QueryRow(
 		"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
@@ -354,31 +508,31 @@ func (h *ProductHandler) Delete(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// Clean up image files before deleting the DB row.
-	rows, err := h.DB.Query("SELECT image_path FROM product_images WHERE product_id = ?", productID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var imagePath string
-			if rows.Scan(&imagePath) == nil {
-				fullPath := filepath.Join(h.Cfg.DataDir, imagePath)
-				os.Remove(fullPath)
-			}
-		}
-	}
-	// Also remove the product image directory if it exists.
-	productDir := filepath.Join(h.Cfg.DataDir, "products", productID)
-	os.RemoveAll(productDir)
+	var lineItems, shoppingListItems, matchingRules, aliases, images int
 
-	_, err = h.DB.Exec(
-		"DELETE FROM products WHERE id = ? AND household_id = ?",
-		productID, householdID,
-	)
-	if err != nil {
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM line_items WHERE product_id = ?", productID).Scan(&lineItems); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM shopping_list_items WHERE product_id = ?", productID).Scan(&shoppingListItems); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM matching_rules WHERE product_id = ?", productID).Scan(&matchingRules); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_aliases WHERE product_id = ?", productID).Scan(&aliases); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_images WHERE product_id = ?", productID).Scan(&images); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	return c.NoContent(http.StatusNoContent)
+	return c.JSON(http.StatusOK, map[string]int{
+		"line_items":          lineItems,
+		"shopping_list_items": shoppingListItems,
+		"matching_rules":      matchingRules,
+		"aliases":             aliases,
+		"images":              images,
+	})
 }
 
 // UploadImage handles multipart image upload for a product.
@@ -577,6 +731,84 @@ func (h *ProductHandler) ListLinks(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, links)
+}
+
+// --- Bulk group types ---
+
+type bulkGroupRequest struct {
+	ProductIDs     []string `json:"product_ids"`
+	ProductGroupID *string  `json:"product_group_id"`
+}
+
+// BulkGroup assigns (or clears) product_group_id for many products in one transaction.
+// POST /api/v1/products/bulk-group
+// Body: { product_ids: [...], product_group_id: "uuid" | null }
+// Passing null (or omitting) clears the group assignment for the listed products.
+func (h *ProductHandler) BulkGroup(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	var req bulkGroupRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.ProductIDs) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "product_ids is required"})
+	}
+
+	// Normalize empty string → nil (clear).
+	if req.ProductGroupID != nil && strings.TrimSpace(*req.ProductGroupID) == "" {
+		req.ProductGroupID = nil
+	}
+
+	// If a group is specified, validate it belongs to the household.
+	if req.ProductGroupID != nil {
+		var groupHouseholdID string
+		err := h.DB.QueryRow("SELECT household_id FROM product_groups WHERE id = ?", *req.ProductGroupID).Scan(&groupHouseholdID)
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "product group not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if groupHouseholdID != householdID {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "product group belongs to another household"})
+		}
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	stmt, err := tx.Prepare(
+		`UPDATE products SET product_group_id = ?, updated_at = ? WHERE id = ? AND household_id = ?`,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer stmt.Close()
+
+	updated := 0
+	for _, id := range req.ProductIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		res, err := stmt.Exec(req.ProductGroupID, now, id, householdID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		n, _ := res.RowsAffected()
+		updated += int(n)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]int{"updated": updated})
 }
 
 // --- Merge types ---
