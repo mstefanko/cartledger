@@ -11,10 +11,16 @@ import type {
   CreateAliasRequest,
 } from '@/types'
 
-export async function listProducts(params?: { search?: string }): Promise<ProductListItem[]> {
+export async function listProducts(params?: {
+  search?: string
+  sort?: 'last_purchased_at'
+}): Promise<ProductListItem[]> {
   const searchParams = new URLSearchParams()
   if (params?.search) {
     searchParams.set('q', params.search)
+  }
+  if (params?.sort) {
+    searchParams.set('sort', params.sort)
   }
   const query = searchParams.toString()
   return get<ProductListItem[]>(`/products${query ? `?${query}` : ''}`)
@@ -28,8 +34,20 @@ export async function updateProduct(id: string, data: UpdateProductRequest): Pro
   return put<Product>(`/products/${encodeURIComponent(id)}`, data)
 }
 
-export async function deleteProduct(id: string): Promise<void> {
-  return del<void>(`/products/${encodeURIComponent(id)}`)
+export async function deleteProduct(id: string): Promise<{ deleted: true; unmatched_line_items: number }> {
+  return del<{ deleted: true; unmatched_line_items: number }>(`/products/${encodeURIComponent(id)}`)
+}
+
+export interface ProductUsage {
+  line_items: number
+  shopping_list_items: number
+  matching_rules: number
+  aliases: number
+  images: number
+}
+
+export async function getProductUsage(id: string): Promise<ProductUsage> {
+  return get<ProductUsage>(`/products/${encodeURIComponent(id)}/usage`)
 }
 
 export async function getProductDetail(id: string): Promise<ProductDetail> {
@@ -68,5 +86,15 @@ export async function mergeProducts(keepId: string, mergeId: string): Promise<vo
   return post<void>('/products/merge', {
     keep_id: keepId,
     merge_id: mergeId,
+  })
+}
+
+export async function bulkAssignGroup(
+  productIds: string[],
+  productGroupId: string | null,
+): Promise<{ updated: number }> {
+  return post<{ updated: number }>('/products/bulk-group', {
+    product_ids: productIds,
+    product_group_id: productGroupId,
   })
 }

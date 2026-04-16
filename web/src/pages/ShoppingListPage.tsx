@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/Badge'
 import { ShareListModal } from '@/components/lists/ShareListModal'
 import { StorePicker } from '@/components/lists/StorePicker'
 import { ItemPriceDetail } from '@/components/lists/ItemPriceDetail'
+import { AddItemsModal } from '@/components/lists/AddItemsModal'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -32,7 +33,15 @@ function ShoppingListPage() {
   const [editingName, setEditingName] = useState(false)
   const [nameValue, setNameValue] = useState('')
   const [showShare, setShowShare] = useState(false)
+  const [showAddItems, setShowAddItems] = useState(false)
   const [remoteIndicator, setRemoteIndicator] = useState(false)
+
+  // Undo toast state — stacks bursts of adds into a single toast.
+  const [recentlyAdded, setRecentlyAdded] = useState<{
+    ids: string[]
+    label: string
+  } | null>(null)
+  const recentlyAddedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Add item state
   const [addInput, setAddInput] = useState('')
@@ -221,46 +230,103 @@ function ShoppingListPage() {
   useEffect(() => {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current)
+      if (recentlyAddedTimerRef.current) clearTimeout(recentlyAddedTimerRef.current)
     }
   }, [])
 
+  // Push a newly-added item onto the undo toast. Stacks bursts — if the toast
+  // is already visible, append the id and update the label to reflect count.
+  const pushRecentlyAdded = useCallback((newId: string, newName: string) => {
+    if (recentlyAddedTimerRef.current) clearTimeout(recentlyAddedTimerRef.current)
+    setRecentlyAdded((prev) => {
+      if (prev) {
+        const ids = [...prev.ids, newId]
+        return { ids, label: `Added ${ids.length} items` }
+      }
+      return { ids: [newId], label: `Added "${newName}"` }
+    })
+    recentlyAddedTimerRef.current = setTimeout(() => {
+      setRecentlyAdded(null)
+      recentlyAddedTimerRef.current = null
+    }, 3000)
+  }, [])
+
+  const handleUndoRecent = useCallback(() => {
+    if (!listId || !recentlyAdded) return
+    const ids = recentlyAdded.ids
+    if (recentlyAddedTimerRef.current) {
+      clearTimeout(recentlyAddedTimerRef.current)
+      recentlyAddedTimerRef.current = null
+    }
+    setRecentlyAdded(null)
+    // Fire-and-forget deletes in parallel; invalidate once at end.
+    Promise.allSettled(ids.map((id) => deleteItem(listId, id))).then(() => {
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+      void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+    })
+  }, [listId, recentlyAdded, queryClient])
+
+  // addItemDirect accepts an explicit target so click/Enter-on-suggestion can
+  // commit without racing setState. Called with no args, uses the current
+  // input text + currently-selected target from state (the "Add" button path).
+  const addItemDirect = useCallback(
+    (explicitTarget?: SuggestionItem) => {
+      if (!listId) return
+
+      let name: string
+      let productId: string | undefined
+      let productGroupId: string | undefined
+      let unit: string | undefined
+
+      if (explicitTarget) {
+        name = explicitTarget.item.name
+        if (explicitTarget.kind === 'product') {
+          productId = explicitTarget.item.id
+          unit = explicitTarget.item.default_unit ?? undefined
+        } else {
+          productGroupId = explicitTarget.item.id
+        }
+      } else {
+        name = addInput.trim()
+        if (!name) return
+        if (selectedTarget?.kind === 'product') {
+          productId = selectedTarget.product.id
+          unit = selectedTarget.product.default_unit ?? undefined
+        } else if (selectedTarget?.kind === 'group') {
+          productGroupId = selectedTarget.group.id
+        }
+      }
+
+      const req: CreateListItemRequest = {
+        name,
+        product_id: productId,
+        product_group_id: productGroupId,
+        unit,
+      }
+
+      addItem(listId, req).then(
+        (created) => {
+          void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+          void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+          setAddInput('')
+          setSelectedTarget(null)
+          setShowSuggestions(false)
+          setSearchQuery('')
+          addInputRef.current?.focus()
+          pushRecentlyAdded(created.id, name)
+        },
+        () => {
+          // Error — swallow for now (existing behavior)
+        },
+      )
+    },
+    [listId, addInput, selectedTarget, queryClient, pushRecentlyAdded],
+  )
+
   function handleSelectTarget(suggestion: SuggestionItem) {
-    if (suggestion.kind === 'product') {
-      setSelectedTarget({ kind: 'product', product: suggestion.item })
-    } else {
-      setSelectedTarget({ kind: 'group', group: suggestion.item })
-    }
-    setAddInput(suggestion.item.name)
-    setShowSuggestions(false)
+    // Commit immediately — no priming of selectedTarget + second click needed.
+    addItemDirect(suggestion)
   }
-
-  const addItemDirect = useCallback(() => {
-    if (!listId) return
-    const name = addInput.trim()
-    if (!name) return
-
-    const req: CreateListItemRequest = {
-      name,
-      product_id: selectedTarget?.kind === 'product' ? selectedTarget.product.id : undefined,
-      product_group_id: selectedTarget?.kind === 'group' ? selectedTarget.group.id : undefined,
-      unit: selectedTarget?.kind === 'product' ? (selectedTarget.product.default_unit ?? undefined) : undefined,
-    }
-
-    // Use direct API call + invalidate, since the mutation shape is (listId, data)
-    addItem(listId, req).then(
-      () => {
-        void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
-        void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
-        setAddInput('')
-        setSelectedTarget(null)
-        setShowSuggestions(false)
-        addInputRef.current?.focus()
-      },
-      () => {
-        // Error — could show a toast
-      },
-    )
-  }, [listId, addInput, selectedTarget, queryClient])
 
   function handleAddKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (showSuggestions && suggestions.length > 0) {
@@ -278,7 +344,8 @@ function ShoppingListPage() {
         e.preventDefault()
         const selected = suggestions[highlightedIdx]
         if (selected) {
-          handleSelectTarget(selected)
+          // Enter on a highlighted suggestion commits it immediately.
+          addItemDirect(selected)
         }
         return
       }
@@ -404,6 +471,9 @@ function ShoppingListPage() {
           </div>
         </div>
         <div className="flex items-center gap-2 ml-3 shrink-0">
+          <Button variant="outlined" size="sm" onClick={() => setShowAddItems(true)}>
+            Add items
+          </Button>
           <Button variant="subtle" size="sm" onClick={() => setShowShare(true)}>
             Share
           </Button>
@@ -511,10 +581,28 @@ function ShoppingListPage() {
               </div>
             )}
           </div>
-          <Button size="sm" onClick={addItemDirect} disabled={!addInput.trim()}>
+          <Button size="sm" onClick={() => addItemDirect()} disabled={!addInput.trim()}>
             Add
           </Button>
         </div>
+
+        {/* Undo toast — anchored under the input, same token palette as remoteIndicator. */}
+        {recentlyAdded && (
+          <div
+            className="mt-2 flex items-center justify-between bg-brand-subtle text-brand text-small font-medium px-3 py-2 rounded-lg shadow-subtle"
+            role="status"
+            aria-live="polite"
+          >
+            <span className="truncate">{recentlyAdded.label}</span>
+            <button
+              type="button"
+              onClick={handleUndoRecent}
+              className="ml-3 shrink-0 font-semibold underline hover:no-underline focus:outline-none focus-visible:ring-2 focus-visible:ring-brand rounded"
+            >
+              Undo
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Checked items (bottom section) */}
@@ -560,6 +648,14 @@ function ShoppingListPage() {
       <ShareListModal
         open={showShare}
         onClose={() => setShowShare(false)}
+        listId={listId}
+        listName={list.name}
+      />
+
+      {/* Bulk Add Items Modal */}
+      <AddItemsModal
+        open={showAddItems}
+        onClose={() => setShowAddItems(false)}
         listId={listId}
         listName={list.name}
       />

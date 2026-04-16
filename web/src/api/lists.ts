@@ -41,6 +41,21 @@ export async function addItem(
   return post<ListItemWithPrice>(`/lists/${encodeURIComponent(listId)}/items`, data)
 }
 
+export interface BulkAddItemsResponse {
+  items: ListItemWithPrice[]
+  list: ShoppingListDetail
+}
+
+export async function bulkAddItems(
+  listId: string,
+  items: CreateListItemRequest[],
+): Promise<BulkAddItemsResponse> {
+  return post<BulkAddItemsResponse>(
+    `/lists/${encodeURIComponent(listId)}/items/bulk`,
+    { items },
+  )
+}
+
 export async function updateItem(
   listId: string,
   itemId: string,

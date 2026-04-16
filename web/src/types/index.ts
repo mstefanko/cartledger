@@ -705,6 +705,11 @@ export interface BuyAgainItem {
   urgency_ratio: number
   last_quantity: string
   last_store: string
+  // Added in Phase D — backend now also returns these fields.
+  urgency?: string
+  avg_days_per_unit?: number
+  last_price?: string | null
+  last_store_name?: string | null
 }
 
 export interface PricePoint {
