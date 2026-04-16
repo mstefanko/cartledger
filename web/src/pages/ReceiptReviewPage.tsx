@@ -7,8 +7,8 @@ import { getToken } from '@/api/client'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 
-const LENS_SIZE = 240
-const ZOOM = 0.8
+const LENS_SIZE = 280
+const ZOOM = 0.75
 
 function ReceiptMagnifier({ src, alt }: { src: string; alt: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
