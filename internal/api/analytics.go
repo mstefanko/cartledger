@@ -30,6 +30,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/trips", h.Trips)
 	analytics.GET("/deals", h.Deals)
 	analytics.GET("/buy-again", h.BuyAgain)
+	analytics.GET("/product-groups/:id/trend", h.GroupTrend)
 }
 
 // --- Response types ---
@@ -332,13 +333,14 @@ func (h *AnalyticsHandler) ProductsWithTrends(c echo.Context) error {
 		FROM products p
 		LEFT JOIN (
 		    SELECT pp.product_id,
-		           COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price
+		           MAX(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL))) as price
 		    FROM product_prices pp
 		    WHERE pp.receipt_date = (
 		        SELECT MAX(pp2.receipt_date)
 		        FROM product_prices pp2
 		        WHERE pp2.product_id = pp.product_id
 		    )
+		    GROUP BY pp.product_id
 		) latest ON latest.product_id = p.id
 		LEFT JOIN (
 		    SELECT pp.product_id,
@@ -585,6 +587,102 @@ func (h *AnalyticsHandler) Deals(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, deals)
+}
+
+// GroupTrend returns price history and stats for all products in a product group.
+// GET /api/v1/analytics/product-groups/:id/trend
+func (h *AnalyticsHandler) GroupTrend(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	groupID := c.Param("id")
+
+	// Verify group belongs to household.
+	var exists int
+	err := h.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM product_groups WHERE id = ? AND household_id = ?",
+		groupID, householdID,
+	).Scan(&exists)
+	if err != nil || exists == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "group not found"})
+	}
+
+	sixMonthsAgo := time.Now().UTC().AddDate(0, -6, 0).Format("2006-01-02")
+
+	// Price history for all group members (last 6 months).
+	rows, err := h.DB.Query(
+		`SELECT pp.receipt_date,
+		        COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price,
+		        s.name, pp.is_sale
+		 FROM product_prices pp
+		 JOIN products p ON pp.product_id = p.id
+		 JOIN stores s ON pp.store_id = s.id
+		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?
+		 ORDER BY pp.receipt_date ASC`,
+		groupID, sixMonthsAgo,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer rows.Close()
+
+	history := make([]pricePoint, 0)
+	for rows.Next() {
+		var pp pricePoint
+		var receiptDate time.Time
+		if err := rows.Scan(&receiptDate, &pp.NormalizedPrice, &pp.Store, &pp.IsSale); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		pp.Date = receiptDate.Format("2006-01-02")
+		history = append(history, pp)
+	}
+	if err := rows.Err(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	resp := productTrendResponse{
+		PriceHistory: history,
+	}
+
+	// Percent change: first vs last in the window.
+	if len(history) >= 2 {
+		first := history[0].NormalizedPrice
+		last := history[len(history)-1].NormalizedPrice
+		if first > 0 {
+			resp.PercentChange = math.Round(((last-first)/first)*10000) / 100
+		}
+	}
+
+	// Min/max/avg with store names.
+	h.DB.QueryRow(
+		`SELECT COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price, s.name
+		 FROM product_prices pp
+		 JOIN products p ON pp.product_id = p.id
+		 JOIN stores s ON pp.store_id = s.id
+		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?
+		 ORDER BY price ASC LIMIT 1`,
+		groupID, sixMonthsAgo,
+	).Scan(&resp.MinPrice, &resp.MinStore)
+
+	h.DB.QueryRow(
+		`SELECT COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price, s.name
+		 FROM product_prices pp
+		 JOIN products p ON pp.product_id = p.id
+		 JOIN stores s ON pp.store_id = s.id
+		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?
+		 ORDER BY price DESC LIMIT 1`,
+		groupID, sixMonthsAgo,
+	).Scan(&resp.MaxPrice, &resp.MaxStore)
+
+	h.DB.QueryRow(
+		`SELECT AVG(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)))
+		 FROM product_prices pp
+		 JOIN products p ON pp.product_id = p.id
+		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?`,
+		groupID, sixMonthsAgo,
+	).Scan(&resp.AvgPrice)
+	resp.AvgPrice = math.Round(resp.AvgPrice*100) / 100
+
+	return c.JSON(http.StatusOK, resp)
 }
 
 // BuyAgain returns products predicted to need repurchasing soon.

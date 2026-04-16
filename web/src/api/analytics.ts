@@ -2,6 +2,7 @@ import { get } from './client'
 import type {
   AnalyticsOverview,
   ProductTrend,
+  ProductTrendResponse,
   ProductWithTrend,
   StoreSummary,
   Trip,
@@ -44,3 +45,9 @@ export async function getDeals(): Promise<Deal[]> {
 export async function getBuyAgain(): Promise<BuyAgainItem[]> {
   return get<BuyAgainItem[]>('/analytics/buy-again')
 }
+
+export const fetchProductTrend = (productId: string) =>
+  get<ProductTrendResponse>(`/analytics/products/${encodeURIComponent(productId)}/trend`)
+
+export const fetchGroupTrend = (groupId: string) =>
+  get<ProductTrendResponse>(`/analytics/product-groups/${encodeURIComponent(groupId)}/trend`)

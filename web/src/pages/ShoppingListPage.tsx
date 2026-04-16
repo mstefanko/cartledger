@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
-import { useParams, useNavigate, Link } from 'react-router-dom'
+import { useParams, useNavigate, Link, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getList, updateList, updateItem, addItem, deleteItem } from '@/api/lists'
 import { listProducts } from '@/api/products'
@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { ShareListModal } from '@/components/lists/ShareListModal'
 import { StorePicker } from '@/components/lists/StorePicker'
+import { ItemPriceDetail } from '@/components/lists/ItemPriceDetail'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -24,6 +25,9 @@ function ShoppingListPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { user } = useAuth()
+  const [searchParams] = useSearchParams()
+  const isCleanView = searchParams.get('share') === '1'
+  const [expandedItemId, setExpandedItemId] = useState<string | null>(null)
 
   const [editingName, setEditingName] = useState(false)
   const [nameValue, setNameValue] = useState('')
@@ -382,16 +386,20 @@ function ShoppingListPage() {
           )}
           <div className="flex items-center gap-2 mt-1">
             <Badge variant={statusVariant}>{list.status}</Badge>
-            <StorePicker
-              preferredStoreId={list.preferred_store_id}
-              stores={storesQuery.data ?? []}
-              onChange={(storeId) => updateStoreMutation.mutate(storeId)}
-              disabled={updateStoreMutation.isPending}
-            />
-            {estimatedTotal > 0 && (
-              <span className="text-caption font-medium text-brand">
-                Est. ${estimatedTotal.toFixed(2)}
-              </span>
+            {!isCleanView && (
+              <>
+                <StorePicker
+                  preferredStoreId={list.preferred_store_id}
+                  stores={storesQuery.data ?? []}
+                  onChange={(storeId) => updateStoreMutation.mutate(storeId)}
+                  disabled={updateStoreMutation.isPending}
+                />
+                {estimatedTotal > 0 && (
+                  <span className="text-caption font-medium text-brand">
+                    Est. ${estimatedTotal.toFixed(2)}
+                  </span>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -415,6 +423,9 @@ function ShoppingListPage() {
               toggleCheckMutation.mutate({ itemId: item.id, checked })
             }
             onDelete={() => deleteItemMutation.mutate(item.id)}
+            isExpanded={expandedItemId === item.id}
+            onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
+            isCleanView={isCleanView}
           />
         ))}
       </div>
@@ -521,6 +532,9 @@ function ShoppingListPage() {
                   toggleCheckMutation.mutate({ itemId: item.id, checked })
                 }
                 onDelete={() => deleteItemMutation.mutate(item.id)}
+                isExpanded={expandedItemId === item.id}
+                onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
+                isCleanView={isCleanView}
               />
             ))}
           </div>
@@ -559,9 +573,12 @@ interface ListItemRowProps {
   item: ListItemWithPrice
   onToggle: (checked: boolean) => void
   onDelete: () => void
+  isExpanded: boolean
+  onToggleExpand: () => void
+  isCleanView: boolean
 }
 
-function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
+function ListItemRow({ item, onToggle, onDelete, isExpanded, onToggleExpand, isCleanView }: ListItemRowProps) {
   const [swiping, setSwiping] = useState(false)
   const [swipeX, setSwipeX] = useState(0)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
@@ -666,9 +683,19 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
             {qtyUnit && (
               <span className="text-small text-neutral-400 shrink-0">{qtyUnit}</span>
             )}
+            {!isCleanView && !item.checked && (item.product_id || item.product_group_id) && (
+              <button
+                type="button"
+                className="shrink-0 text-neutral-400 hover:text-brand transition-colors text-xs leading-none"
+                onClick={onToggleExpand}
+                aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
+              >
+                {isExpanded ? '▾' : '▸'}
+              </button>
+            )}
           </div>
-          {/* Store price indicator */}
-          {!item.checked && (
+          {/* Store price indicator — hidden in clean view */}
+          {!item.checked && !isCleanView && (
             <>
               {item.store_price && item.store_price_store ? (
                 <>
@@ -690,6 +717,9 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
                 )
               )}
             </>
+          )}
+          {isExpanded && !isCleanView && (
+            <ItemPriceDetail item={item} />
           )}
         </div>
 

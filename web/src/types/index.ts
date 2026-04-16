@@ -706,3 +706,20 @@ export interface BuyAgainItem {
   last_quantity: string
   last_store: string
 }
+
+export interface PricePoint {
+  date: string
+  normalized_price: number
+  store: string
+  is_sale: boolean
+}
+
+export interface ProductTrendResponse {
+  price_history: PricePoint[]
+  percent_change: number
+  min_price: number
+  min_store: string
+  max_price: number
+  max_store: string
+  avg_price: number
+}
