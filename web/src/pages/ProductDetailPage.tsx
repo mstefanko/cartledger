@@ -1,13 +1,16 @@
 import { useState, useRef, useCallback, useMemo } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getProductDetail,
+  getProductUsage,
+  deleteProduct,
   updateProduct,
   uploadProductImage,
   deleteProductImage,
   createProductAlias,
   deleteProductAlias,
+  type ProductUsage,
 } from '@/api/products'
 import { fetchGroups, fetchGroupSuggestions, createGroup } from '@/api/groups'
 import { listStores } from '@/api/stores'
@@ -696,7 +699,7 @@ function ProductGroupSection({ detail, productId }: { detail: ProductDetail; pro
 
   const { data: groups } = useQuery({
     queryKey: ['product-groups'],
-    queryFn: fetchGroups,
+    queryFn: () => fetchGroups(),
     enabled: !hasGroup,
   })
 
@@ -869,12 +872,129 @@ function ProductGroupSection({ detail, productId }: { detail: ProductDetail; pro
   )
 }
 
+// --- Delete Product Modal ---
+
+interface DeleteProductModalProps {
+  open: boolean
+  onClose: () => void
+  productId: string
+  productName: string
+  usage: ProductUsage | null
+  onMerge: () => void
+}
+
+function DeleteProductModal({ open, onClose, productId, productName, usage, onMerge }: DeleteProductModalProps) {
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [banner, setBanner] = useState<string | null>(null)
+
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteProduct(productId),
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: ['products'] })
+      void queryClient.invalidateQueries({ queryKey: ['unmatched-count'] })
+      if (result.unmatched_line_items > 0) {
+        setBanner(`${result.unmatched_line_items} item${result.unmatched_line_items !== 1 ? 's' : ''} moved to review queue`)
+        setTimeout(() => {
+          navigate('/products')
+        }, 2500)
+      } else {
+        navigate('/products')
+      }
+    },
+  })
+
+  const isSimple =
+    usage !== null &&
+    usage.line_items === 0 &&
+    usage.shopping_list_items === 0 &&
+    usage.matching_rules === 0 &&
+    usage.aliases === 0 &&
+    usage.images === 0
+
+  if (!open) return null
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Delete Product"
+      footer={
+        isSimple ? (
+          <>
+            <Button variant="secondary" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="bg-expensive text-white hover:opacity-90"
+              onClick={() => deleteMutation.mutate()}
+              disabled={deleteMutation.isPending}
+            >
+              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button variant="secondary" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              variant="outlined"
+              onClick={() => {
+                onClose()
+                onMerge()
+              }}
+            >
+              Merge into another product
+            </Button>
+            <Button
+              size="sm"
+              className="bg-expensive text-white hover:opacity-90"
+              onClick={() => deleteMutation.mutate()}
+              disabled={deleteMutation.isPending}
+            >
+              {deleteMutation.isPending
+                ? 'Deleting...'
+                : `Delete + move ${usage?.line_items ?? 0} item${(usage?.line_items ?? 0) !== 1 ? 's' : ''} to review queue`}
+            </Button>
+          </>
+        )
+      }
+    >
+      {banner && (
+        <div className="mb-4 px-4 py-3 bg-success-subtle rounded-xl text-body text-success-dark flex items-center justify-between gap-3">
+          <span>{banner}</span>
+          <Link to="/review" className="text-brand underline text-caption">
+            Go to review
+          </Link>
+        </div>
+      )}
+      {isSimple ? (
+        <p className="text-body text-neutral-600">
+          Are you sure you want to delete <strong>{productName}</strong>? This cannot be undone.
+        </p>
+      ) : (
+        <p className="text-body text-neutral-600">
+          <strong>{productName}</strong> appears on{' '}
+          {usage?.line_items ?? 0} receipt{(usage?.line_items ?? 0) !== 1 ? 's' : ''} and has{' '}
+          {usage?.aliases ?? 0} alias{(usage?.aliases ?? 0) !== 1 ? 'es' : ''}.
+          Deleting it will move matched line items to the review queue.
+        </p>
+      )}
+    </Modal>
+  )
+}
+
 // --- Main Page ---
 
 function ProductDetailPage() {
   const { id } = useParams<{ id: string }>()
   const productId = id ?? ''
   const [mergeOpen, setMergeOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [usage, setUsage] = useState<ProductUsage | null>(null)
 
   const { data: detail, isLoading, error } = useQuery({
     queryKey: ['product-detail', productId],
@@ -925,9 +1045,22 @@ function ProductDetailPage() {
           <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
             {product.name}
           </h1>
-          <Button size="sm" variant="outlined" onClick={() => setMergeOpen(true)}>
-            Merge with Another Product
-          </Button>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outlined" onClick={() => setMergeOpen(true)}>
+              Merge with Another Product
+            </Button>
+            <Button
+              size="sm"
+              className="bg-expensive text-white hover:opacity-90"
+              onClick={async () => {
+                const u = await getProductUsage(productId)
+                setUsage(u)
+                setDeleteOpen(true)
+              }}
+            >
+              Delete
+            </Button>
+          </div>
         </div>
         <div className="flex items-center gap-3 mt-2">
           {product.brand && <Badge variant="neutral">{product.brand}</Badge>}
@@ -957,6 +1090,16 @@ function ProductDetailPage() {
         open={mergeOpen}
         onClose={() => setMergeOpen(false)}
         keepProduct={product}
+      />
+
+      {/* Delete Modal */}
+      <DeleteProductModal
+        open={deleteOpen}
+        onClose={() => setDeleteOpen(false)}
+        productId={productId}
+        productName={product.name}
+        usage={usage}
+        onMerge={() => setMergeOpen(true)}
       />
     </div>
   )

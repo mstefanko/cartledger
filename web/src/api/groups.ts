@@ -6,8 +6,9 @@ import type {
   GroupSuggestion,
 } from '@/types'
 
-export async function fetchGroups(): Promise<ProductGroup[]> {
-  return get<ProductGroup[]>('/product-groups')
+export async function fetchGroups(params?: { search?: string }): Promise<ProductGroup[]> {
+  const q = params?.search
+  return get<ProductGroup[]>(`/product-groups${q ? `?q=${encodeURIComponent(q)}` : ''}`)
 }
 
 export async function fetchGroup(id: string): Promise<ProductGroup> {

@@ -465,6 +465,9 @@ export interface ListItemWithPrice {
   cheapest_store: string | null
   cheapest_price: string | null
   created_at: string
+  product_group_id: string | null
+  product_group_name: string | null
+  cheapest_product_id: string | null
 }
 
 export interface ShoppingListDetail {
@@ -490,6 +493,7 @@ export interface UpdateListRequest {
 export interface CreateListItemRequest {
   name: string
   product_id?: string
+  product_group_id?: string
   quantity?: string
   unit?: string
   notes?: string
@@ -498,6 +502,7 @@ export interface CreateListItemRequest {
 export interface UpdateListItemRequest {
   name?: string
   product_id?: string
+  product_group_id?: string | null
   quantity?: string
   unit?: string
   checked?: boolean

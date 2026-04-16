@@ -131,11 +131,21 @@ func (h *GroupHandler) Create(c echo.Context) error {
 // GET /api/v1/product-groups
 func (h *GroupHandler) List(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
+	q := strings.TrimSpace(c.QueryParam("q"))
+
+	whereClause := "WHERE g.household_id = ?"
+	queryArgs := []interface{}{householdID}
+	limitClause := ""
+	if q != "" {
+		whereClause += " AND LOWER(g.name) LIKE LOWER(?)"
+		queryArgs = append(queryArgs, "%"+q+"%")
+		limitClause = " LIMIT 50"
+	}
 
 	rows, err := h.DB.Query(
-		`SELECT g.id, g.household_id, g.name, g.comparison_unit,
+		fmt.Sprintf(`SELECT g.id, g.household_id, g.name, g.comparison_unit,
 		        (SELECT COUNT(*) FROM products p WHERE p.product_group_id = g.id) as member_count,
-		        (SELECT PRINTF('%.2f', MIN(CAST(pp.unit_price AS REAL)))
+		        (SELECT PRINTF('%%.2f', MIN(CAST(pp.unit_price AS REAL)))
 		         FROM products p2
 		         JOIN (
 		             SELECT product_id, unit_price,
@@ -146,9 +156,9 @@ func (h *GroupHandler) List(c echo.Context) error {
 		        ) as best_price,
 		        g.created_at, g.updated_at
 		 FROM product_groups g
-		 WHERE g.household_id = ?
-		 ORDER BY g.name`,
-		householdID,
+		 %s
+		 ORDER BY g.name%s`, whereClause, limitClause),
+		queryArgs...,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

@@ -45,9 +45,17 @@ func (h *ExportHandler) ShareList(c echo.Context) error {
 	// Get items with estimated prices.
 	rows, err := h.DB.Query(
 		`SELECT sli.name, sli.quantity, sli.unit, sli.checked,
-		        (SELECT pp.unit_price FROM product_prices pp
-		         WHERE pp.product_id = sli.product_id
-		         ORDER BY pp.receipt_date DESC LIMIT 1) AS estimated_price
+		        COALESCE(
+		          (SELECT pp.unit_price FROM product_prices pp
+		           WHERE pp.product_id = sli.product_id
+		           ORDER BY pp.receipt_date DESC LIMIT 1),
+		          (SELECT MIN(pp.unit_price) FROM product_prices pp
+		           JOIN products p ON p.id = pp.product_id
+		           WHERE p.product_group_id = sli.product_group_id
+		             AND pp.receipt_date = (
+		                 SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+		                 WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id))
+		        ) AS estimated_price
 		 FROM shopping_list_items sli
 		 WHERE sli.list_id = ?
 		 ORDER BY sli.sort_order, sli.created_at`,

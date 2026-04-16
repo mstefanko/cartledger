@@ -1,12 +1,14 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
-import { listProducts, createProduct, updateProduct } from '@/api/products'
+import { ArrowUpRight, ChevronRight, X } from 'lucide-react'
+import { listProducts, createProduct, updateProduct, bulkAssignGroup } from '@/api/products'
 import { fetchGroups, createGroup } from '@/api/groups'
 import type { ProductListItem, ProductGroup } from '@/types'
 import { getProductsWithTrends } from '@/api/analytics'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
+import { Modal } from '@/components/ui/Modal'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { EditableTable } from '@/components/ui/EditableTable'
 import type { ColumnDef, CellContext } from '@tanstack/react-table'
@@ -19,7 +21,7 @@ function GroupsView() {
 
   const { data: groups, isLoading } = useQuery({
     queryKey: ['product-groups'],
-    queryFn: fetchGroups,
+    queryFn: () => fetchGroups(),
   })
 
   const createMutation = useMutation({
@@ -82,9 +84,7 @@ function GroupsView() {
                   )}
                 </div>
               </div>
-              <svg className="w-5 h-5 text-neutral-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-              </svg>
+              <ChevronRight className="w-5 h-5 text-neutral-300" aria-hidden="true" />
             </div>
           </Link>
         ))}
@@ -105,11 +105,14 @@ function ProductsPage() {
   const activeTab = searchParams.get('tab') === 'groups' ? 'groups' : 'products'
   const setActiveTab = (tab: 'products' | 'groups') => {
     setSearchParams(tab === 'groups' ? { tab: 'groups' } : {})
+    setSelection(new Set())
   }
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [brandFilter, setBrandFilter] = useState('')
   const [missingFilter, setMissingFilter] = useState<'' | 'missing_brand' | 'missing_pack'>('')
+  const [selection, setSelection] = useState<Set<string>>(new Set())
+  const [groupModalOpen, setGroupModalOpen] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
@@ -148,6 +151,33 @@ function ProductsPage() {
     mutationFn: (data: { name: string }) => createProduct(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+
+  const { data: groups } = useQuery({
+    queryKey: ['product-groups'],
+    queryFn: () => fetchGroups(),
+  })
+
+  const bulkGroupMutation = useMutation({
+    mutationFn: ({ ids, groupId }: { ids: string[]; groupId: string | null }) =>
+      bulkAssignGroup(ids, groupId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+      queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+      setSelection(new Set())
+      setGroupModalOpen(false)
+    },
+  })
+
+  const createGroupMutation = useMutation({
+    mutationFn: (name: string) => createGroup({ name }),
+    onSuccess: (group, _name) => {
+      queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+      const ids = Array.from(selection)
+      if (ids.length > 0) {
+        bulkGroupMutation.mutate({ ids, groupId: group.id })
+      }
     },
   })
 
@@ -222,24 +252,33 @@ function ProductsPage() {
         accessorKey: 'name',
         header: 'Name',
         size: 240,
-        meta: { editable: true, cellType: 'text' as const },
-        cell: ({ getValue, row }: CellContext<ProductRow, unknown>) => {
-          const name = getValue() as string
-          const product = row.original
-          return (
-            <span className="flex items-center gap-1.5">
-              <Link
-                to={`/products/${product.id}`}
-                className="text-brand hover:underline"
-                onClick={(e) => e.stopPropagation()}
-              >
-                {name}
-              </Link>
-              {product.product_group_id && (
-                <span className="inline-block w-2 h-2 rounded-full bg-brand flex-shrink-0" title="In a product group" />
-              )}
-            </span>
-          )
+        meta: {
+          editable: true,
+          cellType: 'text' as const,
+          displayRenderer: ({ getValue, row }: CellContext<ProductRow, unknown>) => {
+            const name = getValue() as string
+            const product = row.original
+            return (
+              <span className="flex items-center gap-1.5 w-full">
+                <span className="truncate flex-1">{name}</span>
+                {product.product_group_id && (
+                  <span
+                    className="inline-block w-2 h-2 rounded-full bg-brand flex-shrink-0"
+                    title="In a product group"
+                  />
+                )}
+                <Link
+                  to={`/products/${product.id}`}
+                  className="flex-shrink-0 text-neutral-400 hover:text-brand transition-colors"
+                  onClick={(e) => e.stopPropagation()}
+                  title="View product details"
+                  aria-label={`View ${name}`}
+                >
+                  <ArrowUpRight size={14} />
+                </Link>
+              </span>
+            )
+          },
         },
       },
       {
@@ -432,11 +471,187 @@ function ProductsPage() {
           data={rows}
           onCellUpdate={handleCellUpdate}
           virtualizeRows={rows.length > 100}
+          selection={selection}
+          onSelectionChange={setSelection}
+          getRowId={(row) => row.id}
         />
       )}
       </>
       )}
+
+      {activeTab === 'products' && selection.size > 0 && (
+        <BulkActionBar
+          count={selection.size}
+          onClear={() => setSelection(new Set())}
+          onGroup={() => setGroupModalOpen(true)}
+        />
+      )}
+
+      <GroupAssignModal
+        open={groupModalOpen}
+        onClose={() => setGroupModalOpen(false)}
+        selectedCount={selection.size}
+        groups={groups ?? []}
+        pending={bulkGroupMutation.isPending || createGroupMutation.isPending}
+        onAssignExisting={(groupId) =>
+          bulkGroupMutation.mutate({ ids: Array.from(selection), groupId })
+        }
+        onCreateAndAssign={(name) => createGroupMutation.mutate(name)}
+      />
     </div>
+  )
+}
+
+// --- Bulk action bar (floating at bottom) ---
+
+interface BulkActionBarProps {
+  count: number
+  onClear: () => void
+  onGroup: () => void
+}
+
+function BulkActionBar({ count, onClear, onGroup }: BulkActionBarProps) {
+  return (
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 bg-neutral-900 text-white rounded-2xl shadow-lg px-4 py-2.5">
+      <span className="text-caption font-medium">
+        {count} selected
+      </span>
+      <div className="h-5 w-px bg-neutral-700" />
+      <Button size="sm" variant="primary" onClick={onGroup}>
+        Group selected
+      </Button>
+      <button
+        type="button"
+        onClick={onClear}
+        className="flex items-center justify-center w-7 h-7 rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors"
+        aria-label="Clear selection"
+      >
+        <X size={16} />
+      </button>
+    </div>
+  )
+}
+
+// --- Group assignment modal ---
+
+interface GroupAssignModalProps {
+  open: boolean
+  onClose: () => void
+  selectedCount: number
+  groups: ProductGroup[]
+  pending: boolean
+  onAssignExisting: (groupId: string) => void
+  onCreateAndAssign: (name: string) => void
+}
+
+function GroupAssignModal({
+  open,
+  onClose,
+  selectedCount,
+  groups,
+  pending,
+  onAssignExisting,
+  onCreateAndAssign,
+}: GroupAssignModalProps) {
+  const [mode, setMode] = useState<'existing' | 'new'>('existing')
+  const [selectedGroupId, setSelectedGroupId] = useState('')
+  const [newGroupName, setNewGroupName] = useState('')
+
+  useEffect(() => {
+    if (open) {
+      setMode(groups.length > 0 ? 'existing' : 'new')
+      setSelectedGroupId(groups[0]?.id ?? '')
+      setNewGroupName('')
+    }
+  }, [open, groups])
+
+  const canSubmit =
+    !pending &&
+    ((mode === 'existing' && selectedGroupId) ||
+      (mode === 'new' && newGroupName.trim().length > 0))
+
+  const handleSubmit = () => {
+    if (!canSubmit) return
+    if (mode === 'existing') {
+      onAssignExisting(selectedGroupId)
+    } else {
+      onCreateAndAssign(newGroupName.trim())
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Group products"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={pending}>
+            Cancel
+          </Button>
+          <Button onClick={handleSubmit} disabled={!canSubmit}>
+            {pending ? 'Saving...' : 'Assign'}
+          </Button>
+        </>
+      }
+    >
+      <p className="text-body text-neutral-600 mb-4">
+        Assign {selectedCount} product{selectedCount !== 1 ? 's' : ''} to a group.
+      </p>
+
+      {groups.length > 0 && (
+        <div className="flex gap-1 mb-4 bg-neutral-100 rounded-xl p-1 w-fit">
+          <button
+            type="button"
+            className={`px-3 py-1.5 text-caption rounded-lg transition-colors cursor-pointer ${
+              mode === 'existing'
+                ? 'bg-white shadow-sm text-neutral-900 font-medium'
+                : 'text-neutral-500 hover:text-neutral-700'
+            }`}
+            onClick={() => setMode('existing')}
+          >
+            Existing group
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1.5 text-caption rounded-lg transition-colors cursor-pointer ${
+              mode === 'new'
+                ? 'bg-white shadow-sm text-neutral-900 font-medium'
+                : 'text-neutral-500 hover:text-neutral-700'
+            }`}
+            onClick={() => setMode('new')}
+          >
+            New group
+          </button>
+        </div>
+      )}
+
+      {mode === 'existing' && groups.length > 0 ? (
+        <select
+          value={selectedGroupId}
+          onChange={(e) => setSelectedGroupId(e.target.value)}
+          className="w-full px-3 py-2 text-body border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand"
+        >
+          {groups.map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.name} ({g.member_count} product{g.member_count !== 1 ? 's' : ''})
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          type="text"
+          value={newGroupName}
+          onChange={(e) => setNewGroupName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && canSubmit) handleSubmit()
+          }}
+          placeholder="Group name..."
+          autoFocus
+          className="w-full px-3 py-2 text-body border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand"
+        />
+      )}
+    </Modal>
   )
 }
 

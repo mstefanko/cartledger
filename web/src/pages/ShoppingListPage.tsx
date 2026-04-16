@@ -3,6 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getList, updateList, updateItem, addItem, deleteItem } from '@/api/lists'
 import { listProducts } from '@/api/products'
+import { fetchGroups, createGroup } from '@/api/groups'
 import { useAuth } from '@/hooks/useAuth'
 import { useListWebSocket } from '@/hooks/useWebSocket'
 import { Button } from '@/components/ui/Button'
@@ -12,6 +13,8 @@ import type {
   ListItemWithPrice,
   ShoppingListDetail,
   Product,
+  ProductGroup,
+  CreateListItemRequest,
 } from '@/types'
 
 function ShoppingListPage() {
@@ -29,7 +32,11 @@ function ShoppingListPage() {
   const [addInput, setAddInput] = useState('')
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [highlightedIdx, setHighlightedIdx] = useState(0)
-  const [selectedProduct, setSelectedProduct] = useState<Product | null>(null)
+  const [selectedTarget, setSelectedTarget] = useState<
+    | { kind: 'product'; product: Product }
+    | { kind: 'group'; group: ProductGroup }
+    | null
+  >(null)
   const addInputRef = useRef<HTMLInputElement>(null)
   const suggestionsRef = useRef<HTMLDivElement>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -58,8 +65,24 @@ function ShoppingListPage() {
     enabled: searchQuery.length >= 2,
   })
 
+  // Groups search for autocomplete
+  const groupsQuery = useQuery({
+    queryKey: ['product-groups', { search: searchQuery }],
+    queryFn: () => fetchGroups({ search: searchQuery }),
+    enabled: searchQuery.length >= 2,
+  })
+
   const list = listQuery.data
-  const suggestions = productsQuery.data ?? []
+
+  type SuggestionItem =
+    | { kind: 'product'; item: Product }
+    | { kind: 'group'; item: ProductGroup }
+
+  const suggestions = useMemo((): SuggestionItem[] => {
+    const groups = (groupsQuery.data ?? []).map((g): SuggestionItem => ({ kind: 'group', item: g }))
+    const products = (productsQuery.data ?? []).map((p): SuggestionItem => ({ kind: 'product', item: p }))
+    return [...groups, ...products]
+  }, [groupsQuery.data, productsQuery.data])
 
   // Separate checked and unchecked items
   const { uncheckedItems, checkedItems } = useMemo(() => {
@@ -150,10 +173,19 @@ function ShoppingListPage() {
     },
   })
 
+  // Create group and immediately select it
+  const createGroupMutation = useMutation({
+    mutationFn: (name: string) => createGroup({ name }),
+    onSuccess: (group) => {
+      setSelectedTarget({ kind: 'group', group })
+      void queryClient.invalidateQueries({ queryKey: ['product-groups'] })
+    },
+  })
+
   // Handle add input changes with debounced search
   const handleAddInputChange = useCallback((value: string) => {
     setAddInput(value)
-    setSelectedProduct(null)
+    setSelectedTarget(null)
     setHighlightedIdx(0)
     if (debounceRef.current) clearTimeout(debounceRef.current)
     if (value.trim().length >= 2) {
@@ -172,9 +204,13 @@ function ShoppingListPage() {
     }
   }, [])
 
-  function handleSelectProduct(product: Product) {
-    setSelectedProduct(product)
-    setAddInput(product.name)
+  function handleSelectTarget(suggestion: SuggestionItem) {
+    if (suggestion.kind === 'product') {
+      setSelectedTarget({ kind: 'product', product: suggestion.item })
+    } else {
+      setSelectedTarget({ kind: 'group', group: suggestion.item })
+    }
+    setAddInput(suggestion.item.name)
     setShowSuggestions(false)
   }
 
@@ -183,10 +219,11 @@ function ShoppingListPage() {
     const name = addInput.trim()
     if (!name) return
 
-    const req = {
+    const req: CreateListItemRequest = {
       name,
-      product_id: selectedProduct?.id,
-      unit: selectedProduct?.default_unit ?? undefined,
+      product_id: selectedTarget?.kind === 'product' ? selectedTarget.product.id : undefined,
+      product_group_id: selectedTarget?.kind === 'group' ? selectedTarget.group.id : undefined,
+      unit: selectedTarget?.kind === 'product' ? (selectedTarget.product.default_unit ?? undefined) : undefined,
     }
 
     // Use direct API call + invalidate, since the mutation shape is (listId, data)
@@ -195,7 +232,7 @@ function ShoppingListPage() {
         void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
         void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
         setAddInput('')
-        setSelectedProduct(null)
+        setSelectedTarget(null)
         setShowSuggestions(false)
         addInputRef.current?.focus()
       },
@@ -203,7 +240,7 @@ function ShoppingListPage() {
         // Error — could show a toast
       },
     )
-  }, [listId, addInput, selectedProduct, queryClient])
+  }, [listId, addInput, selectedTarget, queryClient])
 
   function handleAddKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (showSuggestions && suggestions.length > 0) {
@@ -221,7 +258,7 @@ function ShoppingListPage() {
         e.preventDefault()
         const selected = suggestions[highlightedIdx]
         if (selected) {
-          handleSelectProduct(selected)
+          handleSelectTarget(selected)
         }
         return
       }
@@ -382,39 +419,62 @@ function ShoppingListPage() {
               placeholder="Add an item..."
               className="w-full px-3 py-2.5 rounded-xl border border-neutral-200 text-body text-neutral-900 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-brand focus:border-brand transition-colors"
             />
-            {selectedProduct && (
+            {selectedTarget && (
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-small text-success-dark">
-                Linked
+                {selectedTarget.kind === 'group' ? 'Group' : 'Linked'}
               </span>
             )}
 
             {/* Autocomplete suggestions */}
-            {showSuggestions && suggestions.length > 0 && (
+            {showSuggestions && (suggestions.length > 0 || addInput.trim().length >= 2) && (
               <div
                 ref={suggestionsRef}
                 className="absolute z-40 left-0 right-0 top-full mt-1 bg-white border border-neutral-200 rounded-lg shadow-subtle max-h-48 overflow-y-auto"
               >
-                {suggestions.map((product, idx) => (
+                {suggestions.map((suggestion, idx) => (
                   <div
-                    key={product.id}
+                    key={suggestion.item.id}
                     onMouseDown={(e) => {
                       e.preventDefault()
-                      handleSelectProduct(product)
+                      handleSelectTarget(suggestion)
                     }}
                     onMouseEnter={() => setHighlightedIdx(idx)}
                     className={[
-                      'px-3 py-2 text-caption cursor-pointer',
+                      'px-3 py-2 text-caption cursor-pointer flex items-center',
                       idx === highlightedIdx
                         ? 'bg-brand-subtle text-neutral-900'
                         : 'text-neutral-900',
                     ].join(' ')}
                   >
-                    <span className="font-medium">{product.name}</span>
-                    {product.category && (
-                      <span className="ml-2 text-neutral-400">{product.category}</span>
+                    {suggestion.kind === 'product' ? (
+                      <>
+                        <span className="font-medium">{suggestion.item.name}</span>
+                        {suggestion.item.category && (
+                          <span className="ml-2 text-neutral-400">{suggestion.item.category}</span>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <span className="font-medium">{suggestion.item.name}</span>
+                        <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded ml-1">Group</span>
+                      </>
                     )}
                   </div>
                 ))}
+                {addInput.trim().length >= 2 && !suggestions.some(
+                  (s) => s.item.name.toLowerCase() === addInput.trim().toLowerCase()
+                ) && (
+                  <div
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      createGroupMutation.mutate(addInput.trim())
+                      setShowSuggestions(false)
+                    }}
+                    className="px-3 py-2 text-caption cursor-pointer text-blue-700 hover:bg-brand-subtle"
+                  >
+                    + Use &ldquo;{addInput.trim()}&rdquo; as a group
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -578,6 +638,9 @@ function ListItemRow({ item, onToggle, onDelete }: ListItemRowProps) {
             >
               {item.name}
             </span>
+            {item.product_group_id && (
+              <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded ml-1">Group</span>
+            )}
             {qtyUnit && (
               <span className="text-small text-neutral-400 shrink-0">{qtyUnit}</span>
             )}

@@ -33,22 +33,24 @@ type updateListRequest struct {
 }
 
 type createListItemRequest struct {
-	Name      string  `json:"name"`
-	ProductID *string `json:"product_id,omitempty"`
-	Quantity  *string `json:"quantity,omitempty"`
-	Unit      *string `json:"unit,omitempty"`
-	Notes     *string `json:"notes,omitempty"`
+	Name           string  `json:"name"`
+	ProductID      *string `json:"product_id,omitempty"`
+	ProductGroupID *string `json:"product_group_id"`
+	Quantity       *string `json:"quantity,omitempty"`
+	Unit           *string `json:"unit,omitempty"`
+	Notes          *string `json:"notes,omitempty"`
 }
 
 type updateListItemRequest struct {
-	Name      *string `json:"name,omitempty"`
-	ProductID *string `json:"product_id,omitempty"`
-	Quantity  *string `json:"quantity,omitempty"`
-	Unit      *string `json:"unit,omitempty"`
-	Checked   *bool   `json:"checked,omitempty"`
-	CheckedBy *string `json:"checked_by,omitempty"`
-	Notes     *string `json:"notes,omitempty"`
-	SortOrder *int    `json:"sort_order,omitempty"`
+	Name           *string `json:"name,omitempty"`
+	ProductID      *string `json:"product_id,omitempty"`
+	ProductGroupID *string `json:"product_group_id"`
+	Quantity       *string `json:"quantity,omitempty"`
+	Unit           *string `json:"unit,omitempty"`
+	Checked        *bool   `json:"checked,omitempty"`
+	CheckedBy      *string `json:"checked_by,omitempty"`
+	Notes          *string `json:"notes,omitempty"`
+	SortOrder      *int    `json:"sort_order,omitempty"`
 }
 
 type reorderListItemEntry struct {
@@ -97,10 +99,13 @@ type listItemResponse struct {
 	CheckedBy      *string `json:"checked_by,omitempty"`
 	SortOrder      int     `json:"sort_order"`
 	Notes          *string `json:"notes,omitempty"`
-	EstimatedPrice *string `json:"estimated_price,omitempty"`
-	CheapestStore  *string `json:"cheapest_store,omitempty"`
-	CheapestPrice  *string `json:"cheapest_price,omitempty"`
-	CreatedAt      string  `json:"created_at"`
+	EstimatedPrice    *string `json:"estimated_price,omitempty"`
+	CheapestStore     *string `json:"cheapest_store,omitempty"`
+	CheapestPrice     *string `json:"cheapest_price,omitempty"`
+	ProductGroupID    *string `json:"product_group_id,omitempty"`
+	ProductGroupName  *string `json:"product_group_name,omitempty"`
+	CheapestProductID *string `json:"cheapest_product_id,omitempty"`
+	CreatedAt         string  `json:"created_at"`
 }
 
 // RegisterRoutes mounts shopping list endpoints onto the protected group.
@@ -213,16 +218,18 @@ func (h *ListHandler) Get(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// Fetch items with product name and latest price.
+	// Fetch items with product name, group name, and latest price.
 	rows, err := h.DB.Query(
 		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
 		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
 		        sli.sort_order, sli.notes, sli.created_at,
 		        (SELECT pp.unit_price FROM product_prices pp
 		         WHERE pp.product_id = sli.product_id
-		         ORDER BY pp.receipt_date DESC LIMIT 1) AS estimated_price
+		         ORDER BY pp.receipt_date DESC LIMIT 1) AS estimated_price,
+		        sli.product_group_id, pg.name AS product_group_name
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
+		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
 		 WHERE sli.list_id = ?
 		 ORDER BY sli.sort_order, sli.created_at`,
 		listID,
@@ -239,7 +246,8 @@ func (h *ListHandler) Get(c echo.Context) error {
 		var createdAt time.Time
 		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
-			&item.SortOrder, &item.Notes, &createdAt, &estimatedPrice); err != nil {
+			&item.SortOrder, &item.Notes, &createdAt, &estimatedPrice,
+			&item.ProductGroupID, &item.ProductGroupName); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		item.CreatedAt = createdAt.Format(time.RFC3339)
@@ -256,10 +264,16 @@ func (h *ListHandler) Get(c echo.Context) error {
 	// Batch query: find cheapest store for all items with a product_id.
 	productIDs := make([]string, 0)
 	productIDSet := make(map[string]bool)
+	groupIDs := make([]string, 0)
+	groupIDSet := make(map[string]bool)
 	for _, item := range resp.Items {
 		if item.ProductID != nil && !productIDSet[*item.ProductID] {
 			productIDs = append(productIDs, *item.ProductID)
 			productIDSet[*item.ProductID] = true
+		}
+		if item.ProductGroupID != nil && !groupIDSet[*item.ProductGroupID] {
+			groupIDs = append(groupIDs, *item.ProductGroupID)
+			groupIDSet[*item.ProductGroupID] = true
 		}
 	}
 
@@ -314,6 +328,68 @@ func (h *ListHandler) Get(c echo.Context) error {
 					p := fmt.Sprintf("%.2f", info.Price)
 					resp.Items[i].CheapestPrice = &p
 				}
+			}
+		}
+	}
+
+	// Batch query: find cheapest product+store for all items with a product_group_id.
+	type groupPriceInfo struct {
+		CheapestStore     string
+		CheapestPrice     string
+		CheapestProductID string
+	}
+	groupPriceMap := map[string]groupPriceInfo{}
+	if len(groupIDs) > 0 {
+		placeholders := strings.Repeat("?,", len(groupIDs))
+		placeholders = placeholders[:len(placeholders)-1]
+		q2 := fmt.Sprintf(`
+			SELECT sub.product_group_id, sub.product_id, s.name, PRINTF('%%.2f', sub.unit_price)
+			FROM (
+				SELECT p.product_group_id, pp.product_id, pp.store_id, pp.unit_price,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY p.product_group_id
+				           ORDER BY pp.unit_price ASC
+				       ) AS rn
+				FROM product_prices pp
+				JOIN products p ON p.id = pp.product_id
+				WHERE p.product_group_id IN (%s)
+				  AND pp.receipt_date = (
+				      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+				      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+				  )
+			) sub
+			JOIN stores s ON sub.store_id = s.id
+			WHERE sub.rn = 1`, placeholders)
+		args2 := make([]interface{}, len(groupIDs))
+		for i, id := range groupIDs {
+			args2[i] = id
+		}
+		rows2, err := h.DB.QueryContext(c.Request().Context(), q2, args2...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch group prices")
+		}
+		defer rows2.Close()
+		for rows2.Next() {
+			var groupID, productID, storeName, price string
+			if err := rows2.Scan(&groupID, &productID, &storeName, &price); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan group prices")
+			}
+			groupPriceMap[groupID] = groupPriceInfo{
+				CheapestStore:     storeName,
+				CheapestPrice:     price,
+				CheapestProductID: productID,
+			}
+		}
+	}
+
+	// Apply group price info to items.
+	for i, item := range resp.Items {
+		if item.ProductGroupID != nil {
+			if info, ok := groupPriceMap[*item.ProductGroupID]; ok {
+				resp.Items[i].CheapestStore = &info.CheapestStore
+				resp.Items[i].CheapestPrice = &info.CheapestPrice
+				resp.Items[i].CheapestProductID = &info.CheapestProductID
+				resp.Items[i].EstimatedPrice = &info.CheapestPrice
 			}
 		}
 	}
@@ -440,6 +516,21 @@ func (h *ListHandler) AddItem(c echo.Context) error {
 	if req.Name == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
+	if req.ProductID != nil && req.ProductGroupID != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot set both product_id and product_group_id"})
+	}
+
+	// Validate group ownership if set.
+	if req.ProductGroupID != nil {
+		var groupHouseholdID string
+		err := h.DB.QueryRow(`SELECT household_id FROM product_groups WHERE id = ?`, *req.ProductGroupID).Scan(&groupHouseholdID)
+		if err == sql.ErrNoRows || groupHouseholdID != householdID {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid product group"})
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
 
 	quantity := "1"
 	if req.Quantity != nil {
@@ -449,10 +540,10 @@ func (h *ListHandler) AddItem(c echo.Context) error {
 	now := time.Now().UTC()
 	var id string
 	err = h.DB.QueryRow(
-		`INSERT INTO shopping_list_items (id, list_id, product_id, name, quantity, unit, notes, created_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO shopping_list_items (id, list_id, product_id, product_group_id, name, quantity, unit, notes, created_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
-		listID, req.ProductID, req.Name, quantity, req.Unit, req.Notes, now,
+		listID, req.ProductID, req.ProductGroupID, req.Name, quantity, req.Unit, req.Notes, now,
 	).Scan(&id)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -462,15 +553,16 @@ func (h *ListHandler) AddItem(c echo.Context) error {
 	h.DB.Exec("UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID)
 
 	item := listItemResponse{
-		ID:        id,
-		ListID:    listID,
-		ProductID: req.ProductID,
-		Name:      req.Name,
-		Quantity:  quantity,
-		Unit:      req.Unit,
-		Checked:   false,
-		Notes:     req.Notes,
-		CreatedAt: now.Format(time.RFC3339),
+		ID:             id,
+		ListID:         listID,
+		ProductID:      req.ProductID,
+		ProductGroupID: req.ProductGroupID,
+		Name:           req.Name,
+		Quantity:       quantity,
+		Unit:           req.Unit,
+		Checked:        false,
+		Notes:          req.Notes,
+		CreatedAt:      now.Format(time.RFC3339),
 	}
 
 	// Broadcast WebSocket event.
@@ -523,9 +615,20 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 		setClauses = append(setClauses, "name = ?")
 		args = append(args, name)
 	}
+	if req.ProductID != nil && req.ProductGroupID != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot set both product_id and product_group_id"})
+	}
 	if req.ProductID != nil {
 		setClauses = append(setClauses, "product_id = ?")
 		args = append(args, *req.ProductID)
+		// Clear group when setting a specific product.
+		setClauses = append(setClauses, "product_group_id = NULL")
+	}
+	if req.ProductGroupID != nil {
+		setClauses = append(setClauses, "product_group_id = ?")
+		args = append(args, *req.ProductGroupID)
+		// Clear product_id when setting a group.
+		setClauses = append(setClauses, "product_id = NULL")
 	}
 	if req.Quantity != nil {
 		setClauses = append(setClauses, "quantity = ?")
@@ -582,14 +685,17 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 	err = h.DB.QueryRow(
 		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
 		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
-		        sli.sort_order, sli.notes, sli.created_at
+		        sli.sort_order, sli.notes, sli.created_at,
+		        sli.product_group_id, pg.name AS product_group_name
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
+		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
 		 WHERE sli.id = ?`,
 		itemID,
 	).Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 		&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
-		&item.SortOrder, &item.Notes, &createdAt)
+		&item.SortOrder, &item.Notes, &createdAt,
+		&item.ProductGroupID, &item.ProductGroupName)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
