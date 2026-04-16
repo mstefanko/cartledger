@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -13,6 +14,16 @@ import (
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
+
+// DBTX is the minimal interface satisfied by both *sql.DB and *sql.Tx,
+// letting helper functions be called from either a direct DB path or inside
+// a transaction.
+type DBTX interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
 
 // ListHandler holds dependencies for shopping list endpoints.
 type ListHandler struct {
@@ -122,6 +133,7 @@ func (h *ListHandler) RegisterRoutes(protected *echo.Group) {
 	lists.PUT("/:id", h.Update)
 	lists.DELETE("/:id", h.Delete)
 	lists.POST("/:id/items", h.AddItem)
+	lists.POST("/:id/items/bulk", h.BulkAddItems)
 	lists.PUT("/:id/items/:itemId", h.UpdateItem)
 	lists.DELETE("/:id/items/:itemId", h.DeleteItem)
 	lists.PUT("/:id/reorder", h.ReorderItems)
@@ -585,11 +597,91 @@ func (h *ListHandler) Delete(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
+// insertListItem inserts a single shopping list item into listID on behalf of
+// householdID, validating product/group cross-household ownership. It does NOT
+// verify that listID belongs to householdID (the caller is expected to have
+// checked that already), does NOT touch shopping_lists.updated_at, and does
+// NOT broadcast any WebSocket event — those are the caller's responsibility
+// so the same helper can be used inside a transaction for bulk inserts.
+//
+// Validation errors are returned as *echo.HTTPError with 400; unexpected DB
+// errors are returned as plain errors.
+func insertListItem(ctx context.Context, tx DBTX, householdID, listID string, req createListItemRequest) (listItemResponse, error) {
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		return listItemResponse{}, echo.NewHTTPError(http.StatusBadRequest, "name is required")
+	}
+	if req.ProductID != nil && req.ProductGroupID != nil {
+		return listItemResponse{}, echo.NewHTTPError(http.StatusBadRequest, "cannot set both product_id and product_group_id")
+	}
+
+	// Validate product ownership if set.
+	if req.ProductID != nil && *req.ProductID != "" {
+		var one int
+		err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM products WHERE id = ? AND household_id = ?`,
+			*req.ProductID, householdID,
+		).Scan(&one)
+		if err == sql.ErrNoRows {
+			return listItemResponse{}, echo.NewHTTPError(http.StatusBadRequest, "invalid product")
+		}
+		if err != nil {
+			return listItemResponse{}, fmt.Errorf("verify product ownership: %w", err)
+		}
+	}
+
+	// Validate group ownership if set.
+	if req.ProductGroupID != nil && *req.ProductGroupID != "" {
+		var groupHouseholdID string
+		err := tx.QueryRowContext(ctx,
+			`SELECT household_id FROM product_groups WHERE id = ?`,
+			*req.ProductGroupID,
+		).Scan(&groupHouseholdID)
+		if err == sql.ErrNoRows || (err == nil && groupHouseholdID != householdID) {
+			return listItemResponse{}, echo.NewHTTPError(http.StatusBadRequest, "invalid product group")
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return listItemResponse{}, fmt.Errorf("verify product_group ownership: %w", err)
+		}
+	}
+
+	quantity := "1"
+	if req.Quantity != nil {
+		quantity = *req.Quantity
+	}
+
+	now := time.Now().UTC()
+	var id string
+	err := tx.QueryRowContext(ctx,
+		`INSERT INTO shopping_list_items (id, list_id, product_id, product_group_id, name, quantity, unit, notes, created_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?)
+		 RETURNING id`,
+		listID, req.ProductID, req.ProductGroupID, req.Name, quantity, req.Unit, req.Notes, now,
+	).Scan(&id)
+	if err != nil {
+		return listItemResponse{}, fmt.Errorf("insert shopping_list_item: %w", err)
+	}
+
+	return listItemResponse{
+		ID:             id,
+		ListID:         listID,
+		ProductID:      req.ProductID,
+		ProductGroupID: req.ProductGroupID,
+		Name:           req.Name,
+		Quantity:       quantity,
+		Unit:           req.Unit,
+		Checked:        false,
+		Notes:          req.Notes,
+		CreatedAt:      now.Format(time.RFC3339),
+	}, nil
+}
+
 // AddItem adds an item to a shopping list.
 // POST /api/v1/lists/:id/items
 func (h *ListHandler) AddItem(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	listID := c.Param("id")
+	ctx := c.Request().Context()
 
 	// Verify list belongs to household.
 	var exists int
@@ -608,58 +700,18 @@ func (h *ListHandler) AddItem(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
-	}
-	if req.ProductID != nil && req.ProductGroupID != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot set both product_id and product_group_id"})
-	}
 
-	// Validate group ownership if set.
-	if req.ProductGroupID != nil {
-		var groupHouseholdID string
-		err := h.DB.QueryRow(`SELECT household_id FROM product_groups WHERE id = ?`, *req.ProductGroupID).Scan(&groupHouseholdID)
-		if err == sql.ErrNoRows || groupHouseholdID != householdID {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid product group"})
-		}
-		if err != nil && err != sql.ErrNoRows {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
-		}
-	}
-
-	quantity := "1"
-	if req.Quantity != nil {
-		quantity = *req.Quantity
-	}
-
-	now := time.Now().UTC()
-	var id string
-	err = h.DB.QueryRow(
-		`INSERT INTO shopping_list_items (id, list_id, product_id, product_group_id, name, quantity, unit, notes, created_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?)
-		 RETURNING id`,
-		listID, req.ProductID, req.ProductGroupID, req.Name, quantity, req.Unit, req.Notes, now,
-	).Scan(&id)
+	item, err := insertListItem(ctx, h.DB, householdID, listID, req)
 	if err != nil {
+		if he, ok := err.(*echo.HTTPError); ok {
+			return c.JSON(he.Code, map[string]string{"error": fmt.Sprint(he.Message)})
+		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// Touch list updated_at.
+	// Touch list updated_at (best-effort, matches pre-refactor behavior).
+	now := time.Now().UTC()
 	h.DB.Exec("UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID)
-
-	item := listItemResponse{
-		ID:             id,
-		ListID:         listID,
-		ProductID:      req.ProductID,
-		ProductGroupID: req.ProductGroupID,
-		Name:           req.Name,
-		Quantity:       quantity,
-		Unit:           req.Unit,
-		Checked:        false,
-		Notes:          req.Notes,
-		CreatedAt:      now.Format(time.RFC3339),
-	}
 
 	// Broadcast WebSocket event.
 	h.Hub.Broadcast(ws.Message{
@@ -672,6 +724,244 @@ func (h *ListHandler) AddItem(c echo.Context) error {
 	})
 
 	return c.JSON(http.StatusCreated, item)
+}
+
+// --- Bulk add ---
+
+type bulkAddItemsRequest struct {
+	Items []createListItemRequest `json:"items"`
+}
+
+type bulkAddItemsResponse struct {
+	Items []listItemResponse `json:"items"`
+	List  listDetailResponse `json:"list"`
+}
+
+// BulkAddItems adds up to 100 items to a shopping list in a single transaction.
+// POST /api/v1/lists/:id/items/bulk
+func (h *ListHandler) BulkAddItems(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+	ctx := c.Request().Context()
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRowContext(ctx,
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req bulkAddItemsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.Items) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "items is required"})
+	}
+	if len(req.Items) > 100 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot add more than 100 items in one request"})
+	}
+
+	// --- Batch ownership preflight (outside transaction). ---
+	productIDs := make([]string, 0, len(req.Items))
+	productIDSet := make(map[string]bool)
+	groupIDs := make([]string, 0, len(req.Items))
+	groupIDSet := make(map[string]bool)
+	for _, it := range req.Items {
+		if it.ProductID != nil && *it.ProductID != "" && !productIDSet[*it.ProductID] {
+			productIDs = append(productIDs, *it.ProductID)
+			productIDSet[*it.ProductID] = true
+		}
+		if it.ProductGroupID != nil && *it.ProductGroupID != "" && !groupIDSet[*it.ProductGroupID] {
+			groupIDs = append(groupIDs, *it.ProductGroupID)
+			groupIDSet[*it.ProductGroupID] = true
+		}
+	}
+
+	if len(productIDs) > 0 {
+		found, err := selectIDsInHousehold(ctx, h.DB, "products", productIDs, householdID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		missing := missingIDs(productIDs, found)
+		if len(missing) > 0 {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("unknown product_id(s): %s", strings.Join(missing, ",")),
+			})
+		}
+	}
+	if len(groupIDs) > 0 {
+		found, err := selectIDsInHousehold(ctx, h.DB, "product_groups", groupIDs, householdID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		missing := missingIDs(groupIDs, found)
+		if len(missing) > 0 {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("unknown product_group_id(s): %s", strings.Join(missing, ",")),
+			})
+		}
+	}
+
+	// --- Transaction: insert items. ---
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	inserted := make([]listItemResponse, 0, len(req.Items))
+	for i, itemReq := range req.Items {
+		item, err := insertListItem(ctx, tx, householdID, listID, itemReq)
+		if err != nil {
+			if he, ok := err.(*echo.HTTPError); ok {
+				return c.JSON(he.Code, map[string]string{
+					"error": fmt.Sprintf("item %d: %v", i, he.Message),
+				})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		inserted = append(inserted, item)
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, "UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+	committed = true
+
+	// --- Broadcast one event per inserted item (consistent with AddItem). ---
+	for _, item := range inserted {
+		h.Hub.Broadcast(ws.Message{
+			Type:      ws.EventListItemAdded,
+			Household: householdID,
+			Payload: map[string]interface{}{
+				"list_id": listID,
+				"item":    item,
+			},
+		})
+	}
+
+	// --- Build updated list resource (reuses Get's shape). ---
+	listResp, err := h.loadListDetail(ctx, householdID, listID)
+	if err != nil {
+		// Still return the inserted items; the client can refetch the list.
+		return c.JSON(http.StatusCreated, bulkAddItemsResponse{
+			Items: inserted,
+			List:  listDetailResponse{ID: listID, HouseholdID: householdID},
+		})
+	}
+
+	return c.JSON(http.StatusCreated, bulkAddItemsResponse{
+		Items: inserted,
+		List:  listResp,
+	})
+}
+
+// selectIDsInHousehold returns the subset of ids present in the given table
+// that belong to householdID. Table name is a trusted literal — only callers
+// in this package pass it.
+func selectIDsInHousehold(ctx context.Context, db DBTX, table string, ids []string, householdID string) (map[string]bool, error) {
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]interface{}, 0, len(ids)+1)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	args = append(args, householdID)
+	q := fmt.Sprintf("SELECT id FROM %s WHERE id IN (%s) AND household_id = ?", table, placeholders)
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	found := make(map[string]bool, len(ids))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		found[id] = true
+	}
+	return found, rows.Err()
+}
+
+// missingIDs returns the ids not present in the found set, preserving order.
+func missingIDs(ids []string, found map[string]bool) []string {
+	missing := make([]string, 0)
+	for _, id := range ids {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
+// loadListDetail returns a listDetailResponse for listID in householdID. It
+// mirrors the shape returned by Get but without the extensive price JOINs;
+// callers who need prices should re-fetch via GET. This keeps the bulk path
+// fast and avoids duplicating Get's price-enrichment logic.
+func (h *ListHandler) loadListDetail(ctx context.Context, householdID, listID string) (listDetailResponse, error) {
+	var resp listDetailResponse
+	err := h.DB.QueryRowContext(ctx,
+		`SELECT sl.id, sl.household_id, sl.name, sl.created_by, sl.status,
+		        sl.created_at, sl.updated_at, sl.preferred_store_id, s.name
+		 FROM shopping_lists sl
+		 LEFT JOIN stores s ON sl.preferred_store_id = s.id
+		 WHERE sl.id = ? AND sl.household_id = ?`,
+		listID, householdID,
+	).Scan(&resp.ID, &resp.HouseholdID, &resp.Name, &resp.CreatedBy, &resp.Status,
+		&resp.CreatedAt, &resp.UpdatedAt, &resp.PreferredStoreID, &resp.PreferredStoreName)
+	if err != nil {
+		return resp, err
+	}
+
+	rows, err := h.DB.QueryContext(ctx,
+		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
+		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
+		        sli.sort_order, sli.notes, sli.created_at,
+		        sli.product_group_id, pg.name AS product_group_name
+		 FROM shopping_list_items sli
+		 LEFT JOIN products p ON sli.product_id = p.id
+		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
+		 WHERE sli.list_id = ?
+		 ORDER BY sli.sort_order, sli.created_at`,
+		listID,
+	)
+	if err != nil {
+		return resp, err
+	}
+	defer rows.Close()
+
+	resp.Items = make([]listItemResponse, 0)
+	for rows.Next() {
+		var item listItemResponse
+		var createdAt time.Time
+		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
+			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
+			&item.SortOrder, &item.Notes, &createdAt,
+			&item.ProductGroupID, &item.ProductGroupName); err != nil {
+			return resp, err
+		}
+		item.CreatedAt = createdAt.Format(time.RFC3339)
+		resp.Items = append(resp.Items, item)
+	}
+	return resp, rows.Err()
 }
 
 // UpdateItem modifies a shopping list item.
