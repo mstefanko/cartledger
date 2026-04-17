@@ -1036,6 +1036,7 @@ function ShoppingListPage() {
                   onAssignStore={(storeId) =>
                     assignStoreMutation.mutate({ itemId: item.id, storeId })
                   }
+                  preferredStoreId={list.preferred_store_id}
                 />
               ))}
             </div>
@@ -1064,6 +1065,7 @@ function ShoppingListPage() {
               onAssignStore={(storeId) =>
                 assignStoreMutation.mutate({ itemId: item.id, storeId })
               }
+              preferredStoreId={list.preferred_store_id}
             />
           ))}
         </div>
@@ -1202,6 +1204,7 @@ function ShoppingListPage() {
                 onAssignStore={(storeId) =>
                   assignStoreMutation.mutate({ itemId: item.id, storeId })
                 }
+                preferredStoreId={list.preferred_store_id}
               />
             ))}
           </div>
@@ -1323,6 +1326,7 @@ interface ListItemRowProps {
   onToggleSelected: () => void
   stores: Store[]
   onAssignStore: (storeId: string | null) => void
+  preferredStoreId: string | null
 }
 
 function ListItemRow({
@@ -1338,6 +1342,7 @@ function ListItemRow({
   onToggleSelected,
   stores,
   onAssignStore,
+  preferredStoreId,
 }: ListItemRowProps) {
   const [swiping, setSwiping] = useState(false)
   const [swipeX, setSwipeX] = useState(0)
@@ -1569,14 +1574,23 @@ function ListItemRow({
               <span className="text-small text-neutral-400 shrink-0">{qtyLabel}</span>
             )}
           </div>
-          {/* Best-price indicator — always frames as "Best at <store>". Green
-              check when the scoped store IS the cheapest; red alert when a
-              different store is cheaper (not an error — just a nudge). */}
-          {!item.checked && !isCleanView && !multiStoreMode &&
+          {/* Best-price indicator — always frames as "Best at <store>". Icon
+              reflects whether the store the row will be bought at (toolbar
+              "Shop at" in single-store, per-row dropdown in multi-store) is
+              the cheapest known option. Green check = yes; red alert = a
+              different store is cheaper. */}
+          {!item.checked && !isCleanView &&
            item.cheapest_store && item.cheapest_price && (() => {
+            const effectiveStoreId = multiStoreMode
+              ? item.assigned_store_id
+              : preferredStoreId
+            const effectiveStore = stores.find((s) => s.id === effectiveStoreId)
+            const effectiveStoreName = effectiveStore
+              ? effectiveStore.nickname ?? effectiveStore.name
+              : null
             const isBestHere =
-              !item.store_price_store ||
-              item.store_price_store === item.cheapest_store
+              effectiveStoreName !== null &&
+              effectiveStoreName === item.cheapest_store
             return (
               <p
                 className={[
