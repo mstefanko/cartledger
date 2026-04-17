@@ -13,13 +13,14 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/locks"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
 	"github.com/mstefanko/cartledger/web"
 )
 
 // NewRouter creates and configures the Echo router with all middleware and routes.
-func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker) *echo.Echo {
+func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -110,7 +111,7 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	matchingHandler := &MatchingHandler{DB: database, Cfg: cfg}
 	matchingHandler.RegisterRoutes(protected)
 
-	listHandler := &ListHandler{DB: database, Cfg: cfg, Hub: hub}
+	listHandler := &ListHandler{DB: database, Cfg: cfg, Hub: hub, Locks: lockStore}
 	listHandler.RegisterRoutes(protected)
 
 	exportHandler := &ExportHandler{DB: database, Cfg: cfg}

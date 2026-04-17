@@ -13,6 +13,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/llm"
+	"github.com/mstefanko/cartledger/internal/locks"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
@@ -41,6 +42,10 @@ func main() {
 	hub := ws.NewHub()
 	go hub.Run()
 
+	// In-memory per-list edit lock store (single-node only; see internal/locks).
+	lockStore := locks.NewStore(cfg.LockInactivityTTL)
+	defer lockStore.Close()
+
 	// Create LLM client based on configuration.
 	var llmClient llm.Client
 	switch cfg.LLMProvider {
@@ -65,7 +70,7 @@ func main() {
 	receiptWorker := worker.NewReceiptWorker(2, llmClient, matchEngine, database, hub, cfg)
 
 	// Set up Echo with router, middleware, and all routes.
-	e := api.NewRouter(database, cfg, hub, receiptWorker)
+	e := api.NewRouter(database, cfg, hub, receiptWorker, lockStore)
 
 	// Graceful shutdown via signal.NotifyContext.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

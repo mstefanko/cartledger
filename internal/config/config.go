@@ -1,8 +1,10 @@
 package config
 
 import (
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -18,6 +20,10 @@ type Config struct {
 	JWTSecret      string
 	MealieURL      string
 	MealieToken    string
+	// LockInactivityTTL is how long a shopping-list edit lock may be idle
+	// before the sweeper reclaims it. Placeholder default — see
+	// tmp/ux_flows/multi-store-implementation-plan.md §6 Q5.
+	LockInactivityTTL time.Duration
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -34,6 +40,7 @@ func Load() *Config {
 		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-production"),
 		MealieURL:      getEnv("MEALIE_URL", ""),
 		MealieToken:    getEnv("MEALIE_TOKEN", ""),
+		LockInactivityTTL: getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
 	}
 }
 
@@ -47,4 +54,19 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getEnvDuration parses a time.Duration env var (e.g. "60s", "5m") and falls
+// back to the provided default on missing/malformed values.
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Printf("config: invalid %s=%q (%v); using default %s", key, v, err, fallback)
+		return fallback
+	}
+	return d
 }

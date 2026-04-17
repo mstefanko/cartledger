@@ -12,6 +12,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/locks"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -27,9 +28,10 @@ type DBTX interface {
 
 // ListHandler holds dependencies for shopping list endpoints.
 type ListHandler struct {
-	DB  *sql.DB
-	Cfg *config.Config
-	Hub *ws.Hub
+	DB    *sql.DB
+	Cfg   *config.Config
+	Hub   *ws.Hub
+	Locks *locks.Store
 }
 
 // --- Request types ---
@@ -143,6 +145,12 @@ func (h *ListHandler) RegisterRoutes(protected *echo.Group) {
 	lists.PUT("/:id/items/:itemId", h.UpdateItem)
 	lists.DELETE("/:id/items/:itemId", h.DeleteItem)
 	lists.PUT("/:id/reorder", h.ReorderItems)
+
+	// Phase 7: per-list optimistic lock endpoints.
+	lists.POST("/:id/lock", h.AcquireLock)
+	lists.POST("/:id/lock/heartbeat", h.TouchLock)
+	lists.POST("/:id/lock/release", h.ReleaseLock)
+	lists.POST("/:id/lock/takeover", h.TakeOverLock)
 }
 
 // List returns all shopping lists for the authenticated household with item counts.
@@ -559,6 +567,10 @@ func (h *ListHandler) Update(c echo.Context) error {
 		strings.Join(setClauses, ", "),
 	)
 
+	if err := h.requireLock(c, listID); err != nil {
+		return err
+	}
+
 	result, err := h.DB.Exec(query, args...)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -727,6 +739,10 @@ func (h *ListHandler) AddItem(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
+	if err := h.requireLock(c, listID); err != nil {
+		return err
+	}
+
 	var req createListItemRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -786,6 +802,10 @@ func (h *ListHandler) BulkAddItems(c echo.Context) error {
 	}
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := h.requireLock(c, listID); err != nil {
+		return err
 	}
 
 	var req bulkAddItemsRequest
@@ -1036,6 +1056,10 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
+	if err := h.requireLock(c, listID); err != nil {
+		return err
+	}
+
 	var req updateListItemRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -1208,6 +1232,10 @@ func (h *ListHandler) DeleteItem(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
+	if err := h.requireLock(c, listID); err != nil {
+		return err
+	}
+
 	result, err := h.DB.Exec(
 		"DELETE FROM shopping_list_items WHERE id = ? AND list_id = ?",
 		itemID, listID,
@@ -1254,6 +1282,10 @@ func (h *ListHandler) ReorderItems(c echo.Context) error {
 	}
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := h.requireLock(c, listID); err != nil {
+		return err
 	}
 
 	var req reorderListItemsRequest
@@ -1321,6 +1353,10 @@ func (h *ListHandler) BulkUpdateItems(c echo.Context) error {
 	}
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := h.requireLock(c, listID); err != nil {
+		return err
 	}
 
 	var req bulkUpdateItemsRequest

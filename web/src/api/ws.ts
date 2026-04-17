@@ -1,6 +1,12 @@
 import ReconnectingWebSocket from 'reconnecting-websocket'
 import type { QueryClient } from '@tanstack/react-query'
 import { getToken } from './client'
+import { emit as emitLockEvent } from './lockEvents'
+import type {
+  LockAcquiredPayload,
+  LockReleasedPayload,
+  LockTakenOverPayload,
+} from './lockEvents'
 import type { WSMessage } from '@/types'
 
 let socket: ReconnectingWebSocket | null = null
@@ -50,9 +56,13 @@ export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocke
         break
       }
       case 'list.lock.acquired':
+        emitLockEvent('list.lock.acquired', message.payload as LockAcquiredPayload)
+        break
       case 'list.lock.released':
+        emitLockEvent('list.lock.released', message.payload as LockReleasedPayload)
+        break
       case 'list.lock.taken_over':
-        // handled by useListLock hook in Phase 7
+        emitLockEvent('list.lock.taken_over', message.payload as LockTakenOverPayload)
         break
       case 'product.updated':
         void queryClient.invalidateQueries({ queryKey: ['products'] })

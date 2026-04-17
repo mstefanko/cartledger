@@ -115,6 +115,35 @@ export async function reorderItems(
   return put<void>(`/lists/${encodeURIComponent(listId)}/reorder`, data)
 }
 
+// --- Per-list optimistic lock (Phase 7) ---
+
+export interface LockHolder {
+  user_id: string
+  user_name: string
+  household_id?: string
+  last_touched?: string
+}
+
+export interface LockResponse {
+  holder: LockHolder | null
+}
+
+export async function acquireListLock(listId: string): Promise<LockResponse> {
+  return post<LockResponse>(`/lists/${encodeURIComponent(listId)}/lock`)
+}
+
+export async function heartbeatListLock(listId: string): Promise<void> {
+  return post<void>(`/lists/${encodeURIComponent(listId)}/lock/heartbeat`)
+}
+
+export async function releaseListLock(listId: string): Promise<void> {
+  return post<void>(`/lists/${encodeURIComponent(listId)}/lock/release`)
+}
+
+export async function takeOverListLock(listId: string): Promise<LockResponse> {
+  return post<LockResponse>(`/lists/${encodeURIComponent(listId)}/lock/takeover`)
+}
+
 export async function getShareText(id: string, storeId?: string): Promise<string> {
   const token = getToken()
   const qs = storeId ? `?store_id=${encodeURIComponent(storeId)}` : ''

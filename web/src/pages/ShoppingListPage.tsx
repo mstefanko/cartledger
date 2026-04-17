@@ -16,6 +16,9 @@ import { fetchGroups, createGroup } from '@/api/groups'
 import { listStores } from '@/api/stores'
 import { useAuth } from '@/hooks/useAuth'
 import { useListWebSocket } from '@/hooks/useWebSocket'
+import { useListLock } from '@/hooks/useListLock'
+import { on as onLockEvent, off as offLockEvent } from '@/api/lockEvents'
+import { ApiClientError } from '@/api/client'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { StorePicker } from '@/components/lists/StorePicker'
@@ -99,6 +102,72 @@ function ShoppingListPage() {
       setTimeout(() => setRemoteIndicator(false), 2000)
     },
   })
+
+  // Phase 7: per-list edit lock. Silent while we hold it; surfaces a banner
+  // + take-over button when another user is editing.
+  const {
+    state: lockState,
+    takeOver: takeOverLock,
+  } = useListLock(listId ?? '', user?.id ?? '')
+
+  // "Your edit session ended" toast. Fires when someone else takes over.
+  const [lockEndedToast, setLockEndedToast] = useState<string | null>(null)
+  const lockEndedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // "You took over editing" toast — shown after successful takeover.
+  const [tookOverToast, setTookOverToast] = useState<string | null>(null)
+  const tookOverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (!listId || !user?.id) return
+    const handler = (p: { list_id: string; prior_user_id?: string }) => {
+      if (p.list_id !== listId) return
+      if (p.prior_user_id && p.prior_user_id === user.id) {
+        if (lockEndedTimerRef.current) clearTimeout(lockEndedTimerRef.current)
+        setLockEndedToast('Your edit session ended')
+        lockEndedTimerRef.current = setTimeout(() => {
+          setLockEndedToast(null)
+          lockEndedTimerRef.current = null
+        }, 4000)
+      }
+    }
+    onLockEvent('list.lock.taken_over', handler)
+    return () => {
+      offLockEvent('list.lock.taken_over', handler)
+      if (lockEndedTimerRef.current) {
+        clearTimeout(lockEndedTimerRef.current)
+        lockEndedTimerRef.current = null
+      }
+    }
+  }, [listId, user?.id])
+
+  // Surface a toast when a write lands a 409. The banner re-renders
+  // automatically from the WS event that the new holder's acquire broadcast.
+  const handleWriteError = useCallback((err: unknown) => {
+    if (err instanceof ApiClientError && err.status === 409) {
+      if (lockEndedTimerRef.current) clearTimeout(lockEndedTimerRef.current)
+      setLockEndedToast('Someone else started editing — your change was rejected')
+      lockEndedTimerRef.current = setTimeout(() => {
+        setLockEndedToast(null)
+        lockEndedTimerRef.current = null
+      }, 4000)
+    }
+  }, [])
+
+  const handleTakeOver = useCallback(async () => {
+    try {
+      await takeOverLock()
+      if (tookOverTimerRef.current) clearTimeout(tookOverTimerRef.current)
+      setTookOverToast('You took over editing')
+      tookOverTimerRef.current = setTimeout(() => {
+        setTookOverToast(null)
+        tookOverTimerRef.current = null
+      }, 3000)
+    } catch {
+      // swallow — server-side error surfaces via WS event on success or a
+      // visible 409 banner if permissions bounced.
+    }
+  }, [takeOverLock])
 
   // Fetch list detail
   const listQuery = useQuery({
@@ -199,6 +268,9 @@ function ShoppingListPage() {
       void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
       setEditingName(false)
     },
+    onError: (err) => {
+      handleWriteError(err)
+    },
   })
 
   // Update preferred store mutation
@@ -250,11 +322,12 @@ function ShoppingListPage() {
 
       return { previous }
     },
-    onError: (_err, _vars, context) => {
+    onError: (err, _vars, context) => {
       // Rollback on error
       if (context?.previous) {
         queryClient.setQueryData(['shopping-list', listId], context.previous)
       }
+      handleWriteError(err)
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
@@ -269,6 +342,7 @@ function ShoppingListPage() {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
       void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
     },
+    onError: handleWriteError,
   })
 
   // Inline-edit title for unmatched items — commits a new name via PUT.
@@ -278,6 +352,7 @@ function ShoppingListPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
     },
+    onError: handleWriteError,
   })
 
   // Create group and immediately select it
@@ -406,6 +481,7 @@ function ShoppingListPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
     },
+    onError: handleWriteError,
   })
 
   // Push a newly-added item onto the undo toast. Stacks bursts — if the toast
@@ -676,6 +752,30 @@ function ShoppingListPage() {
       {remoteIndicator && (
         <div className="fixed top-4 right-4 z-50 bg-brand-subtle text-brand text-small font-medium px-3 py-2 rounded-lg shadow-subtle animate-pulse">
           List updated by another user
+        </div>
+      )}
+
+      {/* Phase 7: lock banner — visible only when someone else is editing.
+          Silent when we hold the lock per findings §6 Q4. */}
+      {!lockState.isHeldByMe && lockState.holder && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-3 flex items-center justify-between gap-3 bg-brand-subtle border border-brand text-brand text-caption px-3 py-2 rounded-lg"
+        >
+          <span>
+            <span className="font-semibold">
+              {lockState.holder.user_name || 'Someone'}
+            </span>{' '}
+            is editing
+          </span>
+          <Button
+            variant="outlined"
+            size="sm"
+            onClick={() => void handleTakeOver()}
+          >
+            Take over
+          </Button>
         </div>
       )}
 
@@ -1097,6 +1197,28 @@ function ShoppingListPage() {
           >
             Undo
           </button>
+        </div>
+      )}
+
+      {/* Phase 7: "Your edit session ended" toast. */}
+      {lockEndedToast && (
+        <div
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 max-w-md w-[calc(100%-2rem)] flex items-center justify-center bg-neutral-900 text-white text-small font-medium px-3 py-2 rounded-lg shadow-subtle"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="truncate">{lockEndedToast}</span>
+        </div>
+      )}
+
+      {/* Phase 7: "You took over editing" toast. */}
+      {tookOverToast && (
+        <div
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 max-w-md w-[calc(100%-2rem)] flex items-center justify-center bg-brand-subtle text-brand text-small font-medium px-3 py-2 rounded-lg shadow-subtle"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="truncate">{tookOverToast}</span>
         </div>
       )}
 
