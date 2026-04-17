@@ -1,9 +1,10 @@
-import { useRef, useMemo, useCallback, type KeyboardEvent } from 'react'
+import { useRef, useMemo, useCallback, type KeyboardEvent, type ReactNode } from 'react'
 import {
   useReactTable,
   getCoreRowModel,
   getSortedRowModel,
   flexRender,
+  type CellContext,
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table'
@@ -27,6 +28,8 @@ declare module '@tanstack/react-table' {
     getDisplayValue?: (value: TValue) => string
     /** For autocomplete: a function to get a pending suggestion for this row */
     getSuggestedValue?: (rowIndex: number) => { name: string; type: string } | null
+    /** For editable text/number cells: render this node in display (non-editing) mode. */
+    displayRenderer?: (ctx: CellContext<TData, TValue>) => ReactNode
   }
 }
 
@@ -36,6 +39,11 @@ interface EditableTableProps<TData> {
   onCellUpdate: (rowIndex: number, columnId: string, value: string) => void
   getRowClassName?: (row: TData, index: number) => string
   virtualizeRows?: boolean
+  /** If provided, renders a leading checkbox column and emits selection changes. */
+  selection?: Set<string>
+  onSelectionChange?: (next: Set<string>) => void
+  /** Required when `selection` is used — returns the stable row id. */
+  getRowId?: (row: TData) => string
 }
 
 function EditableTable<TData>({
@@ -44,7 +52,48 @@ function EditableTable<TData>({
   onCellUpdate,
   getRowClassName,
   virtualizeRows = true,
+  selection,
+  onSelectionChange,
+  getRowId,
 }: EditableTableProps<TData>) {
+  const selectable = selection !== undefined && onSelectionChange !== undefined && getRowId !== undefined
+
+  const toggleRow = useCallback(
+    (id: string) => {
+      if (!selection || !onSelectionChange) return
+      const next = new Set(selection)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      onSelectionChange(next)
+    },
+    [selection, onSelectionChange],
+  )
+
+  const toggleAll = useCallback(() => {
+    if (!selection || !onSelectionChange || !getRowId) return
+    const allIds = data.map(getRowId)
+    const allSelected = allIds.length > 0 && allIds.every((id) => selection.has(id))
+    if (allSelected) {
+      const next = new Set(selection)
+      allIds.forEach((id) => next.delete(id))
+      onSelectionChange(next)
+    } else {
+      const next = new Set(selection)
+      allIds.forEach((id) => next.add(id))
+      onSelectionChange(next)
+    }
+  }, [data, selection, onSelectionChange, getRowId])
+
+  const allChecked = useMemo(() => {
+    if (!selectable || !selection || !getRowId || data.length === 0) return false
+    return data.every((row) => selection.has(getRowId(row)))
+  }, [data, selection, getRowId, selectable])
+
+  const someChecked = useMemo(() => {
+    if (!selectable || !selection || !getRowId) return false
+    return data.some((row) => selection.has(getRowId(row)))
+  }, [data, selection, getRowId, selectable])
+
   const [sorting, setSorting] = useState<SortingState>([])
   const tableContainerRef = useRef<HTMLDivElement>(null)
 
@@ -125,7 +174,23 @@ function EditableTable<TData>({
     (rowIndex: number, row: (typeof rows)[number]) => {
       const rowData = row.original
       const rowClassName = getRowClassName ? getRowClassName(rowData, rowIndex) : ''
-      return row.getVisibleCells().map((cell, colIndex) => {
+      const rowId = selectable && getRowId ? getRowId(rowData) : null
+      const checkboxTd = selectable && rowId ? (
+        <td
+          key="__select"
+          className={['h-[36px] w-10 px-2 py-1 border-b border-neutral-200 text-center', rowClassName].join(' ')}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <input
+            type="checkbox"
+            checked={selection?.has(rowId) ?? false}
+            onChange={() => toggleRow(rowId)}
+            className="cursor-pointer accent-brand"
+            aria-label="Select row"
+          />
+        </td>
+      ) : null
+      const cells = row.getVisibleCells().map((cell, colIndex) => {
         const meta = cell.column.columnDef.meta
         const isActive = activeCell !== null && activeCell[0] === rowIndex && activeCell[1] === colIndex
         const cellEditing = isActive && isEditing
@@ -165,6 +230,9 @@ function EditableTable<TData>({
         }
 
         if (meta?.editable) {
+          const customDisplay = meta.displayRenderer
+            ? meta.displayRenderer(cell.getContext() as CellContext<TData, unknown>)
+            : undefined
           return (
             <td
               key={cell.id}
@@ -182,6 +250,7 @@ function EditableTable<TData>({
                 onCellUpdate={onCellUpdate}
                 onKeyDown={handleTableKeyDown}
                 onCancelEdit={handleCancelEdit}
+                displayNode={customDisplay}
               />
             </td>
           )
@@ -201,6 +270,7 @@ function EditableTable<TData>({
           </td>
         )
       })
+      return checkboxTd ? [checkboxTd, ...cells] : cells
     },
     [
       activeCell,
@@ -211,6 +281,10 @@ function EditableTable<TData>({
       handleCancelEdit,
       handleTableKeyDown,
       handleCellClick,
+      selectable,
+      selection,
+      getRowId,
+      toggleRow,
     ],
   )
 
@@ -224,6 +298,23 @@ function EditableTable<TData>({
         <thead className="sticky top-0 z-10 bg-white">
           {table.getHeaderGroups().map((headerGroup) => (
             <tr key={headerGroup.id}>
+              {selectable && (
+                <th
+                  className="h-[36px] w-10 px-2 py-1 border-b border-neutral-200 bg-neutral-50 select-none"
+                  style={{ width: 40 }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    ref={(el) => {
+                      if (el) el.indeterminate = !allChecked && someChecked
+                    }}
+                    onChange={toggleAll}
+                    className="cursor-pointer accent-brand"
+                    aria-label="Select all rows"
+                  />
+                </th>
+              )}
               {headerGroup.headers.map((header) => (
                 <th
                   key={header.id}
@@ -253,7 +344,7 @@ function EditableTable<TData>({
             <>
               {virtualRows.length > 0 && (
                 <tr style={{ height: `${virtualRows[0]!.start}px` }}>
-                  <td colSpan={leafColumns.length} />
+                  <td colSpan={leafColumns.length + (selectable ? 1 : 0)} />
                 </tr>
               )}
               {virtualRows.map((virtualRow) => {
@@ -274,7 +365,7 @@ function EditableTable<TData>({
                     height: `${totalSize - (virtualRows[virtualRows.length - 1]!.end)}px`,
                   }}
                 >
-                  <td colSpan={leafColumns.length} />
+                  <td colSpan={leafColumns.length + (selectable ? 1 : 0)} />
                 </tr>
               )}
             </>

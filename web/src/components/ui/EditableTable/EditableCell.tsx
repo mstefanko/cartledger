@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type KeyboardEvent } from 'react'
+import { useState, useRef, useEffect, useCallback, type KeyboardEvent, type ReactNode } from 'react'
 
 interface EditableCellProps {
   value: string
@@ -11,6 +11,8 @@ interface EditableCellProps {
   onCellUpdate: (rowIndex: number, columnId: string, value: string) => void
   onKeyDown: (e: KeyboardEvent) => void
   onCancelEdit: () => void
+  /** Optional custom display content rendered when not editing. Falls back to `value`. */
+  displayNode?: ReactNode
 }
 
 function EditableCell({
@@ -24,6 +26,7 @@ function EditableCell({
   onCellUpdate,
   onKeyDown,
   onCancelEdit,
+  displayNode,
 }: EditableCellProps) {
   const [editValue, setEditValue] = useState(value)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -118,7 +121,7 @@ function EditableCell({
       ].join(' ')}
       title="Click to edit"
     >
-      {value}
+      {displayNode ?? value}
     </div>
   )
 }
