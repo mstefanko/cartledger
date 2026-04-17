@@ -27,6 +27,7 @@ import { AddItemsModal } from '@/components/lists/AddItemsModal'
 import { StoreAssignDropdown } from '@/components/lists/StoreAssignDropdown'
 import { ListTotalsBar } from '@/components/lists/ListTotalsBar'
 import { BatchActionBar } from '@/components/lists/BatchActionBar'
+import { CircleCheck, CircleAlert } from 'lucide-react'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -1568,30 +1569,32 @@ function ListItemRow({
               <span className="text-small text-neutral-400 shrink-0">{qtyLabel}</span>
             )}
           </div>
-          {/* Store price indicator — hidden in clean view and in multi-store mode */}
-          {!item.checked && !isCleanView && !multiStoreMode && (
-            <>
-              {item.store_price && item.store_price_store ? (
-                <>
-                  <p className="text-small text-success-dark mt-0.5">
-                    At {item.store_price_store}{item.unit ? `/${item.unit}` : ''} ${item.store_price}
-                  </p>
-                  {item.cheapest_price && item.cheapest_store &&
-                   item.store_price !== item.cheapest_price && (
-                    <p className="text-small text-neutral-400 mt-0.5">
-                      Best at {item.cheapest_store} ${item.cheapest_price}
-                    </p>
-                  )}
-                </>
-              ) : (
-                item.cheapest_store && item.cheapest_price && (
-                  <p className="text-small text-success-dark mt-0.5">
-                    Best at {item.cheapest_store}{item.unit ? `/${item.unit}` : ''} ${item.cheapest_price}
-                  </p>
-                )
-              )}
-            </>
-          )}
+          {/* Best-price indicator — always frames as "Best at <store>". Green
+              check when the scoped store IS the cheapest; red alert when a
+              different store is cheaper (not an error — just a nudge). */}
+          {!item.checked && !isCleanView && !multiStoreMode &&
+           item.cheapest_store && item.cheapest_price && (() => {
+            const isBestHere =
+              !item.store_price_store ||
+              item.store_price_store === item.cheapest_store
+            return (
+              <p
+                className={[
+                  'text-small mt-0.5 flex items-center gap-1',
+                  isBestHere ? 'text-success-dark' : 'text-neutral-600',
+                ].join(' ')}
+              >
+                {isBestHere ? (
+                  <CircleCheck className="w-3.5 h-3.5 text-success-dark shrink-0" aria-hidden="true" />
+                ) : (
+                  <CircleAlert className="w-3.5 h-3.5 text-red-600 shrink-0" aria-hidden="true" />
+                )}
+                <span className="truncate">
+                  Best at {item.cheapest_store}{item.unit ? `/${item.unit}` : ''} ${item.cheapest_price}
+                </span>
+              </p>
+            )
+          })()}
           {isExpanded && !isCleanView && (
             <ItemPriceDetail item={item} />
           )}
