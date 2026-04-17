@@ -25,9 +25,13 @@ func (h *ExportHandler) RegisterRoutes(protected *echo.Group) {
 
 // ShareList returns a plain-text formatted shopping list for sharing.
 // GET /api/v1/lists/:id/share
+// Optional query param: ?store_id=<id> — scope the output to items assigned
+// to that store. The store is validated against the household. When present,
+// the header becomes "<list name> — <store name> (<N items>)".
 func (h *ExportHandler) ShareList(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	listID := c.Param("id")
+	storeID := c.QueryParam("store_id")
 
 	// Get list name.
 	var listName string
@@ -42,9 +46,24 @@ func (h *ExportHandler) ShareList(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// Get items with estimated prices.
-	rows, err := h.DB.Query(
-		`SELECT sli.name, sli.quantity, sli.unit, sli.checked,
+	// Validate store_id belongs to household (when provided) and fetch its name.
+	var storeName string
+	if storeID != "" {
+		err := h.DB.QueryRow(
+			"SELECT COALESCE(NULLIF(nickname, ''), name) FROM stores WHERE id = ? AND household_id = ?",
+			storeID, householdID,
+		).Scan(&storeName)
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "store not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
+
+	// Get items with estimated prices. When storeID is set, scope to items
+	// assigned to that store.
+	query := `SELECT sli.name, sli.quantity, sli.unit, sli.checked,
 		        COALESCE(
 		          (SELECT pp.unit_price FROM product_prices pp
 		           WHERE pp.product_id = sli.product_id
@@ -57,10 +76,15 @@ func (h *ExportHandler) ShareList(c echo.Context) error {
 		                 WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id))
 		        ) AS estimated_price
 		 FROM shopping_list_items sli
-		 WHERE sli.list_id = ?
-		 ORDER BY sli.sort_order, sli.created_at`,
-		listID,
-	)
+		 WHERE sli.list_id = ?`
+	args := []interface{}{listID}
+	if storeID != "" {
+		query += " AND sli.assigned_store_id = ?"
+		args = append(args, storeID)
+	}
+	query += " ORDER BY sli.sort_order, sli.created_at"
+
+	rows, err := h.DB.Query(query, args...)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -69,6 +93,7 @@ func (h *ExportHandler) ShareList(c echo.Context) error {
 	var lines []string
 	var totalEstimate float64
 	hasEstimate := false
+	itemCount := 0
 
 	for rows.Next() {
 		var name, quantity string
@@ -105,15 +130,23 @@ func (h *ExportHandler) ShareList(c echo.Context) error {
 		}
 
 		lines = append(lines, fmt.Sprintf("%s %s%s%s", checkbox, name, qtyStr, priceStr))
+		itemCount++
 	}
 	if err := rows.Err(); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// Build header.
-	header := listName
+	// Build header. When a store filter is applied, prefix the list name with
+	// the store name and include item count. The estimate suffix is preserved
+	// in both modes.
+	var header string
+	if storeID != "" {
+		header = fmt.Sprintf("%s \u2014 %s (%d items)", listName, storeName, itemCount)
+	} else {
+		header = listName
+	}
 	if hasEstimate {
-		header = fmt.Sprintf("%s \u2014 Est. $%.2f", listName, totalEstimate)
+		header = fmt.Sprintf("%s \u2014 Est. $%.2f", header, totalEstimate)
 	}
 
 	var sb strings.Builder

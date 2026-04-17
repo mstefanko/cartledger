@@ -9,6 +9,7 @@ import {
   deleteItem,
   bulkUpdateItems,
   bulkDeleteItems,
+  getShareText,
 } from '@/api/lists'
 import { listProducts } from '@/api/products'
 import { fetchGroups, createGroup } from '@/api/groups'
@@ -17,7 +18,6 @@ import { useAuth } from '@/hooks/useAuth'
 import { useListWebSocket } from '@/hooks/useWebSocket'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
-import { ShareListModal } from '@/components/lists/ShareListModal'
 import { StorePicker } from '@/components/lists/StorePicker'
 import { ItemPriceDetail } from '@/components/lists/ItemPriceDetail'
 import { AddItemsModal } from '@/components/lists/AddItemsModal'
@@ -44,9 +44,14 @@ function ShoppingListPage() {
 
   const [editingName, setEditingName] = useState(false)
   const [nameValue, setNameValue] = useState('')
-  const [showShare, setShowShare] = useState(false)
   const [showAddItems, setShowAddItems] = useState(false)
   const [remoteIndicator, setRemoteIndicator] = useState(false)
+  const [copyMenuOpen, setCopyMenuOpen] = useState(false)
+  const copyMenuRef = useRef<HTMLDivElement>(null)
+
+  // Copy-feedback toast — mirrors the recentlyAdded/recentlyDeleted pattern.
+  const [recentlyCopied, setRecentlyCopied] = useState<{ label: string } | null>(null)
+  const recentlyCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Undo toast state — stacks bursts of adds into a single toast.
   const [recentlyAdded, setRecentlyAdded] = useState<{
@@ -305,8 +310,49 @@ function ShoppingListPage() {
       if (debounceRef.current) clearTimeout(debounceRef.current)
       if (recentlyAddedTimerRef.current) clearTimeout(recentlyAddedTimerRef.current)
       if (recentlyDeletedTimerRef.current) clearTimeout(recentlyDeletedTimerRef.current)
+      if (recentlyCopiedTimerRef.current) clearTimeout(recentlyCopiedTimerRef.current)
     }
   }, [])
+
+  // Close the copy menu on outside-click. Guard on `copyMenuOpen` so we only
+  // attach the listener while the menu is actually visible.
+  useEffect(() => {
+    if (!copyMenuOpen) return
+    const handler = (e: MouseEvent) => {
+      if (copyMenuRef.current && !copyMenuRef.current.contains(e.target as Node)) {
+        setCopyMenuOpen(false)
+      }
+    }
+    document.addEventListener('click', handler)
+    return () => document.removeEventListener('click', handler)
+  }, [copyMenuOpen])
+
+  // Copy share text for the list (optionally scoped to a store) into the
+  // clipboard and surface a toast on success/failure. Matches the
+  // recentlyAdded/recentlyDeleted toast convention.
+  const showCopyToast = useCallback((label: string) => {
+    if (recentlyCopiedTimerRef.current) clearTimeout(recentlyCopiedTimerRef.current)
+    setRecentlyCopied({ label })
+    recentlyCopiedTimerRef.current = setTimeout(() => {
+      setRecentlyCopied(null)
+      recentlyCopiedTimerRef.current = null
+    }, 3500)
+  }, [])
+
+  const handleCopy = useCallback(
+    async (storeId: string | undefined, successLabel: string) => {
+      if (!listId) return
+      setCopyMenuOpen(false)
+      try {
+        const text = await getShareText(listId, storeId)
+        await navigator.clipboard.writeText(text)
+        showCopyToast(`Copied ${successLabel} to clipboard`)
+      } catch {
+        showCopyToast('Failed to copy — check browser permissions')
+      }
+    },
+    [listId, showCopyToast],
+  )
 
   // Auto-engage multi-store mode when the list has >1 distinct assigned stores.
   // Only fires when mode is its default `false` AND we haven't auto-engaged
@@ -714,9 +760,74 @@ function ShoppingListPage() {
             </svg>
             <span className="hidden sm:inline">Multi-store</span>
           </Button>
-          <Button variant="subtle" size="sm" onClick={() => setShowShare(true)}>
-            Share
-          </Button>
+          {multiStoreMode ? (
+            <div className="relative" ref={copyMenuRef}>
+              <Button
+                variant="subtle"
+                size="sm"
+                onClick={(e: React.MouseEvent) => {
+                  e.stopPropagation()
+                  setCopyMenuOpen((prev) => !prev)
+                }}
+                aria-haspopup="menu"
+                aria-expanded={copyMenuOpen}
+              >
+                Copy
+                <svg
+                  className="w-3 h-3 ml-1"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  strokeWidth={2}
+                  aria-hidden="true"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                </svg>
+              </Button>
+              {copyMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full mt-1 z-40 min-w-[200px] bg-white border border-neutral-200 rounded-lg shadow-subtle overflow-hidden"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      void handleCopy(undefined, `"${list.name}"`)
+                    }}
+                    className="w-full px-3 py-2 text-left text-caption text-neutral-900 hover:bg-brand-subtle focus:outline-none focus:bg-brand-subtle"
+                  >
+                    Copy entire list
+                  </button>
+                  {groupedItems
+                    .filter((g) => g.storeId !== null && g.items.length > 0)
+                    .map((g) => (
+                      <button
+                        key={g.storeId}
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          void handleCopy(g.storeId ?? undefined, `${g.storeName} list`)
+                        }}
+                        className="w-full px-3 py-2 text-left text-caption text-neutral-900 hover:bg-brand-subtle focus:outline-none focus:bg-brand-subtle border-t border-neutral-100"
+                      >
+                        Copy {g.storeName} ({g.items.length})
+                      </button>
+                    ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={() => {
+                void handleCopy(undefined, `"${list.name}"`)
+              }}
+            >
+              Copy
+            </Button>
+          )}
           <Button variant="secondary" size="sm" onClick={() => navigate('/lists')}>
             Back
           </Button>
@@ -989,13 +1100,18 @@ function ShoppingListPage() {
         </div>
       )}
 
-      {/* Share Modal */}
-      <ShareListModal
-        open={showShare}
-        onClose={() => setShowShare(false)}
-        listId={listId}
-        listName={list.name}
-      />
+      {/* Copy-feedback toast — matches recentlyDeleted positioning so it
+          anchors above the sticky ListTotalsBar/BatchActionBar when in
+          multi-store mode. */}
+      {recentlyCopied && (
+        <div
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 max-w-md w-[calc(100%-2rem)] flex items-center justify-center bg-neutral-900 text-white text-small font-medium px-3 py-2 rounded-lg shadow-subtle"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="truncate">{recentlyCopied.label}</span>
+        </div>
+      )}
 
       {/* Bulk Add Items Modal */}
       <AddItemsModal

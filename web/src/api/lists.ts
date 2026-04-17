@@ -115,10 +115,11 @@ export async function reorderItems(
   return put<void>(`/lists/${encodeURIComponent(listId)}/reorder`, data)
 }
 
-export async function getShareText(id: string): Promise<string> {
+export async function getShareText(id: string, storeId?: string): Promise<string> {
   const token = getToken()
+  const qs = storeId ? `?store_id=${encodeURIComponent(storeId)}` : ''
   const response = await fetch(
-    `${window.location.origin}/api/v1/lists/${encodeURIComponent(id)}/share`,
+    `${window.location.origin}/api/v1/lists/${encodeURIComponent(id)}/share${qs}`,
     {
       method: 'GET',
       headers: {
