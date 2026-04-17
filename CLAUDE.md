@@ -13,7 +13,7 @@ internal/
   api/router.go            All route registration + middleware (CORS, auth, rate-limit)
   auth/                    JWT (householdID + userID in claims)
   config/config.go         All env vars loaded here — single source of truth
-  db/                      SQLite via database/sql, migrations in db/migrations/ (currently 007)
+  db/                      SQLite via database/sql, migrations in db/migrations/ (numbered sequentially — `ls` to find next slot)
   imaging/preprocess.go    Receipt image preprocessing (contrast, crop, resize)
   llm/                     LLM abstraction: Client interface in client.go, types in types.go
     claude.go              Claude API client — uses tool_use for structured extraction
