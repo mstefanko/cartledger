@@ -65,18 +65,24 @@ export function ItemPriceDetail({ item }: ItemPriceDetailProps) {
     return <div className="py-2 text-xs text-neutral-400">Loading prices...</div>
   }
 
-  if (!trend || sparklineData.length < 2) {
+  if (!trend || sparklineData.length === 0) {
     return <div className="py-2 text-xs text-neutral-400">No price history available.</div>
   }
 
   return (
     <div className="mt-2 space-y-2">
       <div className="flex items-center gap-3">
-        <span className="text-xs text-neutral-400">90d trend</span>
-        <Sparkline data={sparklineData} width={100} height={28} />
-        <span className="text-xs text-neutral-400">
-          avg ${trend.avg_price.toFixed(2)}
-        </span>
+        {sparklineData.length >= 2 ? (
+          <>
+            <span className="text-xs text-neutral-400">90d trend</span>
+            <Sparkline data={sparklineData} width={100} height={28} />
+            <span className="text-xs text-neutral-400">
+              avg ${trend.avg_price.toFixed(2)}
+            </span>
+          </>
+        ) : (
+          <span className="text-xs text-neutral-400">Only 1 observation so far</span>
+        )}
       </div>
       {storeData.length > 0 && (
         <ResponsiveContainer width="100%" height={Math.min(storeData.length * 22 + 10, 100)}>
