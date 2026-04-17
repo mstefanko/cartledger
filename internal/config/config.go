@@ -20,6 +20,11 @@ type Config struct {
 	JWTSecret      string
 	MealieURL      string
 	MealieToken    string
+	// AllowPrivateIntegrations, when true, permits integration base_urls that
+	// resolve to loopback / link-local / RFC1918 / IPv6 ULA addresses. Default
+	// is false to prevent SSRF probes of internal services; self-hosted users
+	// on a LAN can opt in to reach e.g. http://192.168.x.x:9000.
+	AllowPrivateIntegrations bool
 	// LockInactivityTTL is how long a shopping-list edit lock may be idle
 	// before the sweeper reclaims it. Placeholder default — see
 	// tmp/ux_flows/multi-store-implementation-plan.md §6 Q5.
@@ -40,6 +45,7 @@ func Load() *Config {
 		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-production"),
 		MealieURL:      getEnv("MEALIE_URL", ""),
 		MealieToken:    getEnv("MEALIE_TOKEN", ""),
+		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
 		LockInactivityTTL: getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
 	}
 }
@@ -53,6 +59,23 @@ func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
+	return fallback
+}
+
+// getEnvBool parses a boolean env var. Accepts "1", "true", "yes", "on"
+// (case-insensitive) as true; anything else (including empty) returns fallback.
+func getEnvBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "TRUE", "True", "yes", "YES", "Yes", "on", "ON", "On":
+		return true
+	case "0", "false", "FALSE", "False", "no", "NO", "No", "off", "OFF", "Off":
+		return false
+	}
+	log.Printf("config: invalid %s=%q; using default %v", key, v, fallback)
 	return fallback
 }
 

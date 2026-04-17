@@ -120,6 +120,9 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	importHandler := &ImportHandler{DB: database, Cfg: cfg}
 	importHandler.RegisterRoutes(protected)
 
+	integrationHandler := NewIntegrationHandler(database, cfg)
+	integrationHandler.RegisterRoutes(protected)
+
 	conversionHandler := &ConversionHandler{DB: database, Cfg: cfg}
 	conversionHandler.RegisterRoutes(protected)
 
