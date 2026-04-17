@@ -76,6 +76,21 @@ export async function bulkUpdateItems(
   )
 }
 
+export interface BulkDeleteItemsResponse {
+  list_id: string
+  item_ids: string[]
+}
+
+export async function bulkDeleteItems(
+  listId: string,
+  itemIds: string[],
+): Promise<BulkDeleteItemsResponse> {
+  return del<BulkDeleteItemsResponse>(
+    `/lists/${encodeURIComponent(listId)}/items/bulk`,
+    { item_ids: itemIds },
+  )
+}
+
 export async function updateItem(
   listId: string,
   itemId: string,

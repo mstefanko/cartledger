@@ -619,3 +619,78 @@ func TestBulkUpdate_UnknownList(t *testing.T) {
 		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// callBulkDelete invokes BulkDeleteItems on the given list as the given household and returns the recorder.
+func callBulkDelete(t *testing.T, h *ListHandler, householdID, listID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/lists/"+listID+"/items/bulk", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set(auth.ContextKeyHouseholdID, householdID)
+	c.SetParamNames("id")
+	c.SetParamValues(listID)
+	if err := h.BulkDeleteItems(c); err != nil {
+		t.Fatalf("BulkDeleteItems err: %v", err)
+	}
+	return rec
+}
+
+// TestBulkDelete_HappyPath seeds 3 items, deletes 2, verifies 1 remains.
+func TestBulkDelete_HappyPath(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	item1 := seedListItem(t, h, listID, "A")
+	item2 := seedListItem(t, h, listID, "B")
+	_ = seedListItem(t, h, listID, "C")
+
+	body := `{"item_ids":["` + item1 + `","` + item2 + `"]}`
+	rec := callBulkDelete(t, h, hh, listID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if countItems(t, h, listID) != 1 {
+		t.Errorf("expected 1 item remaining, got %d", countItems(t, h, listID))
+	}
+}
+
+// TestBulkDelete_UnknownItemID rejects with 400 and deletes nothing.
+func TestBulkDelete_UnknownItemID(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	item1 := seedListItem(t, h, listID, "A")
+
+	body := `{"item_ids":["` + item1 + `","nonexistent"]}`
+	rec := callBulkDelete(t, h, hh, listID, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// Verify nothing was deleted (transaction rollback / pre-validation).
+	if countItems(t, h, listID) != 1 {
+		t.Errorf("expected 1 row to remain, got %d", countItems(t, h, listID))
+	}
+}
+
+// TestBulkDelete_UnknownList returns 404.
+func TestBulkDelete_UnknownList(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh1 := seedHousehold(t, h, "HH1")
+	hh2 := seedHousehold(t, h, "HH2")
+	// List belongs to hh2.
+	listID := seedList(t, h, hh2, "Other")
+
+	body := `{"item_ids":["any"]}`
+	rec := callBulkDelete(t, h, hh1, listID, body)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

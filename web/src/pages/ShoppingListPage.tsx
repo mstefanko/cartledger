@@ -1,7 +1,15 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { useParams, useNavigate, Link, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getList, updateList, updateItem, addItem, deleteItem } from '@/api/lists'
+import {
+  getList,
+  updateList,
+  updateItem,
+  addItem,
+  deleteItem,
+  bulkUpdateItems,
+  bulkDeleteItems,
+} from '@/api/lists'
 import { listProducts } from '@/api/products'
 import { fetchGroups, createGroup } from '@/api/groups'
 import { listStores } from '@/api/stores'
@@ -15,6 +23,7 @@ import { ItemPriceDetail } from '@/components/lists/ItemPriceDetail'
 import { AddItemsModal } from '@/components/lists/AddItemsModal'
 import { StoreAssignDropdown } from '@/components/lists/StoreAssignDropdown'
 import { ListTotalsBar } from '@/components/lists/ListTotalsBar'
+import { BatchActionBar } from '@/components/lists/BatchActionBar'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -45,6 +54,14 @@ function ShoppingListPage() {
     label: string
   } | null>(null)
   const recentlyAddedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Separate "batch-deleted" toast. Holds the full snapshot of each deleted
+  // item so Undo can replay them via the existing addItem mutation.
+  const [recentlyDeleted, setRecentlyDeleted] = useState<{
+    items: ListItemWithPrice[]
+    label: string
+  } | null>(null)
+  const recentlyDeletedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Multi-store mode — toggled by header button or auto-engaged when the
   // fetched list already has items assigned to >1 distinct stores.
@@ -287,6 +304,7 @@ function ShoppingListPage() {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current)
       if (recentlyAddedTimerRef.current) clearTimeout(recentlyAddedTimerRef.current)
+      if (recentlyDeletedTimerRef.current) clearTimeout(recentlyDeletedTimerRef.current)
     }
   }, [])
 
@@ -375,6 +393,94 @@ function ShoppingListPage() {
       void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
     })
   }, [listId, recentlyAdded, queryClient])
+
+  // --- Batch action handlers (Phase 5) ---
+
+  // Apply assigned_store_id to every selected item via the bulk endpoint.
+  // storeId === null clears (server treats "" as NULL). On success, clear
+  // selection so the BatchActionBar dismisses and ListTotalsBar returns.
+  const handleBatchAssignStore = useCallback(
+    (storeId: string | null) => {
+      if (!listId || selectedItemIds.size === 0) return
+      const ids = [...selectedItemIds]
+      bulkUpdateItems(listId, {
+        item_ids: ids,
+        patch: { assigned_store_id: storeId ?? '' },
+      }).then(
+        () => {
+          void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+          void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+          setSelectedItemIds(new Set())
+        },
+        () => {
+          // Error — leave selection in place so user can retry.
+        },
+      )
+    },
+    [listId, selectedItemIds, queryClient],
+  )
+
+  // Snapshot selected items, call bulk-delete, then show an undo toast with
+  // enough data to reconstruct via the existing addItem mutation.
+  const handleBatchDelete = useCallback(() => {
+    if (!listId || !list || selectedItemIds.size === 0) return
+    const ids = [...selectedItemIds]
+    const snapshot = list.items.filter((it) => selectedItemIds.has(it.id))
+
+    bulkDeleteItems(listId, ids).then(
+      () => {
+        void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+        void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+        setSelectedItemIds(new Set())
+
+        // Show the batch-undo toast.
+        if (recentlyDeletedTimerRef.current) clearTimeout(recentlyDeletedTimerRef.current)
+        const only = snapshot[0]
+        const label = snapshot.length === 1 && only
+          ? `Deleted "${only.name}"`
+          : `${snapshot.length} items deleted`
+        setRecentlyDeleted({ items: snapshot, label })
+        recentlyDeletedTimerRef.current = setTimeout(() => {
+          setRecentlyDeleted(null)
+          recentlyDeletedTimerRef.current = null
+        }, 6000)
+      },
+      () => {
+        // Error — leave selection in place so user can retry.
+      },
+    )
+  }, [listId, list, selectedItemIds, queryClient])
+
+  const handleBatchCancel = useCallback(() => {
+    setSelectedItemIds(new Set())
+  }, [])
+
+  // Undo batch-delete — replay each snapshot item via the existing addItem
+  // path. Findings §2.4 accepts N parallel POSTs at expected list sizes.
+  const handleUndoRecentDelete = useCallback(() => {
+    if (!listId || !recentlyDeleted) return
+    const items = recentlyDeleted.items
+    if (recentlyDeletedTimerRef.current) {
+      clearTimeout(recentlyDeletedTimerRef.current)
+      recentlyDeletedTimerRef.current = null
+    }
+    setRecentlyDeleted(null)
+    Promise.allSettled(
+      items.map((it) =>
+        addItem(listId, {
+          name: it.name,
+          quantity: it.quantity,
+          unit: it.unit ?? undefined,
+          product_id: it.product_id ?? undefined,
+          product_group_id: it.product_group_id ?? undefined,
+          assigned_store_id: it.assigned_store_id ?? undefined,
+        }),
+      ),
+    ).then(() => {
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+      void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+    })
+  }, [listId, recentlyDeleted, queryClient])
 
   // addItemDirect accepts an explicit target so click/Enter-on-suggestion can
   // commit without racing setState. Called with no args, uses the current
@@ -845,14 +951,42 @@ function ShoppingListPage() {
         </div>
       )}
 
-      {/* Sticky grand-total bar — multi-store mode only. Phase 5 will render
-          <BatchActionBar> in the same slot when rows are selected. */}
-      {multiStoreMode && (
+      {/* Sticky footer — multi-store mode only.
+          When rows are selected, BatchActionBar preempts ListTotalsBar in the
+          same sticky slot (Phase 5). */}
+      {multiStoreMode && selectedItemIds.size > 0 && (
+        <BatchActionBar
+          count={selectedItemIds.size}
+          stores={storesQuery.data ?? []}
+          onAssignStore={handleBatchAssignStore}
+          onDelete={handleBatchDelete}
+          onCancel={handleBatchCancel}
+        />
+      )}
+      {multiStoreMode && selectedItemIds.size === 0 && (
         <ListTotalsBar
           itemCount={uncheckedItems.length}
           grandTotal={estimatedTotal}
-          hidden={selectedItemIds.size > 0}
         />
+      )}
+
+      {/* Batch-delete undo toast — separate from the add-toast so the two can
+          coexist; 6s timer per Phase 5 spec. */}
+      {recentlyDeleted && (
+        <div
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 max-w-md w-[calc(100%-2rem)] flex items-center justify-between bg-neutral-900 text-white text-small font-medium px-3 py-2 rounded-lg shadow-subtle"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="truncate">{recentlyDeleted.label}</span>
+          <button
+            type="button"
+            onClick={handleUndoRecentDelete}
+            className="ml-3 shrink-0 font-semibold underline hover:no-underline focus:outline-none focus-visible:ring-2 focus-visible:ring-white rounded"
+          >
+            Undo
+          </button>
+        </div>
       )}
 
       {/* Share Modal */}

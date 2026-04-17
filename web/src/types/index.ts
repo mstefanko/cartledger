@@ -635,6 +635,11 @@ export interface WSListItemsBulkUpdated {
   payload: { list_id: string; item_ids: string[] }
 }
 
+export interface WSListItemsBulkRemoved {
+  type: 'list.items.bulk_removed'
+  payload: { list_id: string; item_ids: string[] }
+}
+
 export interface WSListLockAcquired {
   type: 'list.lock.acquired'
   payload: { list_id: string; user_id: string; user_name: string }

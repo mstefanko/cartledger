@@ -40,7 +40,8 @@ export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocke
       case 'list.item.updated':
         void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
         break
-      case 'list.items.bulk_updated': {
+      case 'list.items.bulk_updated':
+      case 'list.items.bulk_removed': {
         const payload = (message.payload ?? {}) as { list_id?: string }
         if (payload.list_id) {
           void queryClient.invalidateQueries({ queryKey: ['shopping-list', payload.list_id] })

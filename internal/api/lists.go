@@ -139,6 +139,7 @@ func (h *ListHandler) RegisterRoutes(protected *echo.Group) {
 	lists.POST("/:id/items", h.AddItem)
 	lists.POST("/:id/items/bulk", h.BulkAddItems)
 	lists.PATCH("/:id/items/bulk", h.BulkUpdateItems)
+	lists.DELETE("/:id/items/bulk", h.BulkDeleteItems)
 	lists.PUT("/:id/items/:itemId", h.UpdateItem)
 	lists.DELETE("/:id/items/:itemId", h.DeleteItem)
 	lists.PUT("/:id/reorder", h.ReorderItems)
@@ -1465,6 +1466,134 @@ func (h *ListHandler) BulkUpdateItems(c echo.Context) error {
 	// Broadcast one WS message so subscribers refetch the list detail.
 	h.Hub.Broadcast(ws.Message{
 		Type:      ws.EventListItemsBulkUpdated,
+		Household: householdID,
+		Payload: map[string]interface{}{
+			"list_id":  listID,
+			"item_ids": req.ItemIDs,
+		},
+	})
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"list_id":  listID,
+		"item_ids": req.ItemIDs,
+	})
+}
+
+// --- Bulk delete ---
+
+// bulkDeleteItemsRequest is the request body for DELETE /lists/:id/items/bulk.
+type bulkDeleteItemsRequest struct {
+	ItemIDs []string `json:"item_ids"`
+}
+
+// BulkDeleteItems removes multiple list items in a single transaction and
+// broadcasts one WS event after commit. Mirrors the validation and
+// transaction pattern of BulkUpdateItems.
+//
+// DELETE /api/v1/lists/:id/items/bulk
+func (h *ListHandler) BulkDeleteItems(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+	ctx := c.Request().Context()
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRowContext(ctx,
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req bulkDeleteItemsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.ItemIDs) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "item_ids is required"})
+	}
+	if len(req.ItemIDs) > 500 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot delete more than 500 items in one request"})
+	}
+
+	// Validate every item_id belongs to the list.
+	placeholders := strings.Repeat("?,", len(req.ItemIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	validateArgs := make([]interface{}, 0, len(req.ItemIDs)+1)
+	for _, id := range req.ItemIDs {
+		validateArgs = append(validateArgs, id)
+	}
+	validateArgs = append(validateArgs, listID)
+
+	rows, err := h.DB.QueryContext(ctx,
+		fmt.Sprintf("SELECT id FROM shopping_list_items WHERE id IN (%s) AND list_id = ?", placeholders),
+		validateArgs...,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer rows.Close()
+	foundItems := make(map[string]bool, len(req.ItemIDs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		foundItems[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	missing := missingIDs(req.ItemIDs, foundItems)
+	if len(missing) > 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("unknown item_id(s): %s", strings.Join(missing, ",")),
+		})
+	}
+
+	// --- Transaction: delete every item in one statement. ---
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	deleteArgs := make([]interface{}, 0, len(req.ItemIDs)+1)
+	for _, id := range req.ItemIDs {
+		deleteArgs = append(deleteArgs, id)
+	}
+	deleteArgs = append(deleteArgs, listID)
+
+	query := fmt.Sprintf(
+		"DELETE FROM shopping_list_items WHERE id IN (%s) AND list_id = ?",
+		placeholders,
+	)
+	if _, err := tx.ExecContext(ctx, query, deleteArgs...); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, "UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+	committed = true
+
+	// Broadcast one WS message so subscribers refetch the list detail.
+	h.Hub.Broadcast(ws.Message{
+		Type:      ws.EventListItemsBulkRemoved,
 		Household: householdID,
 		Payload: map[string]interface{}{
 			"list_id":  listID,

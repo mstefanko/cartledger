@@ -7,6 +7,7 @@ const (
 	EventListItemRemoved      = "list.item.removed"
 	EventListItemUpdated      = "list.item.updated"
 	EventListItemsBulkUpdated = "list.items.bulk_updated"
+	EventListItemsBulkRemoved = "list.items.bulk_removed"
 	EventListLockAcquired     = "list.lock.acquired"
 	EventListLockReleased     = "list.lock.released"
 	EventListLockTakenOver    = "list.lock.taken_over"
