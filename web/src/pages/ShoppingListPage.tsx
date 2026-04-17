@@ -278,13 +278,26 @@ function ShoppingListPage() {
     },
   })
 
-  // Update preferred store mutation
-  const updateStoreMutation = useMutation({
-    mutationFn: (storeId: string | null) =>
-      updateList(listId!, { preferred_store_id: storeId ?? '' }),
+  // Single-store "Shop at:" handler. In single-store mode every item has
+  // assigned_store_id === preferred_store_id — so picking a new store from the
+  // toolbar must patch BOTH the list's preferred_store_id AND every item's
+  // assigned_store_id. Also used by the Multi→Single auto-heal path.
+  const shopAtMutation = useMutation({
+    mutationFn: async (storeId: string) => {
+      await updateList(listId!, { preferred_store_id: storeId })
+      const allItemIds = (listQuery.data?.items ?? []).map((i) => i.id)
+      if (allItemIds.length > 0) {
+        await bulkUpdateItems(listId!, {
+          item_ids: allItemIds,
+          patch: { assigned_store_id: storeId },
+        })
+      }
+    },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+      void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
     },
+    onError: handleWriteError,
   })
 
   // Toggle check mutation with optimistic update
@@ -450,17 +463,51 @@ function ShoppingListPage() {
     }
   }, [list, multiStoreMode])
 
+  // Invariant check: in single-store mode every item must have
+  // assigned_store_id === preferred_store_id. If drifted (manual API usage,
+  // legacy data), log a warning but do NOT auto-heal silently — the next
+  // toolbar change or mode toggle will fix it.
+  useEffect(() => {
+    if (!list || multiStoreMode) return
+    const preferred = list.preferred_store_id
+    if (!preferred) return
+    const drifted = list.items.some(
+      (it) => (it.assigned_store_id ?? null) !== preferred,
+    )
+    if (drifted) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[ShoppingListPage] Single-store invariant violation: items have assigned_store_id that differs from list.preferred_store_id. Next toolbar change or mode toggle will heal.',
+      )
+    }
+  }, [list, multiStoreMode])
+
   // Toggle the mode button. Clears selection + any per-row expanded state so
   // the row tree re-renders cleanly in the new mode (no stale chevron/detail
   // pane left open). Latches hasAutoEngaged so we don't bounce back on the
   // next list refresh.
+  //
+  // Multi→Single is DESTRUCTIVE: auto-heals the single-store invariant by
+  // bulk-assigning every item to the first store alphabetically (product
+  // owner explicitly OK'd this).
   const toggleMultiStoreMode = useCallback(() => {
+    if (multiStoreMode) {
+      const sorted = [...(storesQuery.data ?? [])].sort((a, b) =>
+        (a.nickname ?? a.name).localeCompare(b.nickname ?? b.name),
+      )
+      const firstStoreId = sorted[0]?.id
+      // Edge case: 0 stores in household — just flip the mode, user must
+      // create a store before any item prices will render.
+      if (firstStoreId && (listQuery.data?.items.length ?? 0) > 0) {
+        shopAtMutation.mutate(firstStoreId)
+      }
+    }
     hasAutoEngagedRef.current = true
     setMultiStoreMode((prev) => !prev)
     setSelectedItemIds(new Set())
     setExpandedItemId(null)
     setCopyMenuOpen(false)
-  }, [])
+  }, [multiStoreMode, storesQuery.data, listQuery.data, shopAtMutation])
 
   // Row checkbox / row-click toggler — add/remove the item from the selection set.
   const onToggleSelected = useCallback((id: string) => {
@@ -813,50 +860,11 @@ function ShoppingListPage() {
           )}
           <div className="flex items-center gap-2 mt-1">
             <Badge variant={statusVariant}>{list.status}</Badge>
-            {!isCleanView && (
-              <>
-                <StorePicker
-                  preferredStoreId={list.preferred_store_id}
-                  stores={storesQuery.data ?? []}
-                  onChange={(storeId) => updateStoreMutation.mutate(storeId)}
-                  disabled={updateStoreMutation.isPending}
-                />
-                {estimatedTotal > 0 && (
-                  <span className="text-caption font-medium text-brand">
-                    Est. ${estimatedTotal.toFixed(2)}
-                  </span>
-                )}
-              </>
-            )}
           </div>
         </div>
         <div className="flex items-center gap-2 ml-3 shrink-0">
           <Button variant="outlined" size="sm" onClick={() => setShowAddItems(true)}>
             Add items
-          </Button>
-          <Button
-            variant={multiStoreMode ? 'primary' : 'outlined'}
-            size="sm"
-            onClick={toggleMultiStoreMode}
-            aria-pressed={multiStoreMode}
-            title={multiStoreMode ? 'Exit multi-store mode' : 'Enter multi-store mode'}
-            aria-label="Toggle multi-store mode"
-          >
-            <svg
-              className="w-4 h-4 sm:mr-1"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              strokeWidth={2}
-              aria-hidden="true"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"
-              />
-            </svg>
-            <span className="hidden sm:inline">Multi-store</span>
           </Button>
           {multiStoreMode ? (
             <div className="relative" ref={copyMenuRef}>
@@ -928,6 +936,67 @@ function ShoppingListPage() {
           )}
         </div>
       </div>
+
+      {/* Toolbar row — mode-dependent.
+          Single-store: "Shop at:" dropdown on left, Multi-store toggle on right.
+          Multi-store: Select-all control on left, "Single store" toggle on right. */}
+      {!isCleanView && (
+        <div className="flex items-center justify-between mb-3 gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            {multiStoreMode ? (
+              <SelectAllToggle
+                allItemIds={uncheckedItems.map((i) => i.id)}
+                selected={selectedItemIds}
+                onSelectAll={(ids) => setSelectedItemIds(new Set(ids))}
+                onClear={() => setSelectedItemIds(new Set())}
+              />
+            ) : (
+              <>
+                <label
+                  htmlFor="shop-at-picker"
+                  className="text-caption font-medium text-neutral-900 shrink-0"
+                >
+                  Shop at:
+                </label>
+                <StorePicker
+                  preferredStoreId={list.preferred_store_id}
+                  stores={storesQuery.data ?? []}
+                  onChange={(storeId) => {
+                    if (storeId) shopAtMutation.mutate(storeId)
+                  }}
+                  disabled={shopAtMutation.isPending}
+                />
+              </>
+            )}
+          </div>
+          <Button
+            variant={multiStoreMode ? 'primary' : 'outlined'}
+            size="sm"
+            onClick={toggleMultiStoreMode}
+            aria-pressed={multiStoreMode}
+            title={multiStoreMode ? 'Exit multi-store mode' : 'Enter multi-store mode'}
+            aria-label="Toggle multi-store mode"
+          >
+            <svg
+              className="w-4 h-4 sm:mr-1"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"
+              />
+            </svg>
+            <span className="hidden sm:inline">
+              {multiStoreMode ? 'Single store' : 'Multi-store'}
+            </span>
+          </Button>
+        </div>
+      )}
 
       {/* Item list — unchecked. In multi-store mode, grouped by assigned store
           with per-section subtotals. In single-store mode, flat render. */}
@@ -1582,55 +1651,101 @@ function ListItemRow({
             />
           </div>
         ) : !isCleanView && !item.checked ? (
-          <>
-            {/* Chip/pill cell — fixed width so trash aligns across rows. */}
-            <div
-              className="shrink-0 w-[120px] flex items-center justify-center"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {item.assigned_store_id ? (
-                <span
-                  className="inline-flex items-center px-2 py-1 rounded-lg bg-brand-subtle text-brand text-xs font-medium max-w-[120px] truncate"
-                  aria-label={`Assigned to ${item.assigned_store_name ?? 'store'}`}
-                >
-                  <span className="truncate">{item.assigned_store_name ?? 'Store'}</span>
-                </span>
-              ) : (
-                <span
-                  className="inline-flex items-center px-2 py-1 rounded-lg bg-neutral-100 text-neutral-500 text-xs font-medium max-w-[120px] truncate"
-                  aria-label="Unassigned"
-                >
-                  <span className="truncate">Unassigned</span>
-                </span>
-              )}
-            </div>
-            {/* Chevron cell — 44x44 when matched, same-sized empty spacer otherwise
-                so trash-button x-offset stays identical across all row variants. */}
-            <div
-              className="shrink-0 w-11 h-11 flex items-center justify-center"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {(item.product_id || item.product_group_id) ? (
-                <button
-                  type="button"
-                  className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
-                  onClick={onToggleExpand}
-                  aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                    {isExpanded ? (
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                    ) : (
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                    )}
-                  </svg>
-                </button>
-              ) : null}
-            </div>
-          </>
+          /* Single-store mode: no pills (invariant guarantees every item is
+             assigned to preferred_store_id). Render only the chevron cell so
+             matched rows can expand price detail; unmatched rows get a same-
+             sized empty spacer so trash stays aligned. */
+          <div
+            className="shrink-0 w-11 h-11 flex items-center justify-center"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {(item.product_id || item.product_group_id) ? (
+              <button
+                type="button"
+                className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
+                onClick={onToggleExpand}
+                aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                  {isExpanded ? (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  ) : (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  )}
+                </svg>
+              </button>
+            ) : null}
+          </div>
         ) : null}
       </div>
     </div>
+  )
+}
+
+// --- Select-all toggle (multi-store toolbar) ---
+//
+// Renders a tri-state checkbox: unchecked when nothing is selected,
+// indeterminate when some are, checked when all rows are selected.
+// Clicking fully-selected clears; otherwise selects every visible item.
+
+interface SelectAllToggleProps {
+  allItemIds: string[]
+  selected: Set<string>
+  onSelectAll: (ids: string[]) => void
+  onClear: () => void
+}
+
+function SelectAllToggle({
+  allItemIds,
+  selected,
+  onSelectAll,
+  onClear,
+}: SelectAllToggleProps) {
+  const total = allItemIds.length
+  const count = selected.size
+  const allSelected = total > 0 && count === total
+  const someSelected = count > 0 && count < total
+
+  // Sync the indeterminate DOM flag — React doesn't expose it as a JSX prop.
+  const checkboxRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (checkboxRef.current) {
+      checkboxRef.current.indeterminate = someSelected
+    }
+  }, [someSelected])
+
+  const handleClick = () => {
+    if (allSelected) {
+      onClear()
+    } else {
+      onSelectAll(allItemIds)
+    }
+  }
+
+  const label = count > 0 ? `${count} selected` : 'Select all'
+  const disabled = total === 0
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={disabled}
+      className="flex items-center gap-2 text-caption font-medium text-neutral-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand rounded px-1 py-0.5 disabled:opacity-40 disabled:cursor-not-allowed"
+      aria-label={allSelected ? 'Deselect all items' : 'Select all items'}
+    >
+      <input
+        ref={checkboxRef}
+        type="checkbox"
+        checked={allSelected}
+        onChange={handleClick}
+        onClick={(e) => e.stopPropagation()}
+        disabled={disabled}
+        className="w-4 h-4 accent-brand cursor-pointer disabled:cursor-not-allowed"
+        aria-hidden="true"
+        tabIndex={-1}
+      />
+      <span>{label}</span>
+    </button>
   )
 }
 

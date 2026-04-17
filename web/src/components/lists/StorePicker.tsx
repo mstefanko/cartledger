@@ -15,7 +15,7 @@ export function StorePicker({ preferredStoreId, stores, onChange, disabled }: St
       disabled={disabled}
       className="text-xs border border-border rounded px-2 py-0.5 bg-surface text-content-secondary cursor-pointer disabled:opacity-50"
     >
-      <option value="">All stores</option>
+      <option value="" disabled>Select a store…</option>
       {stores.map((store) => (
         <option key={store.id} value={store.id}>
           {store.nickname ?? store.name}
