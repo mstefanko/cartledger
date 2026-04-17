@@ -226,6 +226,31 @@ function ShoppingListPage() {
     }, 0)
   }, [uncheckedItems])
 
+  // Potential savings from Optimize Price: for each item, compare the current
+  // effective price (store_price for the preferred store, or estimated_price)
+  // against cheapest_price. Only count items whose cheapest_store resolves to
+  // a known store id (otherwise we can't actually reassign them). canOptimize
+  // flips to true as soon as any single item has a real potential saving.
+  const { potentialSavings, canOptimize } = useMemo(() => {
+    const storeList = storesQuery.data ?? []
+    let saved = 0
+    let canOpt = false
+    for (const item of uncheckedItems) {
+      if (!item.cheapest_price || !item.cheapest_store) continue
+      const cheapestStore = storeList.find(
+        (s) => (s.nickname ?? s.name) === item.cheapest_store,
+      )
+      if (!cheapestStore) continue
+      const current = parseFloat(item.store_price ?? item.estimated_price ?? '0')
+      const cheapest = parseFloat(item.cheapest_price)
+      if (cheapest < current) {
+        saved += current - cheapest
+        canOpt = true
+      }
+    }
+    return { potentialSavings: saved, canOptimize: canOpt }
+  }, [uncheckedItems, storesQuery.data])
+
   // Phase 4: group unchecked items by assigned_store_id for multi-store mode.
   // Unassigned bucket (storeId = null) first, then assigned buckets alphabetical
   // by store name. Checked items remain ungrouped in the bottom bucket.
@@ -526,6 +551,45 @@ function ShoppingListPage() {
       updateItem(listId!, itemId, { assigned_store_id: storeId ?? '' }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+    },
+    onError: handleWriteError,
+  })
+
+  // Optimize Price: reassign every unchecked item to its cheapest known store
+  // and flip to multi-store mode. Groups items by target store id and issues
+  // one bulk-update per group (the PATCH endpoint takes a single patch value
+  // per call, so batching by target store is the minimum-call shape).
+  // Destructive — overrides any existing assigned_store_id. Product owner OK.
+  const optimizePriceMutation = useMutation({
+    mutationFn: async () => {
+      if (!listId) return
+      const storeList = storesQuery.data ?? []
+      const byTargetStore = new Map<string, string[]>()
+      for (const item of uncheckedItems) {
+        if (!item.cheapest_store || !item.cheapest_price) continue
+        const target = storeList.find(
+          (s) => (s.nickname ?? s.name) === item.cheapest_store,
+        )
+        if (!target) continue
+        const list = byTargetStore.get(target.id) ?? []
+        list.push(item.id)
+        byTargetStore.set(target.id, list)
+      }
+      for (const [storeId, itemIds] of byTargetStore) {
+        if (itemIds.length === 0) continue
+        await bulkUpdateItems(listId, {
+          item_ids: itemIds,
+          patch: { assigned_store_id: storeId },
+        })
+      }
+    },
+    onSuccess: () => {
+      hasAutoEngagedRef.current = true
+      setMultiStoreMode(true)
+      setSelectedItemIds(new Set())
+      setExpandedItemId(null)
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+      void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
     },
     onError: handleWriteError,
   })
@@ -1224,6 +1288,23 @@ function ShoppingListPage() {
           <p className="text-small text-neutral-400 mt-1">
             Based on {uncheckedItems.filter((i) => i.estimated_price).length} of {uncheckedItems.length} items with price data
           </p>
+          {canOptimize && potentialSavings > 0 ? (
+            <div className="flex items-center justify-between gap-2 mt-2">
+              <span className="text-small text-neutral-600">
+                Save ${potentialSavings.toFixed(2)} by shopping at different stores.
+              </span>
+              <button
+                type="button"
+                onClick={() => optimizePriceMutation.mutate()}
+                disabled={optimizePriceMutation.isPending}
+                className="text-small font-medium text-brand hover:underline disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+              >
+                {optimizePriceMutation.isPending ? 'Optimizing…' : 'Optimize price'}
+              </button>
+            </div>
+          ) : (
+            <p className="text-small text-neutral-500 mt-2">Estimate is the best possible.</p>
+          )}
         </div>
       )}
 
@@ -1243,6 +1324,10 @@ function ShoppingListPage() {
         <ListTotalsBar
           itemCount={uncheckedItems.length}
           grandTotal={estimatedTotal}
+          potentialSavings={potentialSavings}
+          canOptimize={canOptimize}
+          onOptimize={() => optimizePriceMutation.mutate()}
+          optimizing={optimizePriceMutation.isPending}
         />
       )}
 
