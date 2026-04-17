@@ -202,6 +202,15 @@ function ShoppingListPage() {
     },
   })
 
+  // Inline-edit title for unmatched items — commits a new name via PUT.
+  const updateItemNameMutation = useMutation({
+    mutationFn: ({ itemId, name }: { itemId: string; name: string }) =>
+      updateItem(listId!, itemId, { name }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+    },
+  })
+
   // Create group and immediately select it
   const createGroupMutation = useMutation({
     mutationFn: (name: string) => createGroup({ name }),
@@ -493,6 +502,9 @@ function ShoppingListPage() {
               toggleCheckMutation.mutate({ itemId: item.id, checked })
             }
             onDelete={() => deleteItemMutation.mutate(item.id)}
+            onRename={(name) =>
+              updateItemNameMutation.mutate({ itemId: item.id, name })
+            }
             isExpanded={expandedItemId === item.id}
             onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
             isCleanView={isCleanView}
@@ -620,6 +632,9 @@ function ShoppingListPage() {
                   toggleCheckMutation.mutate({ itemId: item.id, checked })
                 }
                 onDelete={() => deleteItemMutation.mutate(item.id)}
+                onRename={(name) =>
+                  updateItemNameMutation.mutate({ itemId: item.id, name })
+                }
                 isExpanded={expandedItemId === item.id}
                 onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
                 isCleanView={isCleanView}
@@ -669,15 +684,46 @@ interface ListItemRowProps {
   item: ListItemWithPrice
   onToggle: (checked: boolean) => void
   onDelete: () => void
+  onRename: (name: string) => void
   isExpanded: boolean
   onToggleExpand: () => void
   isCleanView: boolean
 }
 
-function ListItemRow({ item, onToggle, onDelete, isExpanded, onToggleExpand, isCleanView }: ListItemRowProps) {
+function ListItemRow({ item, onToggle, onDelete, onRename, isExpanded, onToggleExpand, isCleanView }: ListItemRowProps) {
   const [swiping, setSwiping] = useState(false)
   const [swipeX, setSwipeX] = useState(0)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleValue, setTitleValue] = useState(item.name)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
+
+  // Keep local titleValue in sync if the item name changes externally while we aren't editing.
+  useEffect(() => {
+    if (!editingTitle) setTitleValue(item.name)
+  }, [item.name, editingTitle])
+
+  const isUnmatched = !item.product_id && !item.product_group_id
+  const canEditTitle = isUnmatched && !item.checked && !isCleanView
+
+  function startEditTitle() {
+    setTitleValue(item.name)
+    setEditingTitle(true)
+  }
+
+  function commitEditTitle() {
+    const trimmed = titleValue.trim()
+    if (trimmed && trimmed !== item.name) {
+      onRename(trimmed)
+    } else {
+      setTitleValue(item.name)
+    }
+    setEditingTitle(false)
+  }
+
+  function cancelEditTitle() {
+    setTitleValue(item.name)
+    setEditingTitle(false)
+  }
 
   function handleTouchStart(e: React.TouchEvent) {
     const touch = e.touches[0]
@@ -716,12 +762,8 @@ function ListItemRow({ item, onToggle, onDelete, isExpanded, onToggleExpand, isC
     setSwipeX(0)
   }
 
-  const qtyUnit = [
-    item.quantity !== '1' ? item.quantity : null,
-    item.unit,
-  ]
-    .filter(Boolean)
-    .join(' ')
+  // Quantity-only pill — unit is rendered inside the price hint sub-row below.
+  const qtyLabel = item.quantity !== '1' ? item.quantity : null
 
   return (
     <div className="relative overflow-hidden rounded-xl">
@@ -765,29 +807,59 @@ function ListItemRow({ item, onToggle, onDelete, isExpanded, onToggleExpand, isC
         {/* Item details */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <span
-              className={[
-                'text-body font-medium truncate',
-                item.checked ? 'line-through text-neutral-400' : 'text-neutral-900',
-              ].join(' ')}
-            >
-              {item.name}
-            </span>
+            {canEditTitle && editingTitle ? (
+              <input
+                type="text"
+                value={titleValue}
+                onChange={(e) => setTitleValue(e.target.value)}
+                onBlur={commitEditTitle}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    commitEditTitle()
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault()
+                    cancelEditTitle()
+                  }
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="flex-1 min-w-0 text-body font-medium text-neutral-900 bg-transparent border-b-2 border-brand focus:outline-none"
+                autoFocus
+              />
+            ) : canEditTitle ? (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  startEditTitle()
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    startEditTitle()
+                  }
+                }}
+                title="Click to edit name"
+                className="text-body font-medium truncate text-neutral-900 border-b border-dashed border-neutral-200 hover:border-neutral-400 hover:bg-neutral-50/50 transition-colors cursor-pointer"
+              >
+                {item.name}
+              </span>
+            ) : (
+              <span
+                className={[
+                  'text-body font-medium truncate',
+                  item.checked ? 'line-through text-neutral-400' : 'text-neutral-900',
+                ].join(' ')}
+              >
+                {item.name}
+              </span>
+            )}
             {item.product_group_id && (
               <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded ml-1">Group</span>
             )}
-            {qtyUnit && (
-              <span className="text-small text-neutral-400 shrink-0">{qtyUnit}</span>
-            )}
-            {!isCleanView && !item.checked && (item.product_id || item.product_group_id) && (
-              <button
-                type="button"
-                className="shrink-0 text-neutral-400 hover:text-brand transition-colors text-xs leading-none"
-                onClick={onToggleExpand}
-                aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
-              >
-                {isExpanded ? '▾' : '▸'}
-              </button>
+            {qtyLabel && (
+              <span className="text-small text-neutral-400 shrink-0">{qtyLabel}</span>
             )}
           </div>
           {/* Store price indicator — hidden in clean view */}
@@ -851,6 +923,26 @@ function ListItemRow({ item, onToggle, onDelete, isExpanded, onToggleExpand, isC
             <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
           </svg>
         </button>
+
+        {/* Chevron cell — dedicated right-edge 44x44 hit area. Reserves width on unmatched rows. */}
+        <div className="shrink-0 min-w-11 min-h-11 flex items-center justify-center">
+          {!isCleanView && !item.checked && (item.product_id || item.product_group_id) && (
+            <button
+              type="button"
+              className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
+              onClick={onToggleExpand}
+              aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                {isExpanded ? (
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                ) : (
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                )}
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
     </div>
   )
