@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { getTrips, getProductsWithTrends } from '@/api/analytics'
@@ -6,6 +7,8 @@ import { Sparkline } from '@/components/ui/Sparkline'
 import { Badge } from '@/components/ui/Badge'
 
 function AnalyticsPage() {
+  const [productSearch, setProductSearch] = useState('')
+
   const { data: trips, isLoading: tripsLoading } = useQuery({
     queryKey: ['analytics', 'trips'],
     queryFn: getTrips,
@@ -15,6 +18,10 @@ function AnalyticsPage() {
     queryKey: ['analytics', 'products-trends'],
     queryFn: () => getProductsWithTrends({ sort: 'price_change', order: 'desc' }),
   })
+
+  const filteredProducts = productsWithTrends?.filter((p) =>
+    p.name.toLowerCase().includes(productSearch.toLowerCase())
+  ) ?? []
 
   return (
     <div className="py-8">
@@ -40,13 +47,33 @@ function AnalyticsPage() {
 
       {/* Products with Trends Table */}
       <div className="mt-8">
-        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">
-          Product Price Trends
-        </h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-display text-feature font-semibold text-neutral-900">
+            Product Price Trends
+          </h2>
+          <div className="relative w-52">
+            <input
+              type="text"
+              value={productSearch}
+              onChange={(e) => setProductSearch(e.target.value)}
+              placeholder="Filter products..."
+              className="text-body border border-neutral-200 rounded-lg px-3 py-1.5 w-full focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand placeholder:text-neutral-400"
+            />
+            {productSearch && (
+              <button
+                onClick={() => setProductSearch('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600"
+                aria-label="Clear filter"
+              >
+                ×
+              </button>
+            )}
+          </div>
+        </div>
         <div className="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
           {productsLoading ? (
             <p className="text-body text-neutral-400 py-8 text-center">Loading products...</p>
-          ) : productsWithTrends && productsWithTrends.length > 0 ? (
+          ) : filteredProducts.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full">
                 <thead>
@@ -69,7 +96,7 @@ function AnalyticsPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-200">
-                  {productsWithTrends.map((item) => {
+                  {filteredProducts.map((item) => {
                     const sparkPoints = item.sparkline ?? []
                     const sparkData = sparkPoints.map((p) => parseFloat(p.price)).filter((n) => !isNaN(n))
                     const sparkHighlights = sparkPoints.map((p) => p.is_sale)
@@ -118,7 +145,7 @@ function AnalyticsPage() {
             </div>
           ) : (
             <p className="text-body text-neutral-400 py-8 text-center">
-              No product trend data yet.
+              {productSearch ? `No products matching "${productSearch}".` : 'No product trend data yet.'}
             </p>
           )}
         </div>

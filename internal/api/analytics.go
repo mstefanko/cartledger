@@ -36,12 +36,12 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 // --- Response types ---
 
 type overviewResponse struct {
-	TotalSpentThisMonth  float64 `json:"total_spent_this_month"`
-	TotalSpentLastMonth  float64 `json:"total_spent_last_month"`
-	MonthOverMonthChange float64 `json:"month_over_month_change"`
-	TripCountThisMonth   int     `json:"trip_count_this_month"`
-	AvgTripCost          float64 `json:"avg_trip_cost"`
-	UniqueProducts       int     `json:"unique_products_purchased"`
+	SpentThisMonth float64 `json:"spent_this_month"`
+	SpentLastMonth float64 `json:"spent_last_month"`
+	PercentChange  float64 `json:"percent_change"`
+	TripCount      int     `json:"trip_count"`
+	AvgTripCost    float64 `json:"avg_trip_cost"`
+	UniqueProducts int     `json:"unique_products_purchased"`
 }
 
 type pricePoint struct {
@@ -113,6 +113,7 @@ type storeSummaryResponse struct {
 type tripItem struct {
 	ReceiptID string  `json:"receipt_id"`
 	Date      string  `json:"date"`
+	StoreID   *string `json:"store_id"`
 	StoreName string  `json:"store_name"`
 	Total     float64 `json:"total"`
 	ItemCount int     `json:"item_count"`
@@ -157,7 +158,8 @@ func (h *AnalyticsHandler) Overview(c echo.Context) error {
 		 FROM receipts
 		 WHERE household_id = ? AND receipt_date >= ?`,
 		householdID, thisMonthStart,
-	).Scan(&resp.TotalSpentThisMonth, &resp.TripCountThisMonth)
+	).Scan(&resp.SpentThisMonth, &resp.TripCount)
+	resp.SpentThisMonth = math.Round(resp.SpentThisMonth*100) / 100
 
 	// Total spent last month.
 	h.DB.QueryRow(
@@ -165,16 +167,17 @@ func (h *AnalyticsHandler) Overview(c echo.Context) error {
 		 FROM receipts
 		 WHERE household_id = ? AND receipt_date >= ? AND receipt_date < ?`,
 		householdID, lastMonthStart, thisMonthStart,
-	).Scan(&resp.TotalSpentLastMonth)
+	).Scan(&resp.SpentLastMonth)
+	resp.SpentLastMonth = math.Round(resp.SpentLastMonth*100) / 100
 
 	// Month-over-month change %.
-	if resp.TotalSpentLastMonth > 0 {
-		resp.MonthOverMonthChange = math.Round(((resp.TotalSpentThisMonth-resp.TotalSpentLastMonth)/resp.TotalSpentLastMonth)*10000) / 100
+	if resp.SpentLastMonth > 0 {
+		resp.PercentChange = math.Round(((resp.SpentThisMonth-resp.SpentLastMonth)/resp.SpentLastMonth)*10000) / 100
 	}
 
 	// Avg trip cost this month.
-	if resp.TripCountThisMonth > 0 {
-		resp.AvgTripCost = math.Round(resp.TotalSpentThisMonth/float64(resp.TripCountThisMonth)*100) / 100
+	if resp.TripCount > 0 {
+		resp.AvgTripCost = math.Round(resp.SpentThisMonth/float64(resp.TripCount)*100) / 100
 	}
 
 	// Unique products purchased this month.
@@ -436,7 +439,7 @@ func (h *AnalyticsHandler) StoreSummary(c echo.Context) error {
 		        AVG(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL))) as avg_price
 		 FROM product_prices pp
 		 JOIN products p ON p.id = pp.product_id
-		 WHERE pp.store_id = ? AND p.household_id = ?
+		 WHERE pp.store_id = ? AND p.household_id = ? AND p.is_non_product = 0
 		 GROUP BY pp.product_id
 		 ORDER BY avg_price ASC
 		 LIMIT 5`,
@@ -494,7 +497,7 @@ func (h *AnalyticsHandler) Trips(c echo.Context) error {
 	}
 
 	rows, err := h.DB.Query(
-		`SELECT r.id, r.receipt_date, COALESCE(s.name, 'Unknown') as store_name,
+		`SELECT r.id, r.receipt_date, r.store_id, COALESCE(s.name, 'Unknown') as store_name,
 		        COALESCE(CAST(r.total AS REAL), 0),
 		        (SELECT COUNT(*) FROM line_items li WHERE li.receipt_id = r.id)
 		 FROM receipts r
@@ -513,7 +516,7 @@ func (h *AnalyticsHandler) Trips(c echo.Context) error {
 	for rows.Next() {
 		var t tripItem
 		var receiptDate time.Time
-		if err := rows.Scan(&t.ReceiptID, &receiptDate, &t.StoreName, &t.Total, &t.ItemCount); err != nil {
+		if err := rows.Scan(&t.ReceiptID, &receiptDate, &t.StoreID, &t.StoreName, &t.Total, &t.ItemCount); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		t.Date = receiptDate.Format("2006-01-02")
@@ -560,7 +563,7 @@ func (h *AnalyticsHandler) Deals(c echo.Context) error {
 		     GROUP BY product_id
 		     HAVING COUNT(*) >= 2
 		 ) stats ON stats.product_id = p.id
-		 WHERE p.household_id = ?
+		 WHERE p.household_id = ? AND p.is_non_product = 0
 		   AND COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) < stats.avg_price * 0.85
 		 ORDER BY (1.0 - COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) / stats.avg_price) DESC
 		 LIMIT ? OFFSET ?`,
@@ -718,7 +721,7 @@ func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 		            ) as last_qty
 		     FROM product_prices pp
 		     JOIN products p ON p.id = pp.product_id
-		     WHERE p.household_id = ?
+		     WHERE p.household_id = ? AND p.is_non_product = 0
 		     WINDOW w AS (PARTITION BY pp.product_id ORDER BY pp.receipt_date
 		                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
 		 ) sub

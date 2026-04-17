@@ -629,11 +629,12 @@ export interface WSListItemUpdated {
 // --- Analytics Types ---
 
 export interface AnalyticsOverview {
-  spent_this_month: string
-  spent_last_month: string
+  spent_this_month: number
+  spent_last_month: number
   percent_change: number
   trip_count: number
-  avg_trip_cost: string
+  avg_trip_cost: number
+  unique_products_purchased: number
 }
 
 export interface SparklinePoint {
@@ -679,10 +680,10 @@ export interface StoreSummary {
 
 export interface Trip {
   receipt_id: string
-  store_id: string
+  store_id: string | null
   store_name: string
   date: string
-  total: string
+  total: number
   item_count: number
 }
 
