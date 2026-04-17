@@ -1,8 +1,24 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { useState } from 'react'
+import { useState, type ComponentType } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  BarChart3,
+  Package,
+  Wand2,
+  Receipt,
+  Upload,
+  Settings,
+  ListChecks,
+  ShoppingCart,
+  Store,
+  ScanLine,
+  Plus,
+  ClipboardCheck,
+  type LucideProps,
+} from 'lucide-react'
 import { listStores } from '@/api/stores'
 import { listLists, createList } from '@/api/lists'
+import { getUnmatchedCount } from '@/api/review'
 
 interface SidebarProps {
   open: boolean
@@ -17,32 +33,25 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
       : 'text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900',
   ].join(' ')
 
-const pageLinks = [
-  { to: '/analytics', label: 'Analytics', icon: 'chart-bar' },
-  { to: '/products', label: 'Products', icon: 'cube' },
-  { to: '/rules', label: 'Auto-Match', icon: 'adjustments' },
-  { to: '/receipts', label: 'Receipts', icon: 'receipt' },
-  { to: '/import', label: 'Import', icon: 'upload' },
-] as const
+type IconComponent = ComponentType<LucideProps>
 
-// Simple inline SVG icons to avoid an icon library dependency
+const pageLinks: { to: string; label: string; Icon: IconComponent }[] = [
+  { to: '/analytics', label: 'Analytics', Icon: BarChart3 },
+  { to: '/review', label: 'Review', Icon: ClipboardCheck },
+  { to: '/products', label: 'Products', Icon: Package },
+  { to: '/rules', label: 'Auto-Match', Icon: Wand2 },
+  { to: '/receipts', label: 'Receipts', Icon: Receipt },
+  { to: '/import', label: 'Import', Icon: Upload },
+]
+
+const ICON_SIZE = 16
+
 function StoreIcon({ icon }: { icon: string | null }) {
-  // Use the first letter of the icon or a default store emoji
   if (icon) {
+    // Legacy data may store a short string/emoji — preserve it.
     return <span className="text-base leading-none">{icon}</span>
   }
-  return <span className="text-base leading-none">&#x1F3EA;</span>
-}
-
-function PageIcon({ icon }: { icon: string }) {
-  const icons: Record<string, string> = {
-    'chart-bar': '\u2248',
-    cube: '\u25A2',
-    adjustments: '\u2699',
-    receipt: '\u2630',
-    upload: '\u2912',
-  }
-  return <span className="text-sm leading-none font-mono">{icons[icon] ?? '\u2022'}</span>
+  return <Store size={ICON_SIZE} className="text-neutral-400" aria-hidden="true" />
 }
 
 function Sidebar({ open, onClose }: SidebarProps) {
@@ -55,6 +64,13 @@ function Sidebar({ open, onClose }: SidebarProps) {
     queryKey: ['stores'],
     queryFn: listStores,
   })
+
+  const unmatchedCountQuery = useQuery({
+    queryKey: ['unmatched-count'],
+    queryFn: getUnmatchedCount,
+  })
+
+  const unmatchedCount = unmatchedCountQuery.data?.count ?? 0
 
   const listsQuery = useQuery({
     queryKey: ['shopping-lists'],
@@ -93,11 +109,11 @@ function Sidebar({ open, onClose }: SidebarProps) {
             </p>
             <button
               type="button"
-              className="text-small font-medium text-brand hover:text-brand-dark transition-colors"
+              className="text-brand hover:text-brand-dark transition-colors"
               onClick={() => setCreatingList(true)}
               aria-label="New list"
             >
-              +
+              <Plus size={ICON_SIZE} />
             </button>
           </div>
           {creatingList && (
@@ -133,7 +149,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
               onClick={onClose}
               end
             >
-              <span className="text-base leading-none">&#x1F4CB;</span>
+              <ListChecks size={ICON_SIZE} aria-hidden="true" />
               All Lists
             </NavLink>
             {lists.map((list) => (
@@ -143,7 +159,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
                 className={navLinkClass}
                 onClick={onClose}
               >
-                <span className="text-base leading-none">&#x1F6D2;</span>
+                <ShoppingCart size={ICON_SIZE} aria-hidden="true" />
                 <span className="truncate flex-1">{list.name}</span>
                 <span className="text-small text-neutral-400 shrink-0">
                   {list.checked_count}/{list.item_count}
@@ -187,8 +203,11 @@ function Sidebar({ open, onClose }: SidebarProps) {
           <div className="flex flex-col gap-0.5">
             {pageLinks.map((link) => (
               <NavLink key={link.to} to={link.to} className={navLinkClass} onClick={onClose}>
-                <PageIcon icon={link.icon} />
-                {link.label}
+                <link.Icon size={ICON_SIZE} aria-hidden="true" />
+                <span className="flex-1">{link.label}</span>
+                {link.to === '/review' && unmatchedCount > 0 && (
+                  <span className="text-small text-neutral-400 shrink-0">{unmatchedCount}</span>
+                )}
               </NavLink>
             ))}
           </div>
@@ -198,7 +217,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
         <div>
           <div className="flex flex-col gap-0.5">
             <NavLink to="/settings" className={navLinkClass} onClick={onClose}>
-              <span className="text-sm leading-none font-mono">{'\u2699'}</span>
+              <Settings size={ICON_SIZE} aria-hidden="true" />
               Settings
             </NavLink>
           </div>
@@ -212,6 +231,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
           className="flex items-center justify-center gap-2 w-full px-4 py-3 bg-brand text-white font-medium rounded-xl hover:bg-brand-dark transition-colors"
           onClick={onClose}
         >
+          <ScanLine size={ICON_SIZE} aria-hidden="true" />
           Scan Receipt
         </NavLink>
       </div>

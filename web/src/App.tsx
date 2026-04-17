@@ -18,6 +18,7 @@ import SettingsPage from '@/pages/SettingsPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import StoreViewPage from '@/pages/StoreViewPage'
 import ProductGroupPage from '@/pages/ProductGroupPage'
+import ReviewPage from '@/pages/ReviewPage'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -119,6 +120,7 @@ function AppRoutes() {
         <Route path="conversions" element={<Navigate to="/settings?tab=conversions" replace />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="scan" element={<ScanPage />} />
+        <Route path="review" element={<ReviewPage />} />
       </Route>
 
       {/* Catch-all */}
