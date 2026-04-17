@@ -472,17 +472,6 @@ function ShoppingListPage() {
     })
   }, [])
 
-  // Chip tap in single-store mode: enter multi-store + pre-select this row.
-  const enterMultiStoreWithRow = useCallback((id: string) => {
-    hasAutoEngagedRef.current = true
-    setMultiStoreMode(true)
-    setSelectedItemIds((prev) => {
-      const next = new Set(prev)
-      next.add(id)
-      return next
-    })
-  }, [])
-
   // Per-row store assignment from the dropdown. Server treats "" as NULL clear.
   const assignStoreMutation = useMutation({
     mutationFn: ({ itemId, storeId }: { itemId: string; storeId: string | null }) =>
@@ -973,7 +962,6 @@ function ShoppingListPage() {
                   multiStoreMode={multiStoreMode}
                   isSelected={selectedItemIds.has(item.id)}
                   onToggleSelected={() => onToggleSelected(item.id)}
-                  onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
                   stores={storesQuery.data ?? []}
                   onAssignStore={(storeId) =>
                     assignStoreMutation.mutate({ itemId: item.id, storeId })
@@ -1002,7 +990,6 @@ function ShoppingListPage() {
               multiStoreMode={multiStoreMode}
               isSelected={selectedItemIds.has(item.id)}
               onToggleSelected={() => onToggleSelected(item.id)}
-              onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
               stores={storesQuery.data ?? []}
               onAssignStore={(storeId) =>
                 assignStoreMutation.mutate({ itemId: item.id, storeId })
@@ -1141,7 +1128,6 @@ function ShoppingListPage() {
                 multiStoreMode={multiStoreMode}
                 isSelected={selectedItemIds.has(item.id)}
                 onToggleSelected={() => onToggleSelected(item.id)}
-                onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
                 stores={storesQuery.data ?? []}
                 onAssignStore={(storeId) =>
                   assignStoreMutation.mutate({ itemId: item.id, storeId })
@@ -1265,7 +1251,6 @@ interface ListItemRowProps {
   multiStoreMode: boolean
   isSelected: boolean
   onToggleSelected: () => void
-  onEnterMultiStore: () => void
   stores: Store[]
   onAssignStore: (storeId: string | null) => void
 }
@@ -1281,7 +1266,6 @@ function ListItemRow({
   multiStoreMode,
   isSelected,
   onToggleSelected,
-  onEnterMultiStore,
   stores,
   onAssignStore,
 }: ListItemRowProps) {
@@ -1580,53 +1564,71 @@ function ListItemRow({
           </svg>
         </button>
 
-        {/* Right-edge cell — dedicated 44x44 min size. Renders:
-            - multi-store mode: the store-assignment dropdown.
-            - single-store + assigned row: a store chip (replaces chevron per findings §2.6).
-            - otherwise: the price-detail expand chevron. */}
-        <div
-          className="shrink-0 min-w-11 min-h-11 flex items-center justify-center"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {multiStoreMode && !isCleanView && !item.checked ? (
+        {/* Right-edge area. Layout differs by mode:
+            - multi-store mode: single dropdown cell replaces the whole area.
+            - single-store + active row: TWO cells — a chip/pill cell (fixed width
+              so rows align) + a chevron cell (44x44, empty spacer when unmatched).
+            - cleanView or checked: nothing renders. */}
+        {multiStoreMode && !isCleanView && !item.checked ? (
+          <div
+            className="shrink-0 min-w-11 min-h-11 flex items-center justify-center"
+            onClick={(e) => e.stopPropagation()}
+          >
             <StoreAssignDropdown
               value={item.assigned_store_id}
               onChange={onAssignStore}
               stores={stores}
               cheapestStoreId={cheapestStoreId}
             />
-          ) : !multiStoreMode && !isCleanView && !item.checked && item.assigned_store_id ? (
-            <button
-              type="button"
-              className="inline-flex items-center px-2 py-1 rounded-lg bg-brand-subtle text-brand text-xs font-medium hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand max-w-[120px] truncate"
-              onClick={(e) => {
-                e.stopPropagation()
-                onEnterMultiStore()
-              }}
-              title="Tap to edit store assignments"
-              aria-label={`Assigned to ${item.assigned_store_name ?? 'store'} — tap to manage`}
+          </div>
+        ) : !isCleanView && !item.checked ? (
+          <>
+            {/* Chip/pill cell — fixed width so trash aligns across rows. */}
+            <div
+              className="shrink-0 w-[120px] flex items-center justify-center"
+              onClick={(e) => e.stopPropagation()}
             >
-              <span className="truncate">{item.assigned_store_name ?? 'Store'}</span>
-            </button>
-          ) : (
-            !isCleanView && !item.checked && (item.product_id || item.product_group_id) && (
-              <button
-                type="button"
-                className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
-                onClick={onToggleExpand}
-                aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                  {isExpanded ? (
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                  ) : (
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                  )}
-                </svg>
-              </button>
-            )
-          )}
-        </div>
+              {item.assigned_store_id ? (
+                <span
+                  className="inline-flex items-center px-2 py-1 rounded-lg bg-brand-subtle text-brand text-xs font-medium max-w-[120px] truncate"
+                  aria-label={`Assigned to ${item.assigned_store_name ?? 'store'}`}
+                >
+                  <span className="truncate">{item.assigned_store_name ?? 'Store'}</span>
+                </span>
+              ) : (
+                <span
+                  className="inline-flex items-center px-2 py-1 rounded-lg bg-neutral-100 text-neutral-500 text-xs font-medium max-w-[120px] truncate"
+                  aria-label="Unassigned"
+                >
+                  <span className="truncate">Unassigned</span>
+                </span>
+              )}
+            </div>
+            {/* Chevron cell — 44x44 when matched, same-sized empty spacer otherwise
+                so trash-button x-offset stays identical across all row variants. */}
+            <div
+              className="shrink-0 w-11 h-11 flex items-center justify-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {(item.product_id || item.product_group_id) ? (
+                <button
+                  type="button"
+                  className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
+                  onClick={onToggleExpand}
+                  aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                    {isExpanded ? (
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                    ) : (
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                    )}
+                  </svg>
+                </button>
+              ) : null}
+            </div>
+          </>
+        ) : null}
       </div>
     </div>
   )
