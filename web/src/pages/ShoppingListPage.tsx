@@ -13,12 +13,14 @@ import { ShareListModal } from '@/components/lists/ShareListModal'
 import { StorePicker } from '@/components/lists/StorePicker'
 import { ItemPriceDetail } from '@/components/lists/ItemPriceDetail'
 import { AddItemsModal } from '@/components/lists/AddItemsModal'
+import { StoreAssignDropdown } from '@/components/lists/StoreAssignDropdown'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
   Product,
   ProductGroup,
   CreateListItemRequest,
+  Store,
 } from '@/types'
 
 function ShoppingListPage() {
@@ -42,6 +44,15 @@ function ShoppingListPage() {
     label: string
   } | null>(null)
   const recentlyAddedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Multi-store mode — toggled by header button or auto-engaged when the
+  // fetched list already has items assigned to >1 distinct stores.
+  // v1: session-only (no localStorage); reload re-detects via useEffect below.
+  const [multiStoreMode, setMultiStoreMode] = useState(false)
+  const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set())
+  // Guard so auto-engage only fires once per page-load: if the user toggles
+  // the mode off, we do NOT re-engage on subsequent list refreshes.
+  const hasAutoEngagedRef = useRef(false)
 
   // Add item state
   const [addInput, setAddInput] = useState('')
@@ -242,6 +253,60 @@ function ShoppingListPage() {
       if (recentlyAddedTimerRef.current) clearTimeout(recentlyAddedTimerRef.current)
     }
   }, [])
+
+  // Auto-engage multi-store mode when the list has >1 distinct assigned stores.
+  // Only fires when mode is its default `false` AND we haven't auto-engaged
+  // this session — so toggling off isn't fought by the next list refresh.
+  useEffect(() => {
+    if (!list || hasAutoEngagedRef.current || multiStoreMode) return
+    const distinct = new Set<string>()
+    for (const it of list.items) {
+      if (it.assigned_store_id) distinct.add(it.assigned_store_id)
+      if (distinct.size > 1) break
+    }
+    if (distinct.size > 1) {
+      hasAutoEngagedRef.current = true
+      setMultiStoreMode(true)
+    }
+  }, [list, multiStoreMode])
+
+  // Toggle the mode button. Clears selection and latches hasAutoEngaged so
+  // we don't bounce back on next list refresh.
+  const toggleMultiStoreMode = useCallback(() => {
+    hasAutoEngagedRef.current = true
+    setMultiStoreMode((prev) => !prev)
+    setSelectedItemIds(new Set())
+  }, [])
+
+  // Row checkbox / row-click toggler — add/remove the item from the selection set.
+  const onToggleSelected = useCallback((id: string) => {
+    setSelectedItemIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  // Chip tap in single-store mode: enter multi-store + pre-select this row.
+  const enterMultiStoreWithRow = useCallback((id: string) => {
+    hasAutoEngagedRef.current = true
+    setMultiStoreMode(true)
+    setSelectedItemIds((prev) => {
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+  }, [])
+
+  // Per-row store assignment from the dropdown. Server treats "" as NULL clear.
+  const assignStoreMutation = useMutation({
+    mutationFn: ({ itemId, storeId }: { itemId: string; storeId: string | null }) =>
+      updateItem(listId!, itemId, { assigned_store_id: storeId ?? '' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['shopping-list', listId] })
+    },
+  })
 
   // Push a newly-added item onto the undo toast. Stacks bursts — if the toast
   // is already visible, append the id and update the label to reflect count.
@@ -483,6 +548,30 @@ function ShoppingListPage() {
           <Button variant="outlined" size="sm" onClick={() => setShowAddItems(true)}>
             Add items
           </Button>
+          <Button
+            variant={multiStoreMode ? 'primary' : 'outlined'}
+            size="sm"
+            onClick={toggleMultiStoreMode}
+            aria-pressed={multiStoreMode}
+            title={multiStoreMode ? 'Exit multi-store mode' : 'Enter multi-store mode'}
+            aria-label="Toggle multi-store mode"
+          >
+            <svg
+              className="w-4 h-4 sm:mr-1"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"
+              />
+            </svg>
+            <span className="hidden sm:inline">Multi-store</span>
+          </Button>
           <Button variant="subtle" size="sm" onClick={() => setShowShare(true)}>
             Share
           </Button>
@@ -508,6 +597,14 @@ function ShoppingListPage() {
             isExpanded={expandedItemId === item.id}
             onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
             isCleanView={isCleanView}
+            multiStoreMode={multiStoreMode}
+            isSelected={selectedItemIds.has(item.id)}
+            onToggleSelected={() => onToggleSelected(item.id)}
+            onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
+            stores={storesQuery.data ?? []}
+            onAssignStore={(storeId) =>
+              assignStoreMutation.mutate({ itemId: item.id, storeId })
+            }
           />
         ))}
       </div>
@@ -638,6 +735,14 @@ function ShoppingListPage() {
                 isExpanded={expandedItemId === item.id}
                 onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
                 isCleanView={isCleanView}
+                multiStoreMode={multiStoreMode}
+                isSelected={selectedItemIds.has(item.id)}
+                onToggleSelected={() => onToggleSelected(item.id)}
+                onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
+                stores={storesQuery.data ?? []}
+                onAssignStore={(storeId) =>
+                  assignStoreMutation.mutate({ itemId: item.id, storeId })
+                }
               />
             ))}
           </div>
@@ -688,14 +793,45 @@ interface ListItemRowProps {
   isExpanded: boolean
   onToggleExpand: () => void
   isCleanView: boolean
+  multiStoreMode: boolean
+  isSelected: boolean
+  onToggleSelected: () => void
+  onEnterMultiStore: () => void
+  stores: Store[]
+  onAssignStore: (storeId: string | null) => void
 }
 
-function ListItemRow({ item, onToggle, onDelete, onRename, isExpanded, onToggleExpand, isCleanView }: ListItemRowProps) {
+function ListItemRow({
+  item,
+  onToggle,
+  onDelete,
+  onRename,
+  isExpanded,
+  onToggleExpand,
+  isCleanView,
+  multiStoreMode,
+  isSelected,
+  onToggleSelected,
+  onEnterMultiStore,
+  stores,
+  onAssignStore,
+}: ListItemRowProps) {
   const [swiping, setSwiping] = useState(false)
   const [swipeX, setSwipeX] = useState(0)
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleValue, setTitleValue] = useState(item.name)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
+
+  // Derive the cheapest store's id by matching the store name on the wire
+  // (no cheapest_store_id column in the API response). Defer per-store
+  // price hints to a follow-up — v1 marks only the single best store.
+  const cheapestStoreId = useMemo(() => {
+    if (!item.cheapest_store) return null
+    const match = stores.find(
+      (s) => (s.nickname ?? s.name) === item.cheapest_store,
+    )
+    return match?.id ?? null
+  }, [stores, item.cheapest_store])
 
   // Keep local titleValue in sync if the item name changes externally while we aren't editing.
   useEffect(() => {
@@ -776,33 +912,66 @@ function ListItemRow({ item, onToggle, onDelete, onRename, isExpanded, onToggleE
 
       {/* Item content */}
       <div
-        className="relative bg-white border border-neutral-200 rounded-xl px-3 py-3 flex items-center gap-3 transition-transform"
+        className={[
+          'relative bg-white border rounded-xl px-3 py-3 flex items-center gap-3 transition-transform',
+          multiStoreMode && isSelected ? 'border-brand ring-1 ring-brand' : 'border-neutral-200',
+        ].join(' ')}
         style={{ transform: swiping ? `translateX(${swipeX}px)` : undefined }}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
+        onClick={multiStoreMode ? onToggleSelected : undefined}
+        role={multiStoreMode ? 'button' : undefined}
+        aria-pressed={multiStoreMode ? isSelected : undefined}
       >
-        {/* Checkbox — 44px touch target for mobile accessibility */}
-        <button
-          type="button"
-          className="shrink-0 w-11 h-11 rounded-lg flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand -m-1"
-          onClick={() => onToggle(!item.checked)}
-          aria-label={item.checked ? `Uncheck ${item.name}` : `Check ${item.name}`}
-        >
-          <span
-            className="w-6 h-6 rounded-lg border-2 flex items-center justify-center"
-            style={{
-              borderColor: item.checked ? '#149e61' : '#dedee5',
-              backgroundColor: item.checked ? '#149e61' : 'transparent',
+        {/* Left control — check-off circle (single-store) OR selection checkbox (multi-store) */}
+        {multiStoreMode ? (
+          <button
+            type="button"
+            className="shrink-0 w-11 h-11 rounded-md flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand -m-1"
+            onClick={(e) => {
+              e.stopPropagation()
+              onToggleSelected()
             }}
+            aria-label={isSelected ? `Deselect ${item.name}` : `Select ${item.name}`}
+            aria-pressed={isSelected}
           >
-            {item.checked && (
-              <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-              </svg>
-            )}
-          </span>
-        </button>
+            <span
+              className="w-6 h-6 rounded-md border-2 flex items-center justify-center"
+              style={{
+                borderColor: isSelected ? '#149e61' : '#dedee5',
+                backgroundColor: isSelected ? '#149e61' : 'transparent',
+              }}
+            >
+              {isSelected && (
+                <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+              )}
+            </span>
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="shrink-0 w-11 h-11 rounded-lg flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand -m-1"
+            onClick={() => onToggle(!item.checked)}
+            aria-label={item.checked ? `Uncheck ${item.name}` : `Check ${item.name}`}
+          >
+            <span
+              className="w-6 h-6 rounded-lg border-2 flex items-center justify-center"
+              style={{
+                borderColor: item.checked ? '#149e61' : '#dedee5',
+                backgroundColor: item.checked ? '#149e61' : 'transparent',
+              }}
+            >
+              {item.checked && (
+                <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+              )}
+            </span>
+          </button>
+        )}
 
         {/* Item details */}
         <div className="flex-1 min-w-0">
@@ -862,8 +1031,8 @@ function ListItemRow({ item, onToggle, onDelete, onRename, isExpanded, onToggleE
               <span className="text-small text-neutral-400 shrink-0">{qtyLabel}</span>
             )}
           </div>
-          {/* Store price indicator — hidden in clean view */}
-          {!item.checked && !isCleanView && (
+          {/* Store price indicator — hidden in clean view and in multi-store mode */}
+          {!item.checked && !isCleanView && !multiStoreMode && (
             <>
               {item.store_price && item.store_price_store ? (
                 <>
@@ -916,7 +1085,10 @@ function ListItemRow({ item, onToggle, onDelete, onRename, isExpanded, onToggleE
         <button
           type="button"
           className="shrink-0 w-9 h-9 flex items-center justify-center text-neutral-300 sm:text-neutral-200 hover:text-expensive rounded-lg hover:bg-neutral-50 transition-colors"
-          onClick={onDelete}
+          onClick={(e) => {
+            e.stopPropagation()
+            onDelete()
+          }}
           aria-label={`Delete ${item.name}`}
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
@@ -924,23 +1096,51 @@ function ListItemRow({ item, onToggle, onDelete, onRename, isExpanded, onToggleE
           </svg>
         </button>
 
-        {/* Chevron cell — dedicated right-edge 44x44 hit area. Reserves width on unmatched rows. */}
-        <div className="shrink-0 min-w-11 min-h-11 flex items-center justify-center">
-          {!isCleanView && !item.checked && (item.product_id || item.product_group_id) && (
+        {/* Right-edge cell — dedicated 44x44 min size. Renders:
+            - multi-store mode: the store-assignment dropdown.
+            - single-store + assigned row: a store chip (replaces chevron per findings §2.6).
+            - otherwise: the price-detail expand chevron. */}
+        <div
+          className="shrink-0 min-w-11 min-h-11 flex items-center justify-center"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {multiStoreMode && !isCleanView && !item.checked ? (
+            <StoreAssignDropdown
+              value={item.assigned_store_id}
+              onChange={onAssignStore}
+              stores={stores}
+              cheapestStoreId={cheapestStoreId}
+            />
+          ) : !multiStoreMode && !isCleanView && !item.checked && item.assigned_store_id ? (
             <button
               type="button"
-              className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
-              onClick={onToggleExpand}
-              aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
+              className="inline-flex items-center px-2 py-1 rounded-lg bg-brand-subtle text-brand text-xs font-medium hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand max-w-[120px] truncate"
+              onClick={(e) => {
+                e.stopPropagation()
+                onEnterMultiStore()
+              }}
+              title="Tap to edit store assignments"
+              aria-label={`Assigned to ${item.assigned_store_name ?? 'store'} — tap to manage`}
             >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                {isExpanded ? (
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                ) : (
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                )}
-              </svg>
+              <span className="truncate">{item.assigned_store_name ?? 'Store'}</span>
             </button>
+          ) : (
+            !isCleanView && !item.checked && (item.product_id || item.product_group_id) && (
+              <button
+                type="button"
+                className="w-11 h-11 flex items-center justify-center text-neutral-400 hover:text-brand rounded-lg hover:bg-neutral-50 transition-colors"
+                onClick={onToggleExpand}
+                aria-label={isExpanded ? 'Collapse price detail' : 'Expand price detail'}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                  {isExpanded ? (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  ) : (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  )}
+                </svg>
+              </button>
+            )
           )}
         </div>
       </div>
