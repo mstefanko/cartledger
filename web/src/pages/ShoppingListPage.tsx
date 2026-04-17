@@ -14,6 +14,7 @@ import { StorePicker } from '@/components/lists/StorePicker'
 import { ItemPriceDetail } from '@/components/lists/ItemPriceDetail'
 import { AddItemsModal } from '@/components/lists/AddItemsModal'
 import { StoreAssignDropdown } from '@/components/lists/StoreAssignDropdown'
+import { ListTotalsBar } from '@/components/lists/ListTotalsBar'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -132,6 +133,41 @@ function ShoppingListPage() {
       return sum
     }, 0)
   }, [uncheckedItems])
+
+  // Phase 4: group unchecked items by assigned_store_id for multi-store mode.
+  // Unassigned bucket (storeId = null) first, then assigned buckets alphabetical
+  // by store name. Checked items remain ungrouped in the bottom bucket.
+  // Subtotal uses the same price source as `estimatedTotal` so the sum of all
+  // section subtotals equals the grand total shown in <ListTotalsBar>.
+  const groupedItems = useMemo(() => {
+    if (!multiStoreMode) return []
+    const buckets = new Map<
+      string,
+      { storeId: string | null; storeName: string; items: ListItemWithPrice[]; subtotal: number }
+    >()
+    // Seed Unassigned so it's present even if empty-ordered.
+    const UNASSIGNED_KEY = '__unassigned__'
+    for (const item of uncheckedItems) {
+      const key = item.assigned_store_id ?? UNASSIGNED_KEY
+      const storeId = item.assigned_store_id
+      const storeName = item.assigned_store_id
+        ? item.assigned_store_name ?? 'Store'
+        : 'Unassigned'
+      let bucket = buckets.get(key)
+      if (!bucket) {
+        bucket = { storeId, storeName, items: [], subtotal: 0 }
+        buckets.set(key, bucket)
+      }
+      bucket.items.push(item)
+      const price = item.store_price ?? item.estimated_price
+      if (price) bucket.subtotal += parseFloat(price)
+    }
+    const unassigned = buckets.get(UNASSIGNED_KEY)
+    const assigned = Array.from(buckets.values())
+      .filter((b) => b.storeId !== null)
+      .sort((a, b) => a.storeName.localeCompare(b.storeName))
+    return unassigned ? [unassigned, ...assigned] : assigned
+  }, [multiStoreMode, uncheckedItems])
 
   // Update list name mutation
   const updateNameMutation = useMutation({
@@ -581,33 +617,77 @@ function ShoppingListPage() {
         </div>
       </div>
 
-      {/* Item list — unchecked */}
-      <div className="flex flex-col gap-1">
-        {uncheckedItems.map((item) => (
-          <ListItemRow
-            key={item.id}
-            item={item}
-            onToggle={(checked) =>
-              toggleCheckMutation.mutate({ itemId: item.id, checked })
-            }
-            onDelete={() => deleteItemMutation.mutate(item.id)}
-            onRename={(name) =>
-              updateItemNameMutation.mutate({ itemId: item.id, name })
-            }
-            isExpanded={expandedItemId === item.id}
-            onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
-            isCleanView={isCleanView}
-            multiStoreMode={multiStoreMode}
-            isSelected={selectedItemIds.has(item.id)}
-            onToggleSelected={() => onToggleSelected(item.id)}
-            onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
-            stores={storesQuery.data ?? []}
-            onAssignStore={(storeId) =>
-              assignStoreMutation.mutate({ itemId: item.id, storeId })
-            }
-          />
-        ))}
-      </div>
+      {/* Item list — unchecked. In multi-store mode, grouped by assigned store
+          with per-section subtotals. In single-store mode, flat render. */}
+      {multiStoreMode ? (
+        <div className="flex flex-col gap-4">
+          {groupedItems.map((group) => (
+            <div key={group.storeId ?? '__unassigned__'} className="flex flex-col gap-1">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide">
+                  {group.storeName} ({group.items.length})
+                </p>
+                {group.subtotal > 0 && (
+                  <span className="text-small font-medium text-brand">
+                    Est. ${group.subtotal.toFixed(2)}
+                  </span>
+                )}
+              </div>
+              {group.items.map((item) => (
+                <ListItemRow
+                  key={item.id}
+                  item={item}
+                  onToggle={(checked) =>
+                    toggleCheckMutation.mutate({ itemId: item.id, checked })
+                  }
+                  onDelete={() => deleteItemMutation.mutate(item.id)}
+                  onRename={(name) =>
+                    updateItemNameMutation.mutate({ itemId: item.id, name })
+                  }
+                  isExpanded={expandedItemId === item.id}
+                  onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
+                  isCleanView={isCleanView}
+                  multiStoreMode={multiStoreMode}
+                  isSelected={selectedItemIds.has(item.id)}
+                  onToggleSelected={() => onToggleSelected(item.id)}
+                  onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
+                  stores={storesQuery.data ?? []}
+                  onAssignStore={(storeId) =>
+                    assignStoreMutation.mutate({ itemId: item.id, storeId })
+                  }
+                />
+              ))}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {uncheckedItems.map((item) => (
+            <ListItemRow
+              key={item.id}
+              item={item}
+              onToggle={(checked) =>
+                toggleCheckMutation.mutate({ itemId: item.id, checked })
+              }
+              onDelete={() => deleteItemMutation.mutate(item.id)}
+              onRename={(name) =>
+                updateItemNameMutation.mutate({ itemId: item.id, name })
+              }
+              isExpanded={expandedItemId === item.id}
+              onToggleExpand={() => setExpandedItemId(expandedItemId === item.id ? null : item.id)}
+              isCleanView={isCleanView}
+              multiStoreMode={multiStoreMode}
+              isSelected={selectedItemIds.has(item.id)}
+              onToggleSelected={() => onToggleSelected(item.id)}
+              onEnterMultiStore={() => enterMultiStoreWithRow(item.id)}
+              stores={storesQuery.data ?? []}
+              onAssignStore={(storeId) =>
+                assignStoreMutation.mutate({ itemId: item.id, storeId })
+              }
+            />
+          ))}
+        </div>
+      )}
 
       {/* Add item input */}
       <div className="relative mt-3 mb-4">
@@ -749,8 +829,9 @@ function ShoppingListPage() {
         </div>
       )}
 
-      {/* Footer — estimated total for unchecked */}
-      {uncheckedItems.length > 0 && estimatedTotal > 0 && (
+      {/* Footer — estimated total for unchecked (single-store only; multi-store
+          mode uses <ListTotalsBar> instead per Phase 4). */}
+      {!multiStoreMode && uncheckedItems.length > 0 && estimatedTotal > 0 && (
         <div className="mt-6 pt-4 border-t border-neutral-200">
           <div className="flex items-center justify-between">
             <span className="text-body-medium font-medium text-neutral-900">Estimated Total</span>
@@ -762,6 +843,16 @@ function ShoppingListPage() {
             Based on {uncheckedItems.filter((i) => i.estimated_price).length} of {uncheckedItems.length} items with price data
           </p>
         </div>
+      )}
+
+      {/* Sticky grand-total bar — multi-store mode only. Phase 5 will render
+          <BatchActionBar> in the same slot when rows are selected. */}
+      {multiStoreMode && (
+        <ListTotalsBar
+          itemCount={uncheckedItems.length}
+          grandTotal={estimatedTotal}
+          hidden={selectedItemIds.size > 0}
+        />
       )}
 
       {/* Share Modal */}
