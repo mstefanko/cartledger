@@ -19,6 +19,7 @@ import {
 import { listStores } from '@/api/stores'
 import { listLists, createList } from '@/api/lists'
 import { getUnmatchedCount } from '@/api/review'
+import { useHasIntegrations } from '@/hooks/useHasIntegrations'
 
 interface SidebarProps {
   open: boolean
@@ -41,8 +42,16 @@ const pageLinks: { to: string; label: string; Icon: IconComponent }[] = [
   { to: '/products', label: 'Products', Icon: Package },
   { to: '/rules', label: 'Auto-Match', Icon: Wand2 },
   { to: '/receipts', label: 'Receipts', Icon: Receipt },
-  { to: '/import', label: 'Import', Icon: Upload },
 ]
+
+// Import is gated on having at least one configured+enabled integration. It's
+// appended dynamically inside the component so useHasIntegrations hides it
+// during load (no flash-show) and when no integration is connected.
+const IMPORT_LINK: { to: string; label: string; Icon: IconComponent } = {
+  to: '/import',
+  label: 'Import',
+  Icon: Upload,
+}
 
 const ICON_SIZE = 16
 
@@ -71,6 +80,13 @@ function Sidebar({ open, onClose }: SidebarProps) {
   })
 
   const unmatchedCount = unmatchedCountQuery.data?.count ?? 0
+
+  const { hasAny: hasIntegrations, isLoading: integrationsLoading } = useHasIntegrations()
+  // While loading, hide the Import link entirely so it doesn't flash in and
+  // then disappear once we learn there are no configured integrations.
+  const visiblePageLinks = !integrationsLoading && hasIntegrations
+    ? [...pageLinks, IMPORT_LINK]
+    : pageLinks
 
   const listsQuery = useQuery({
     queryKey: ['shopping-lists'],
@@ -201,7 +217,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
             Pages
           </p>
           <div className="flex flex-col gap-0.5">
-            {pageLinks.map((link) => (
+            {visiblePageLinks.map((link) => (
               <NavLink key={link.to} to={link.to} className={navLinkClass} onClick={onClose}>
                 <link.Icon size={ICON_SIZE} aria-hidden="true" />
                 <span className="flex-1">{link.label}</span>

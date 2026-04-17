@@ -7,14 +7,16 @@ import { Input } from '@/components/ui/Input'
 import { Modal } from '@/components/ui/Modal'
 import { InviteModal } from '@/components/ui/InviteModal'
 import ConversionsPage from './ConversionsPage'
+import IntegrationsTab from '@/components/settings/IntegrationsTab'
 
-const TABS = ['profile', 'household', 'conversions', 'invite', 'danger'] as const
+const TABS = ['profile', 'household', 'conversions', 'integrations', 'invite', 'danger'] as const
 type Tab = (typeof TABS)[number]
 
 const tabLabels: Record<Tab, string> = {
   profile: 'Profile',
   household: 'Household',
   conversions: 'Unit Conversions',
+  integrations: 'Integrations',
   invite: 'Invite Members',
   danger: 'Danger Zone',
 }
@@ -57,6 +59,7 @@ function SettingsPage() {
       {activeTab === 'profile' && <ProfileTab />}
       {activeTab === 'household' && <HouseholdTab />}
       {activeTab === 'conversions' && <ConversionsPage />}
+      {activeTab === 'integrations' && <IntegrationsTab />}
       {activeTab === 'invite' && <InviteTab />}
       {activeTab === 'danger' && <DangerTab />}
     </div>

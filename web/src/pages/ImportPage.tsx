@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   getMealieStatus,
@@ -42,10 +43,15 @@ function ImportPage() {
       {!isConnected && !statusQuery.isLoading && (
         <div className="mt-6 bg-white rounded-2xl shadow-subtle p-6">
           <h2 className="font-display text-feature font-semibold text-neutral-900 mb-2">Not Configured</h2>
-          <p className="text-body text-neutral-500">
-            Mealie integration is not configured. Set the <code className="text-caption bg-neutral-50 px-1.5 py-0.5 rounded">MEALIE_URL</code> and{' '}
-            <code className="text-caption bg-neutral-50 px-1.5 py-0.5 rounded">MEALIE_TOKEN</code> environment variables to connect to your Mealie instance.
+          <p className="text-body text-neutral-500 mb-4">
+            Mealie integration isn&apos;t connected for this household yet.
           </p>
+          <Link
+            to="/settings?tab=integrations"
+            className="inline-flex items-center gap-2 text-caption font-medium text-brand hover:text-brand-dark"
+          >
+            Manage in Settings → Integrations
+          </Link>
         </div>
       )}
 
