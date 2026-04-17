@@ -236,17 +236,22 @@ function ShoppingListPage() {
       string,
       { storeId: string | null; storeName: string; items: ListItemWithPrice[]; subtotal: number }
     >()
-    // Seed Unassigned so it's present even if empty-ordered.
     const UNASSIGNED_KEY = '__unassigned__'
     for (const item of uncheckedItems) {
-      const key = item.assigned_store_id ?? UNASSIGNED_KEY
-      const storeId = item.assigned_store_id
-      const storeName = item.assigned_store_id
+      // Treat empty-string and null equivalently — the Go API stores NULL for
+      // unassigned items, but a ?? null-coalesce would keep "" as a separate
+      // bucket key, producing two "Unassigned" sections that both render with
+      // the same header text.
+      const rawStoreId = item.assigned_store_id
+      const normalizedStoreId =
+        rawStoreId && rawStoreId !== '' ? rawStoreId : null
+      const key = normalizedStoreId ?? UNASSIGNED_KEY
+      const storeName = normalizedStoreId
         ? item.assigned_store_name ?? 'Store'
         : 'Unassigned'
       let bucket = buckets.get(key)
       if (!bucket) {
-        bucket = { storeId, storeName, items: [], subtotal: 0 }
+        bucket = { storeId: normalizedStoreId, storeName, items: [], subtotal: 0 }
         buckets.set(key, bucket)
       }
       bucket.items.push(item)
@@ -445,12 +450,16 @@ function ShoppingListPage() {
     }
   }, [list, multiStoreMode])
 
-  // Toggle the mode button. Clears selection and latches hasAutoEngaged so
-  // we don't bounce back on next list refresh.
+  // Toggle the mode button. Clears selection + any per-row expanded state so
+  // the row tree re-renders cleanly in the new mode (no stale chevron/detail
+  // pane left open). Latches hasAutoEngaged so we don't bounce back on the
+  // next list refresh.
   const toggleMultiStoreMode = useCallback(() => {
     hasAutoEngagedRef.current = true
     setMultiStoreMode((prev) => !prev)
     setSelectedItemIds(new Set())
+    setExpandedItemId(null)
+    setCopyMenuOpen(false)
   }, [])
 
   // Row checkbox / row-click toggler — add/remove the item from the selection set.
@@ -928,9 +937,6 @@ function ShoppingListPage() {
               Copy
             </Button>
           )}
-          <Button variant="secondary" size="sm" onClick={() => navigate('/lists')}>
-            Back
-          </Button>
         </div>
       </div>
 
@@ -1376,8 +1382,10 @@ function ListItemRow({
       {/* Item content */}
       <div
         className={[
-          'relative bg-white border rounded-xl px-3 py-3 flex items-center gap-3 transition-transform',
-          multiStoreMode && isSelected ? 'border-brand ring-1 ring-brand' : 'border-neutral-200',
+          'relative border rounded-xl px-3 py-3 flex items-center gap-3 transition-transform',
+          multiStoreMode && isSelected
+            ? 'border-brand ring-2 ring-brand bg-brand-subtle'
+            : 'border-neutral-200 bg-white',
         ].join(' ')}
         style={{ transform: swiping ? `translateX(${swipeX}px)` : undefined }}
         onTouchStart={handleTouchStart}
@@ -1400,14 +1408,27 @@ function ListItemRow({
             aria-pressed={isSelected}
           >
             <span
-              className="w-6 h-6 rounded-md border-2 flex items-center justify-center"
+              className={[
+                'w-6 h-6 rounded-md border-2 flex items-center justify-center transition-colors',
+                isSelected
+                  ? 'bg-brand border-brand'
+                  : 'bg-white border-neutral-300',
+              ].join(' ')}
               style={{
+                // Hard fallback in case design tokens haven't loaded.
                 borderColor: isSelected ? '#149e61' : '#dedee5',
-                backgroundColor: isSelected ? '#149e61' : 'transparent',
+                backgroundColor: isSelected ? '#149e61' : '#ffffff',
               }}
             >
               {isSelected && (
-                <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="#ffffff"
+                  viewBox="0 0 24 24"
+                  strokeWidth={3}
+                  aria-hidden="true"
+                >
                   <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                 </svg>
               )}

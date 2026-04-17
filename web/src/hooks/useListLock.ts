@@ -64,8 +64,13 @@ export function useListLock(listId: string, currentUserId: string): UseListLockR
   listIdRef.current = listId
 
   const applyHolder = useCallback(
-    (holder: LockHolder | null) => {
-      const isHeldByMe = holder?.user_id === currentUserId
+    (holder: LockHolder | null, isMine?: boolean) => {
+      // `isMine` override: when we know from an HTTP response (200 from
+      // acquire / takeover) that we hold the lock, use that directly rather
+      // than comparing user_id. The caller may not yet have currentUserId
+      // hydrated from /profile, which would otherwise render the
+      // "someone else is editing" banner for the user's own lock.
+      const isHeldByMe = isMine ?? holder?.user_id === currentUserId
       isHeldByMeRef.current = isHeldByMe
       setState({ holder, isHeldByMe })
     },
@@ -81,23 +86,24 @@ export function useListLock(listId: string, currentUserId: string): UseListLockR
     acquireListLock(listId).then(
       (resp) => {
         if (cancelled) return
-        applyHolder(resp.holder)
-        if (resp.holder?.user_id === currentUserId) {
-          heartbeat = setInterval(() => {
-            heartbeatListLock(listId).catch((err) => {
-              if (err instanceof ApiClientError && err.status === 409) {
-                // Lost the lock — stop heartbeating; the WS event will
-                // surface the new holder for the banner.
-                if (heartbeat) {
-                  clearInterval(heartbeat)
-                  heartbeat = null
-                }
-                isHeldByMeRef.current = false
-                setState((prev) => ({ ...prev, isHeldByMe: false }))
+        // 200 from acquire means the server granted (or re-affirmed) the
+        // lock to us. Treat that as authoritative: we ARE the holder,
+        // regardless of whether currentUserId has hydrated yet.
+        applyHolder(resp.holder, true)
+        heartbeat = setInterval(() => {
+          heartbeatListLock(listId).catch((err) => {
+            if (err instanceof ApiClientError && err.status === 409) {
+              // Lost the lock — stop heartbeating; the WS event will
+              // surface the new holder for the banner.
+              if (heartbeat) {
+                clearInterval(heartbeat)
+                heartbeat = null
               }
-            })
-          }, HEARTBEAT_MS)
-        }
+              isHeldByMeRef.current = false
+              setState((prev) => ({ ...prev, isHeldByMe: false }))
+            }
+          })
+        }, HEARTBEAT_MS)
       },
       (err) => {
         if (cancelled) return
@@ -164,7 +170,8 @@ export function useListLock(listId: string, currentUserId: string): UseListLockR
   const takeOver = useCallback(async () => {
     if (!listId) return
     const resp = await takeOverListLock(listId)
-    applyHolder(resp.holder)
+    // Like acquire: 200 from takeover means we own the lock now.
+    applyHolder(resp.holder, true)
   }, [listId, applyHolder])
 
   return { state, takeOver }

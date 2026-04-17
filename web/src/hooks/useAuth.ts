@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from 'react'
 import { getToken, setToken, clearToken } from '@/api/client'
-import { getStatus, login as apiLogin } from '@/api/auth'
+import { getStatus, getProfile, login as apiLogin } from '@/api/auth'
 import type { User, LoginRequest } from '@/types'
 
 interface AuthContextValue {
@@ -51,7 +51,34 @@ function AuthProvider({ children }: AuthProviderProps) {
       }
     }
 
+    // Hydrate user from /profile on mount when we have a token but no user in
+    // state (e.g. after a page refresh). Without this, consumers like
+    // useListLock get `currentUserId=''` and can't recognize self-owned locks.
+    async function hydrateUser() {
+      const existing = getToken()
+      if (!existing) return
+      try {
+        const resp = await getProfile()
+        if (cancelled) return
+        const u: User = {
+          id: resp.user.id,
+          household_id: resp.user.household_id,
+          email: resp.user.email,
+          name: resp.user.name,
+          created_at: '',
+        }
+        setUser(u)
+      } catch {
+        // Token expired or profile fetch failed — clear token so
+        // ProtectedRoute redirects to login.
+        if (cancelled) return
+        clearToken()
+        setTokenState(null)
+      }
+    }
+
     void checkStatus()
+    void hydrateUser()
     return () => {
       cancelled = true
     }
