@@ -45,24 +45,26 @@ type updateListRequest struct {
 }
 
 type createListItemRequest struct {
-	Name           string  `json:"name"`
-	ProductID      *string `json:"product_id,omitempty"`
-	ProductGroupID *string `json:"product_group_id"`
-	Quantity       *string `json:"quantity,omitempty"`
-	Unit           *string `json:"unit,omitempty"`
-	Notes          *string `json:"notes,omitempty"`
+	Name            string  `json:"name"`
+	ProductID       *string `json:"product_id,omitempty"`
+	ProductGroupID  *string `json:"product_group_id"`
+	Quantity        *string `json:"quantity,omitempty"`
+	Unit            *string `json:"unit,omitempty"`
+	Notes           *string `json:"notes,omitempty"`
+	AssignedStoreID *string `json:"assigned_store_id,omitempty"`
 }
 
 type updateListItemRequest struct {
-	Name           *string `json:"name,omitempty"`
-	ProductID      *string `json:"product_id,omitempty"`
-	ProductGroupID *string `json:"product_group_id"`
-	Quantity       *string `json:"quantity,omitempty"`
-	Unit           *string `json:"unit,omitempty"`
-	Checked        *bool   `json:"checked,omitempty"`
-	CheckedBy      *string `json:"checked_by,omitempty"`
-	Notes          *string `json:"notes,omitempty"`
-	SortOrder      *int    `json:"sort_order,omitempty"`
+	Name            *string `json:"name,omitempty"`
+	ProductID       *string `json:"product_id,omitempty"`
+	ProductGroupID  *string `json:"product_group_id"`
+	Quantity        *string `json:"quantity,omitempty"`
+	Unit            *string `json:"unit,omitempty"`
+	Checked         *bool   `json:"checked,omitempty"`
+	CheckedBy       *string `json:"checked_by,omitempty"`
+	Notes           *string `json:"notes,omitempty"`
+	SortOrder       *int    `json:"sort_order,omitempty"`
+	AssignedStoreID *string `json:"assigned_store_id"`
 }
 
 type reorderListItemEntry struct {
@@ -121,6 +123,8 @@ type listItemResponse struct {
 	CheapestProductID *string `json:"cheapest_product_id,omitempty"`
 	StorePrice        *string `json:"store_price,omitempty"`
 	StorePriceStore   *string `json:"store_price_store,omitempty"`
+	AssignedStoreID   *string `json:"assigned_store_id,omitempty"`
+	AssignedStoreName *string `json:"assigned_store_name,omitempty"`
 	CreatedAt         string  `json:"created_at"`
 }
 
@@ -134,6 +138,7 @@ func (h *ListHandler) RegisterRoutes(protected *echo.Group) {
 	lists.DELETE("/:id", h.Delete)
 	lists.POST("/:id/items", h.AddItem)
 	lists.POST("/:id/items/bulk", h.BulkAddItems)
+	lists.PATCH("/:id/items/bulk", h.BulkUpdateItems)
 	lists.PUT("/:id/items/:itemId", h.UpdateItem)
 	lists.DELETE("/:id/items/:itemId", h.DeleteItem)
 	lists.PUT("/:id/reorder", h.ReorderItems)
@@ -246,10 +251,12 @@ func (h *ListHandler) Get(c echo.Context) error {
 		        (SELECT pp.unit_price FROM product_prices pp
 		         WHERE pp.product_id = sli.product_id
 		         ORDER BY pp.receipt_date DESC LIMIT 1) AS estimated_price,
-		        sli.product_group_id, pg.name AS product_group_name
+		        sli.product_group_id, pg.name AS product_group_name,
+		        sli.assigned_store_id, ast.name AS assigned_store_name
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
 		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
+		 LEFT JOIN stores ast ON sli.assigned_store_id = ast.id
 		 WHERE sli.list_id = ?
 		 ORDER BY sli.sort_order, sli.created_at`,
 		listID,
@@ -267,7 +274,8 @@ func (h *ListHandler) Get(c echo.Context) error {
 		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
 			&item.SortOrder, &item.Notes, &createdAt, &estimatedPrice,
-			&item.ProductGroupID, &item.ProductGroupName); err != nil {
+			&item.ProductGroupID, &item.ProductGroupName,
+			&item.AssignedStoreID, &item.AssignedStoreName); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		item.CreatedAt = createdAt.Format(time.RFC3339)
@@ -645,34 +653,56 @@ func insertListItem(ctx context.Context, tx DBTX, householdID, listID string, re
 		}
 	}
 
+	// Validate assigned store ownership if set.
+	if req.AssignedStoreID != nil && *req.AssignedStoreID != "" {
+		var storeHouseholdID string
+		err := tx.QueryRowContext(ctx,
+			`SELECT household_id FROM stores WHERE id = ?`,
+			*req.AssignedStoreID,
+		).Scan(&storeHouseholdID)
+		if err == sql.ErrNoRows || (err == nil && storeHouseholdID != householdID) {
+			return listItemResponse{}, echo.NewHTTPError(http.StatusBadRequest, "invalid assigned store")
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return listItemResponse{}, fmt.Errorf("verify assigned_store ownership: %w", err)
+		}
+	}
+
 	quantity := "1"
 	if req.Quantity != nil {
 		quantity = *req.Quantity
 	}
 
+	// Normalize empty-string assigned_store_id to nil so it's stored as NULL.
+	var assignedStoreID *string
+	if req.AssignedStoreID != nil && *req.AssignedStoreID != "" {
+		assignedStoreID = req.AssignedStoreID
+	}
+
 	now := time.Now().UTC()
 	var id string
 	err := tx.QueryRowContext(ctx,
-		`INSERT INTO shopping_list_items (id, list_id, product_id, product_group_id, name, quantity, unit, notes, created_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO shopping_list_items (id, list_id, product_id, product_group_id, name, quantity, unit, notes, assigned_store_id, created_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
-		listID, req.ProductID, req.ProductGroupID, req.Name, quantity, req.Unit, req.Notes, now,
+		listID, req.ProductID, req.ProductGroupID, req.Name, quantity, req.Unit, req.Notes, assignedStoreID, now,
 	).Scan(&id)
 	if err != nil {
 		return listItemResponse{}, fmt.Errorf("insert shopping_list_item: %w", err)
 	}
 
 	return listItemResponse{
-		ID:             id,
-		ListID:         listID,
-		ProductID:      req.ProductID,
-		ProductGroupID: req.ProductGroupID,
-		Name:           req.Name,
-		Quantity:       quantity,
-		Unit:           req.Unit,
-		Checked:        false,
-		Notes:          req.Notes,
-		CreatedAt:      now.Format(time.RFC3339),
+		ID:              id,
+		ListID:          listID,
+		ProductID:       req.ProductID,
+		ProductGroupID:  req.ProductGroupID,
+		Name:            req.Name,
+		Quantity:        quantity,
+		Unit:            req.Unit,
+		Checked:         false,
+		Notes:           req.Notes,
+		AssignedStoreID: assignedStoreID,
+		CreatedAt:       now.Format(time.RFC3339),
 	}, nil
 }
 
@@ -773,6 +803,8 @@ func (h *ListHandler) BulkAddItems(c echo.Context) error {
 	productIDSet := make(map[string]bool)
 	groupIDs := make([]string, 0, len(req.Items))
 	groupIDSet := make(map[string]bool)
+	storeIDs := make([]string, 0, len(req.Items))
+	storeIDSet := make(map[string]bool)
 	for _, it := range req.Items {
 		if it.ProductID != nil && *it.ProductID != "" && !productIDSet[*it.ProductID] {
 			productIDs = append(productIDs, *it.ProductID)
@@ -781,6 +813,10 @@ func (h *ListHandler) BulkAddItems(c echo.Context) error {
 		if it.ProductGroupID != nil && *it.ProductGroupID != "" && !groupIDSet[*it.ProductGroupID] {
 			groupIDs = append(groupIDs, *it.ProductGroupID)
 			groupIDSet[*it.ProductGroupID] = true
+		}
+		if it.AssignedStoreID != nil && *it.AssignedStoreID != "" && !storeIDSet[*it.AssignedStoreID] {
+			storeIDs = append(storeIDs, *it.AssignedStoreID)
+			storeIDSet[*it.AssignedStoreID] = true
 		}
 	}
 
@@ -805,6 +841,18 @@ func (h *ListHandler) BulkAddItems(c echo.Context) error {
 		if len(missing) > 0 {
 			return c.JSON(http.StatusBadRequest, map[string]string{
 				"error": fmt.Sprintf("unknown product_group_id(s): %s", strings.Join(missing, ",")),
+			})
+		}
+	}
+	if len(storeIDs) > 0 {
+		found, err := selectIDsInHousehold(ctx, h.DB, "stores", storeIDs, householdID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		missing := missingIDs(storeIDs, found)
+		if len(missing) > 0 {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("unknown assigned_store_id(s): %s", strings.Join(missing, ",")),
 			})
 		}
 	}
@@ -935,10 +983,12 @@ func (h *ListHandler) loadListDetail(ctx context.Context, householdID, listID st
 		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
 		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
 		        sli.sort_order, sli.notes, sli.created_at,
-		        sli.product_group_id, pg.name AS product_group_name
+		        sli.product_group_id, pg.name AS product_group_name,
+		        sli.assigned_store_id, ast.name AS assigned_store_name
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
 		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
+		 LEFT JOIN stores ast ON sli.assigned_store_id = ast.id
 		 WHERE sli.list_id = ?
 		 ORDER BY sli.sort_order, sli.created_at`,
 		listID,
@@ -955,7 +1005,8 @@ func (h *ListHandler) loadListDetail(ctx context.Context, householdID, listID st
 		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
 			&item.SortOrder, &item.Notes, &createdAt,
-			&item.ProductGroupID, &item.ProductGroupName); err != nil {
+			&item.ProductGroupID, &item.ProductGroupName,
+			&item.AssignedStoreID, &item.AssignedStoreName); err != nil {
 			return resp, err
 		}
 		item.CreatedAt = createdAt.Format(time.RFC3339)
@@ -1041,6 +1092,26 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 		setClauses = append(setClauses, "sort_order = ?")
 		args = append(args, *req.SortOrder)
 	}
+	if req.AssignedStoreID != nil {
+		if *req.AssignedStoreID == "" {
+			setClauses = append(setClauses, "assigned_store_id = NULL")
+		} else {
+			// Validate store ownership.
+			var storeHouseholdID string
+			err := h.DB.QueryRow(
+				`SELECT household_id FROM stores WHERE id = ?`,
+				*req.AssignedStoreID,
+			).Scan(&storeHouseholdID)
+			if err == sql.ErrNoRows || (err == nil && storeHouseholdID != householdID) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid assigned store"})
+			}
+			if err != nil && err != sql.ErrNoRows {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+			}
+			setClauses = append(setClauses, "assigned_store_id = ?")
+			args = append(args, *req.AssignedStoreID)
+		}
+	}
 
 	if len(setClauses) == 0 {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "no fields to update"})
@@ -1072,16 +1143,19 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
 		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
 		        sli.sort_order, sli.notes, sli.created_at,
-		        sli.product_group_id, pg.name AS product_group_name
+		        sli.product_group_id, pg.name AS product_group_name,
+		        sli.assigned_store_id, ast.name AS assigned_store_name
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
 		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
+		 LEFT JOIN stores ast ON sli.assigned_store_id = ast.id
 		 WHERE sli.id = ?`,
 		itemID,
 	).Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 		&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
 		&item.SortOrder, &item.Notes, &createdAt,
-		&item.ProductGroupID, &item.ProductGroupName)
+		&item.ProductGroupID, &item.ProductGroupName,
+		&item.AssignedStoreID, &item.AssignedStoreName)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -1213,4 +1287,193 @@ func (h *ListHandler) ReorderItems(c echo.Context) error {
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+// --- Bulk update ---
+
+// bulkUpdateItemsRequest is the request body for PATCH /lists/:id/items/bulk.
+// Patch is a free-form object so we can reject unknown fields explicitly with
+// a 400 (rather than silently ignoring them). Supported fields: "assigned_store_id"
+// (string|null — null/empty clears) and "checked" (bool).
+type bulkUpdateItemsRequest struct {
+	ItemIDs []string               `json:"item_ids"`
+	Patch   map[string]interface{} `json:"patch"`
+}
+
+// BulkUpdateItems applies a small set of patch fields to multiple list items
+// in a single transaction and broadcasts one WS event after commit.
+//
+// PATCH /api/v1/lists/:id/items/bulk
+func (h *ListHandler) BulkUpdateItems(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	listID := c.Param("id")
+	ctx := c.Request().Context()
+
+	// Verify list belongs to household.
+	var exists int
+	err := h.DB.QueryRowContext(ctx,
+		"SELECT 1 FROM shopping_lists WHERE id = ? AND household_id = ?",
+		listID, householdID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "list not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req bulkUpdateItemsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.ItemIDs) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "item_ids is required"})
+	}
+	if len(req.ItemIDs) > 500 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot update more than 500 items in one request"})
+	}
+	if len(req.Patch) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "patch is required"})
+	}
+
+	// --- Validate patch fields. Only "assigned_store_id" and "checked" are
+	// supported in phase 1; any other key must 400. ---
+	setClauses := make([]string, 0, len(req.Patch))
+	patchArgs := make([]interface{}, 0, len(req.Patch))
+	var storeIDToValidate *string
+
+	for key, raw := range req.Patch {
+		switch key {
+		case "assigned_store_id":
+			if raw == nil {
+				setClauses = append(setClauses, "assigned_store_id = NULL")
+				continue
+			}
+			s, ok := raw.(string)
+			if !ok {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "assigned_store_id must be a string or null"})
+			}
+			if s == "" {
+				setClauses = append(setClauses, "assigned_store_id = NULL")
+				continue
+			}
+			storeIDToValidate = &s
+			setClauses = append(setClauses, "assigned_store_id = ?")
+			patchArgs = append(patchArgs, s)
+		case "checked":
+			b, ok := raw.(bool)
+			if !ok {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "checked must be a boolean"})
+			}
+			setClauses = append(setClauses, "checked = ?")
+			patchArgs = append(patchArgs, b)
+		default:
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("unsupported patch field: %s", key),
+			})
+		}
+	}
+
+	// Validate store_id belongs to household (outside tx; cheap).
+	if storeIDToValidate != nil {
+		found, err := selectIDsInHousehold(ctx, h.DB, "stores", []string{*storeIDToValidate}, householdID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if !found[*storeIDToValidate] {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("unknown assigned_store_id: %s", *storeIDToValidate),
+			})
+		}
+	}
+
+	// Validate every item_id belongs to the list.
+	placeholders := strings.Repeat("?,", len(req.ItemIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	validateArgs := make([]interface{}, 0, len(req.ItemIDs)+1)
+	for _, id := range req.ItemIDs {
+		validateArgs = append(validateArgs, id)
+	}
+	validateArgs = append(validateArgs, listID)
+
+	rows, err := h.DB.QueryContext(ctx,
+		fmt.Sprintf("SELECT id FROM shopping_list_items WHERE id IN (%s) AND list_id = ?", placeholders),
+		validateArgs...,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer rows.Close()
+	foundItems := make(map[string]bool, len(req.ItemIDs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		foundItems[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	missing := missingIDs(req.ItemIDs, foundItems)
+	if len(missing) > 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("unknown item_id(s): %s", strings.Join(missing, ",")),
+		})
+	}
+
+	// --- Transaction: apply the patch to every item. ---
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	// Build the final UPDATE statement. We apply the same patch to every
+	// item in one statement using IN (...).
+	updateArgs := make([]interface{}, 0, len(patchArgs)+len(req.ItemIDs)+1)
+	updateArgs = append(updateArgs, patchArgs...)
+	for _, id := range req.ItemIDs {
+		updateArgs = append(updateArgs, id)
+	}
+	updateArgs = append(updateArgs, listID)
+
+	query := fmt.Sprintf(
+		"UPDATE shopping_list_items SET %s WHERE id IN (%s) AND list_id = ?",
+		strings.Join(setClauses, ", "),
+		placeholders,
+	)
+	if _, err := tx.ExecContext(ctx, query, updateArgs...); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, "UPDATE shopping_lists SET updated_at = ? WHERE id = ?", now, listID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+	committed = true
+
+	// Broadcast one WS message so subscribers refetch the list detail.
+	h.Hub.Broadcast(ws.Message{
+		Type:      ws.EventListItemsBulkUpdated,
+		Household: householdID,
+		Payload: map[string]interface{}{
+			"list_id":  listID,
+			"item_ids": req.ItemIDs,
+		},
+	})
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"list_id":  listID,
+		"item_ids": req.ItemIDs,
+	})
 }

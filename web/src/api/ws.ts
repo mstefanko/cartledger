@@ -40,6 +40,19 @@ export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocke
       case 'list.item.updated':
         void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
         break
+      case 'list.items.bulk_updated': {
+        const payload = (message.payload ?? {}) as { list_id?: string }
+        if (payload.list_id) {
+          void queryClient.invalidateQueries({ queryKey: ['shopping-list', payload.list_id] })
+        }
+        void queryClient.invalidateQueries({ queryKey: ['shopping-lists'] })
+        break
+      }
+      case 'list.lock.acquired':
+      case 'list.lock.released':
+      case 'list.lock.taken_over':
+        // handled by useListLock hook in Phase 7
+        break
       case 'product.updated':
         void queryClient.invalidateQueries({ queryKey: ['products'] })
         break

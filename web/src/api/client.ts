@@ -116,6 +116,19 @@ export async function del<T>(path: string): Promise<T> {
   return handleResponse<T>(response)
 }
 
+export async function patch<T>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${getBaseUrl()}${path}`, {
+    method: 'PATCH',
+    headers: {
+      ...authHeaders(),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  })
+  return handleResponse<T>(response)
+}
+
 export async function postMultipart<T>(path: string, formData: FormData): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'POST',

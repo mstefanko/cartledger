@@ -1,4 +1,4 @@
-import { get, post, put, del } from './client'
+import { get, post, put, del, patch } from './client'
 import { getToken } from './client'
 import type {
   ShoppingListWithCounts,
@@ -53,6 +53,26 @@ export async function bulkAddItems(
   return post<BulkAddItemsResponse>(
     `/lists/${encodeURIComponent(listId)}/items/bulk`,
     { items },
+  )
+}
+
+export interface BulkUpdateItemsPatch {
+  assigned_store_id?: string | null
+  checked?: boolean
+}
+
+export interface BulkUpdateItemsResponse {
+  list_id: string
+  item_ids: string[]
+}
+
+export async function bulkUpdateItems(
+  listId: string,
+  params: { item_ids: string[]; patch: BulkUpdateItemsPatch },
+): Promise<BulkUpdateItemsResponse> {
+  return patch<BulkUpdateItemsResponse>(
+    `/lists/${encodeURIComponent(listId)}/items/bulk`,
+    params,
   )
 }
 

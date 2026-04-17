@@ -471,6 +471,8 @@ export interface ListItemWithPrice {
   product_group_id: string | null
   product_group_name: string | null
   cheapest_product_id: string | null
+  assigned_store_id: string | null
+  assigned_store_name: string | null
 }
 
 export interface ShoppingListDetail {
@@ -503,6 +505,7 @@ export interface CreateListItemRequest {
   quantity?: string
   unit?: string
   notes?: string
+  assigned_store_id?: string | null
 }
 
 export interface UpdateListItemRequest {
@@ -515,6 +518,7 @@ export interface UpdateListItemRequest {
   checked_by?: string
   notes?: string
   sort_order?: number
+  assigned_store_id?: string | null
 }
 
 export interface ReorderListItemsRequest {
@@ -624,6 +628,26 @@ export interface WSListItemUpdated {
     list_id: string
     item_id: string
   }
+}
+
+export interface WSListItemsBulkUpdated {
+  type: 'list.items.bulk_updated'
+  payload: { list_id: string; item_ids: string[] }
+}
+
+export interface WSListLockAcquired {
+  type: 'list.lock.acquired'
+  payload: { list_id: string; user_id: string; user_name: string }
+}
+
+export interface WSListLockReleased {
+  type: 'list.lock.released'
+  payload: { list_id: string; user_id: string }
+}
+
+export interface WSListLockTakenOver {
+  type: 'list.lock.taken_over'
+  payload: { list_id: string; new_user_id: string; new_user_name: string; prior_user_id: string }
 }
 
 // --- Analytics Types ---

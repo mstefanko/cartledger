@@ -97,6 +97,32 @@ func seedGroup(t *testing.T, h *ListHandler, householdID, name string) string {
 	return id
 }
 
+// seedStore inserts a store for householdID and returns its id.
+func seedStore(t *testing.T, h *ListHandler, householdID, name string) string {
+	t.Helper()
+	var id string
+	if err := h.DB.QueryRow(
+		"INSERT INTO stores (household_id, name) VALUES (?, ?) RETURNING id",
+		householdID, name,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert store: %v", err)
+	}
+	return id
+}
+
+// seedListItem inserts a minimal shopping_list_item and returns its id.
+func seedListItem(t *testing.T, h *ListHandler, listID, name string) string {
+	t.Helper()
+	var id string
+	if err := h.DB.QueryRow(
+		"INSERT INTO shopping_list_items (list_id, name) VALUES (?, ?) RETURNING id",
+		listID, name,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert shopping_list_item: %v", err)
+	}
+	return id
+}
+
 // callBulkAdd invokes BulkAddItems on the given list as the given household and returns the recorder.
 func callBulkAdd(t *testing.T, h *ListHandler, householdID, listID, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -401,5 +427,195 @@ func TestAddItem_SingleAddStillWorks(t *testing.T) {
 	}
 	if countItems(t, h, listID) != 1 {
 		t.Errorf("row count: got %d want 1", countItems(t, h, listID))
+	}
+}
+
+// callBulkUpdate invokes BulkUpdateItems on the given list as the given household and returns the recorder.
+func callBulkUpdate(t *testing.T, h *ListHandler, householdID, listID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/lists/"+listID+"/items/bulk", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set(auth.ContextKeyHouseholdID, householdID)
+	c.SetParamNames("id")
+	c.SetParamValues(listID)
+	if err := h.BulkUpdateItems(c); err != nil {
+		t.Fatalf("BulkUpdateItems err: %v", err)
+	}
+	return rec
+}
+
+// TestBulkUpdate_AssignStoreHappyPath assigns a store to three items in one request.
+func TestBulkUpdate_AssignStoreHappyPath(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	store := seedStore(t, h, hh, "Aldi")
+	item1 := seedListItem(t, h, listID, "A")
+	item2 := seedListItem(t, h, listID, "B")
+	item3 := seedListItem(t, h, listID, "C")
+
+	body := `{"item_ids":["` + item1 + `","` + item2 + `","` + item3 + `"],
+		"patch":{"assigned_store_id":"` + store + `"}}`
+
+	rec := callBulkUpdate(t, h, hh, listID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify DB state.
+	var count int
+	if err := h.DB.QueryRow(
+		"SELECT COUNT(*) FROM shopping_list_items WHERE list_id = ? AND assigned_store_id = ?",
+		listID, store,
+	).Scan(&count); err != nil {
+		t.Fatalf("count assigned: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3 items assigned, got %d", count)
+	}
+}
+
+// TestBulkUpdate_ClearAssignment sets assigned_store_id to null to clear it.
+func TestBulkUpdate_ClearAssignment(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	store := seedStore(t, h, hh, "Aldi")
+	item1 := seedListItem(t, h, listID, "A")
+
+	// Pre-assign.
+	if _, err := h.DB.Exec(
+		"UPDATE shopping_list_items SET assigned_store_id = ? WHERE id = ?", store, item1,
+	); err != nil {
+		t.Fatalf("pre-assign: %v", err)
+	}
+
+	body := `{"item_ids":["` + item1 + `"],"patch":{"assigned_store_id":null}}`
+	rec := callBulkUpdate(t, h, hh, listID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var assigned *string
+	if err := h.DB.QueryRow(
+		"SELECT assigned_store_id FROM shopping_list_items WHERE id = ?", item1,
+	).Scan(&assigned); err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	if assigned != nil {
+		t.Errorf("expected null assigned_store_id, got %v", *assigned)
+	}
+}
+
+// TestBulkUpdate_CheckedBoolean toggles checked=true for multiple items.
+func TestBulkUpdate_CheckedBoolean(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	item1 := seedListItem(t, h, listID, "A")
+	item2 := seedListItem(t, h, listID, "B")
+
+	body := `{"item_ids":["` + item1 + `","` + item2 + `"],"patch":{"checked":true}}`
+	rec := callBulkUpdate(t, h, hh, listID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var checkedCount int
+	if err := h.DB.QueryRow(
+		"SELECT COUNT(*) FROM shopping_list_items WHERE list_id = ? AND checked = TRUE", listID,
+	).Scan(&checkedCount); err != nil {
+		t.Fatalf("count checked: %v", err)
+	}
+	if checkedCount != 2 {
+		t.Errorf("expected 2 checked, got %d", checkedCount)
+	}
+}
+
+// TestBulkUpdate_UnknownPatchField rejects with 400.
+func TestBulkUpdate_UnknownPatchField(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	item1 := seedListItem(t, h, listID, "A")
+
+	body := `{"item_ids":["` + item1 + `"],"patch":{"name":"nope"}}`
+	rec := callBulkUpdate(t, h, hh, listID, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unsupported patch field") {
+		t.Errorf("expected unsupported patch field error, got %s", rec.Body.String())
+	}
+}
+
+// TestBulkUpdate_UnknownItemID rejects with 400 and writes nothing.
+func TestBulkUpdate_UnknownItemID(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+	store := seedStore(t, h, hh, "Aldi")
+	item1 := seedListItem(t, h, listID, "A")
+
+	body := `{"item_ids":["` + item1 + `","nonexistent"],"patch":{"assigned_store_id":"` + store + `"}}`
+	rec := callBulkUpdate(t, h, hh, listID, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// Verify nothing was assigned.
+	var count int
+	if err := h.DB.QueryRow(
+		"SELECT COUNT(*) FROM shopping_list_items WHERE list_id = ? AND assigned_store_id IS NOT NULL", listID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected no rows assigned, got %d", count)
+	}
+}
+
+// TestBulkUpdate_CrossHouseholdStore rejects a store belonging to another household.
+func TestBulkUpdate_CrossHouseholdStore(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh1 := seedHousehold(t, h, "HH1")
+	hh2 := seedHousehold(t, h, "HH2")
+	listID := seedList(t, h, hh1, "Weekly")
+	otherStore := seedStore(t, h, hh2, "OtherMart")
+	item1 := seedListItem(t, h, listID, "A")
+
+	body := `{"item_ids":["` + item1 + `"],"patch":{"assigned_store_id":"` + otherStore + `"}}`
+	rec := callBulkUpdate(t, h, hh1, listID, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestBulkUpdate_UnknownList returns 404.
+func TestBulkUpdate_UnknownList(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh1 := seedHousehold(t, h, "HH1")
+	hh2 := seedHousehold(t, h, "HH2")
+	listID := seedList(t, h, hh2, "Other")
+
+	body := `{"item_ids":["any"],"patch":{"checked":true}}`
+	rec := callBulkUpdate(t, h, hh1, listID, body)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
