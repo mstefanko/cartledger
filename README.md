@@ -90,8 +90,9 @@ go test ./...
 | `LLM_MODEL` | `claude-sonnet-4-20250514` | Claude model ID (e.g., `claude-haiku-4-5-20251001` for cheaper/faster) |
 | `ANTHROPIC_API_KEY` | — | Required for receipt scanning |
 | `JWT_SECRET` | `change-me-in-production` | JWT signing key |
-| `MEALIE_URL` | — | Optional Mealie instance URL |
-| `MEALIE_TOKEN` | — | Optional Mealie API token |
+| `ALLOW_PRIVATE_INTEGRATIONS` | `false` | Allow integration base URLs on loopback/LAN/RFC1918 addresses (self-hosters on a LAN typically want `true`) |
+
+Mealie (and other recipe/shopping integrations) are configured per-household in the UI: **Settings -> Integrations**. No environment variables required.
 
 ## Project Structure
 

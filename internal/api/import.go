@@ -2,6 +2,8 @@ package api
 
 import (
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -12,14 +14,23 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/mealie"
+	"github.com/mstefanko/cartledger/internal/models"
 	"github.com/mstefanko/cartledger/internal/units"
 )
 
+// errMealieNotConfigured is returned by loadMealieClient when the household
+// has no Mealie integration row, or the row exists but is disabled. Handlers
+// branch on errors.Is to translate into the frontend-visible status shape
+// without leaking DB-layer errors.
+var errMealieNotConfigured = errors.New("mealie integration not configured")
+
 // ImportHandler holds dependencies for Mealie import endpoints.
 type ImportHandler struct {
-	DB  *sql.DB
-	Cfg *config.Config
+	DB           *sql.DB
+	Cfg          *config.Config
+	Integrations *db.IntegrationStore
 }
 
 // RegisterRoutes mounts import endpoints onto the protected group.
@@ -28,49 +39,113 @@ func (h *ImportHandler) RegisterRoutes(protected *echo.Group) {
 	imp.GET("/status", h.Status)
 	imp.GET("/recipes", h.ListRecipes)
 	imp.POST("/recipes/:slug", h.ImportRecipe)
+	imp.GET("/lists", h.ListShoppingLists)
 	imp.POST("/lists/:id", h.ImportShoppingList)
 }
 
-// mealieClient returns a Mealie client or nil if not configured.
-func (h *ImportHandler) mealieClient() *mealie.Client {
-	if h.Cfg.MealieURL == "" || h.Cfg.MealieToken == "" {
-		return nil
+// integrationStore returns the backing store, lazily constructing one from
+// h.DB if the handler was built without wiring the store explicitly. This
+// keeps existing callers that zero-init the handler (e.g. older tests) working.
+func (h *ImportHandler) integrationStore() *db.IntegrationStore {
+	if h.Integrations != nil {
+		return h.Integrations
 	}
-	return mealie.NewClient(h.Cfg.MealieURL, h.Cfg.MealieToken)
+	return db.NewIntegrationStore(h.DB)
 }
 
-// notConfigured returns a standard 404 response when Mealie is not configured.
-func notConfigured(c echo.Context) error {
-	return c.JSON(http.StatusNotFound, map[string]string{"error": "Mealie not configured"})
+// loadMealieClient reads the household's Mealie integration row and returns
+// a configured *mealie.Client along with the base URL (for status responses).
+// Returns errMealieNotConfigured if no row exists, the row is disabled, or
+// the stored credentials are empty/unparseable.
+func (h *ImportHandler) loadMealieClient(c echo.Context) (*mealie.Client, string, error) {
+	householdID := auth.HouseholdIDFrom(c)
+	if householdID == "" {
+		return nil, "", errMealieNotConfigured
+	}
+
+	row, err := h.integrationStore().GetByType(c.Request().Context(), householdID, models.IntegrationTypeMealie)
+	if err != nil {
+		return nil, "", err
+	}
+	if row == nil || !row.Enabled {
+		return nil, "", errMealieNotConfigured
+	}
+
+	var cfg models.MealieConfig
+	if err := json.Unmarshal(row.Config, &cfg); err != nil {
+		return nil, "", errMealieNotConfigured
+	}
+	if cfg.BaseURL == "" || cfg.Token == "" {
+		return nil, "", errMealieNotConfigured
+	}
+
+	return mealie.NewClient(cfg.BaseURL, cfg.Token), cfg.BaseURL, nil
 }
 
 // Status checks the Mealie connection.
 // GET /api/v1/import/mealie/status
+//
+// Always returns 200 with the shape the frontend consumes:
+//
+//	{configured: bool, connected: bool, mealie_url: string|null, error: string|null}
+//
+// Non-configured and connection-error cases are distinguished by `configured`
+// and `error` fields rather than by HTTP status, matching web/src/pages/ImportPage.tsx:138.
 func (h *ImportHandler) Status(c echo.Context) error {
-	client := h.mealieClient()
-	if client == nil {
-		return notConfigured(c)
+	client, baseURL, err := h.loadMealieClient(c)
+	if errors.Is(err, errMealieNotConfigured) {
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"configured": false,
+			"connected":  false,
+			"mealie_url": nil,
+			"error":      nil,
+		})
 	}
-
-	if err := client.Ping(); err != nil {
-		return c.JSON(http.StatusBadGateway, map[string]string{
-			"status": "error",
-			"error":  err.Error(),
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
+			"configured": false,
+			"connected":  false,
+			"mealie_url": nil,
+			"error":      "internal error",
 		})
 	}
 
-	return c.JSON(http.StatusOK, map[string]string{
-		"status":  "connected",
-		"base_url": h.Cfg.MealieURL,
+	if err := client.Ping(); err != nil {
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"configured": true,
+			"connected":  false,
+			"mealie_url": baseURL,
+			"error":      err.Error(),
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"configured": true,
+		"connected":  true,
+		"mealie_url": baseURL,
+		"error":      nil,
+	})
+}
+
+// notConfiguredResponse returns a 400 in the frontend-compatible shape for
+// non-status endpoints. Callers that only need connectivity use this to keep
+// copy consistent with the ConnectionStatus banner on ImportPage.
+func notConfiguredResponse(c echo.Context) error {
+	return c.JSON(http.StatusBadRequest, map[string]interface{}{
+		"error":      "Mealie not configured",
+		"configured": false,
 	})
 }
 
 // ListRecipes returns available recipes from Mealie.
 // GET /api/v1/import/mealie/recipes
 func (h *ImportHandler) ListRecipes(c echo.Context) error {
-	client := h.mealieClient()
-	if client == nil {
-		return notConfigured(c)
+	client, _, err := h.loadMealieClient(c)
+	if errors.Is(err, errMealieNotConfigured) {
+		return notConfiguredResponse(c)
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 
 	recipes, err := client.ListRecipes()
@@ -79,6 +154,26 @@ func (h *ImportHandler) ListRecipes(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, recipes)
+}
+
+// ListShoppingLists returns shopping lists from Mealie. The frontend calls this
+// via web/src/api/import.ts:22; the handler was previously unregistered.
+// GET /api/v1/import/mealie/lists
+func (h *ImportHandler) ListShoppingLists(c echo.Context) error {
+	client, _, err := h.loadMealieClient(c)
+	if errors.Is(err, errMealieNotConfigured) {
+		return notConfiguredResponse(c)
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	}
+
+	lists, err := client.ListShoppingLists()
+	if err != nil {
+		return c.JSON(http.StatusBadGateway, map[string]string{"error": err.Error()})
+	}
+
+	return c.JSON(http.StatusOK, lists)
 }
 
 // --- Import recipe types ---
@@ -95,21 +190,24 @@ type importedIngredient struct {
 }
 
 type importedRecipeResponse struct {
-	RecipeName  string               `json:"recipe_name"`
-	RecipeSlug  string               `json:"recipe_slug"`
-	Yield       string               `json:"yield"`
-	Ingredients []importedIngredient `json:"ingredients"`
-	TotalCost   *string              `json:"total_cost,omitempty"`
-	LinksCreated int                 `json:"links_created"`
+	RecipeName   string               `json:"recipe_name"`
+	RecipeSlug   string               `json:"recipe_slug"`
+	Yield        string               `json:"yield"`
+	Ingredients  []importedIngredient `json:"ingredients"`
+	TotalCost    *string              `json:"total_cost,omitempty"`
+	LinksCreated int                  `json:"links_created"`
 }
 
 // ImportRecipe fetches a recipe from Mealie, matches ingredients to the product
 // catalog, creates product_links, and calculates costs.
 // POST /api/v1/import/mealie/recipes/:slug
 func (h *ImportHandler) ImportRecipe(c echo.Context) error {
-	client := h.mealieClient()
-	if client == nil {
-		return notConfigured(c)
+	client, _, err := h.loadMealieClient(c)
+	if errors.Is(err, errMealieNotConfigured) {
+		return notConfiguredResponse(c)
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 
 	householdID := auth.HouseholdIDFrom(c)
@@ -298,9 +396,12 @@ func (h *ImportHandler) calculateIngredientCost(productID string, quantity float
 // ImportShoppingList imports a Mealie shopping list as a CartLedger shopping list.
 // POST /api/v1/import/mealie/lists/:id
 func (h *ImportHandler) ImportShoppingList(c echo.Context) error {
-	client := h.mealieClient()
-	if client == nil {
-		return notConfigured(c)
+	client, _, err := h.loadMealieClient(c)
+	if errors.Is(err, errMealieNotConfigured) {
+		return notConfiguredResponse(c)
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 
 	householdID := auth.HouseholdIDFrom(c)

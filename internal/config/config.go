@@ -18,8 +18,6 @@ type Config struct {
 	LLMProvider    string // "claude", "claude-cli", "gemini", "mock" (empty = auto-detect)
 	LLMModel       string // Claude model ID (default: claude-sonnet-4-20250514)
 	JWTSecret      string
-	MealieURL      string
-	MealieToken    string
 	// AllowPrivateIntegrations, when true, permits integration base_urls that
 	// resolve to loopback / link-local / RFC1918 / IPv6 ULA addresses. Default
 	// is false to prevent SSRF probes of internal services; self-hosted users
@@ -43,8 +41,6 @@ func Load() *Config {
 		LLMProvider:    getEnv("LLM_PROVIDER", ""),
 		LLMModel:       getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
 		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-production"),
-		MealieURL:      getEnv("MEALIE_URL", ""),
-		MealieToken:    getEnv("MEALIE_TOKEN", ""),
 		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
 		LockInactivityTTL: getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
 	}

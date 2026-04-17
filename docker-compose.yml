@@ -10,8 +10,10 @@ services:
       - CARTLEDGER_UPLOAD_DIR=/data/receipts
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}      # optional fallback
-      - MEALIE_URL=${MEALIE_URL}              # optional
-      - MEALIE_TOKEN=${MEALIE_TOKEN}          # optional
+      # Integrations (Mealie, Tandoor, Grocy, ...) are configured per-household
+      # in the UI at Settings -> Integrations. Set ALLOW_PRIVATE_INTEGRATIONS=true
+      # if your Mealie is reachable on a LAN/private address.
+      - ALLOW_PRIVATE_INTEGRATIONS=${ALLOW_PRIVATE_INTEGRATIONS:-false}
     restart: unless-stopped
 
   # Optional: Mealie alongside (if not already running)
