@@ -226,13 +226,21 @@ function ShoppingListPage() {
     }, 0)
   }, [uncheckedItems])
 
-  // Potential savings from Optimize Price: for each item, compare the current
-  // effective price (store_price for the preferred store, or estimated_price)
-  // against cheapest_price. Only count items whose cheapest_store resolves to
-  // a known store id (otherwise we can't actually reassign them). canOptimize
-  // flips to true as soon as any single item has a real potential saving.
+  // Potential savings + optimize-CTA signal.
+  //
+  // canOptimize trips as soon as any item's effective store (toolbar
+  // preferred_store_id in single-store mode, assigned_store_id in multi-store
+  // mode) is not the cheapest known store for that item. This is independent
+  // of whether we can quote a dollar saving — the user still benefits from
+  // reassigning even when the current scoped store has no price on record.
+  //
+  // potentialSavings is a dollars-and-cents estimate for items we can actually
+  // price-compare: sums (current - cheapest) for items with both store_price
+  // and cheapest_price. May be 0 even when canOptimize is true (e.g. scoped
+  // store has no price record → current price falls back to cheapest itself).
   const { potentialSavings, canOptimize } = useMemo(() => {
     const storeList = storesQuery.data ?? []
+    const preferredId = listQuery.data?.preferred_store_id ?? null
     let saved = 0
     let canOpt = false
     for (const item of uncheckedItems) {
@@ -241,15 +249,20 @@ function ShoppingListPage() {
         (s) => (s.nickname ?? s.name) === item.cheapest_store,
       )
       if (!cheapestStore) continue
-      const current = parseFloat(item.store_price ?? item.estimated_price ?? '0')
-      const cheapest = parseFloat(item.cheapest_price)
-      if (cheapest < current) {
-        saved += current - cheapest
+      const effectiveStoreId = multiStoreMode
+        ? item.assigned_store_id
+        : preferredId
+      if (effectiveStoreId && effectiveStoreId !== cheapestStore.id) {
         canOpt = true
+      }
+      if (item.store_price) {
+        const current = parseFloat(item.store_price)
+        const cheapest = parseFloat(item.cheapest_price)
+        if (cheapest < current) saved += current - cheapest
       }
     }
     return { potentialSavings: saved, canOptimize: canOpt }
-  }, [uncheckedItems, storesQuery.data])
+  }, [uncheckedItems, storesQuery.data, listQuery.data, multiStoreMode])
 
   // Phase 4: group unchecked items by assigned_store_id for multi-store mode.
   // Unassigned bucket (storeId = null) first, then assigned buckets alphabetical
@@ -1288,10 +1301,12 @@ function ShoppingListPage() {
           <p className="text-small text-neutral-400 mt-1">
             Based on {uncheckedItems.filter((i) => i.estimated_price).length} of {uncheckedItems.length} items with price data
           </p>
-          {canOptimize && potentialSavings > 0 ? (
+          {canOptimize ? (
             <div className="flex items-center justify-between gap-2 mt-2">
               <span className="text-small text-neutral-600">
-                Save ${potentialSavings.toFixed(2)} by shopping at different stores.
+                {potentialSavings > 0
+                  ? `Save $${potentialSavings.toFixed(2)} by shopping at different stores.`
+                  : 'Some items are cheaper at other stores.'}
               </span>
               <button
                 type="button"

@@ -28,7 +28,7 @@ export function ListTotalsBar({
   optimizing,
 }: ListTotalsBarProps) {
   if (hidden) return null
-  const showSavingsCta = canOptimize && (potentialSavings ?? 0) > 0 && onOptimize
+  const showSavingsCta = canOptimize && onOptimize
   const showBestConfirmation =
     !showSavingsCta && itemCount > 0 && potentialSavings !== undefined
   return (
@@ -49,7 +49,9 @@ export function ListTotalsBar({
         {showSavingsCta && (
           <div className="flex items-center justify-between gap-2">
             <span className="text-small text-neutral-600">
-              Save ${potentialSavings!.toFixed(2)} by shopping at different stores.
+              {(potentialSavings ?? 0) > 0
+                ? `Save $${potentialSavings!.toFixed(2)} by shopping at different stores.`
+                : 'Some items are cheaper at other stores.'}
             </span>
             <button
               type="button"
