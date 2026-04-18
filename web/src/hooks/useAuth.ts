@@ -7,19 +7,28 @@ import {
   createElement,
   type ReactNode,
 } from 'react'
-import { getToken, setToken, clearToken } from '@/api/client'
-import { getStatus, getProfile, login as apiLogin } from '@/api/auth'
+import {
+  getStatus,
+  getProfile,
+  login as apiLogin,
+  logout as apiLogout,
+} from '@/api/auth'
 import type { User, LoginRequest } from '@/types'
 
 interface AuthContextValue {
   user: User | null
+  // Retained for call-site back-compat; always null in cookie mode.
   token: string | null
   needsSetup: boolean
   isAuthenticated: boolean
   isLoading: boolean
   login: (data: LoginRequest) => Promise<void>
-  logout: () => void
-  setAuth: (token: string, user: User) => void
+  logout: () => Promise<void>
+  // setAuth was previously called after login/setup/join to stash the token
+  // into localStorage and flip isAuthenticated. With cookie auth the server
+  // owns cookie lifecycle, so this just records the user server-side-returned
+  // profile into React state and clears needsSetup.
+  setAuth: (user: User) => void
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -30,63 +39,48 @@ interface AuthProviderProps {
 
 function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null)
-  const [token, setTokenState] = useState<string | null>(getToken)
   const [needsSetup, setNeedsSetup] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
     let cancelled = false
 
-    async function checkStatus() {
+    async function bootstrap() {
       try {
+        // /status is public (no auth); tells us whether to route to /setup.
         const status = await getStatus()
         if (cancelled) return
         setNeedsSetup(status.needs_setup)
       } catch {
         // Status endpoint unavailable — assume no setup needed
-      } finally {
-        if (!cancelled) {
-          setIsLoading(false)
-        }
       }
-    }
 
-    // Hydrate user from /profile on mount when we have a token but no user in
-    // state (e.g. after a page refresh). Without this, consumers like
-    // useListLock get `currentUserId=''` and can't recognize self-owned locks.
-    async function hydrateUser() {
-      const existing = getToken()
-      if (!existing) return
+      // Probe /profile with the cookie (if any). 200 => authenticated;
+      // anything else leaves user=null which signals not-authenticated.
       try {
         const resp = await getProfile()
         if (cancelled) return
-        const u: User = {
+        setUser({
           id: resp.user.id,
           household_id: resp.user.household_id,
           email: resp.user.email,
           name: resp.user.name,
           created_at: '',
-        }
-        setUser(u)
+        })
       } catch {
-        // Token expired or profile fetch failed — clear token so
-        // ProtectedRoute redirects to login.
-        if (cancelled) return
-        clearToken()
-        setTokenState(null)
+        // Unauthenticated or profile fetch failed — user stays null.
+      } finally {
+        if (!cancelled) setIsLoading(false)
       }
     }
 
-    void checkStatus()
-    void hydrateUser()
+    void bootstrap()
     return () => {
       cancelled = true
     }
   }, [])
 
-  const setAuth = useCallback((newToken: string, newUser: User) => {
-    setToken(newToken)
-    setTokenState(newToken)
+  const setAuth = useCallback((newUser: User) => {
     setUser(newUser)
     setNeedsSetup(false)
   }, [])
@@ -94,22 +88,25 @@ function AuthProvider({ children }: AuthProviderProps) {
   const login = useCallback(
     async (data: LoginRequest) => {
       const response = await apiLogin(data)
-      setAuth(response.token, response.user)
+      setAuth(response.user)
     },
     [setAuth],
   )
 
-  const logout = useCallback(() => {
-    clearToken()
-    setTokenState(null)
+  const logout = useCallback(async () => {
+    try {
+      await apiLogout()
+    } catch {
+      // Best effort — even if the server call fails, drop local user state.
+    }
     setUser(null)
   }, [])
 
   const value: AuthContextValue = {
     user,
-    token,
+    token: null,
     needsSetup,
-    isAuthenticated: token !== null,
+    isAuthenticated: user !== null,
     isLoading,
     login,
     logout,

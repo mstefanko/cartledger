@@ -20,7 +20,9 @@ function SetupPage() {
   const mutation = useMutation({
     mutationFn: (data: SetupRequest) => setup(data),
     onSuccess: (response) => {
-      setAuth(response.token, response.user)
+      // Cookie is set by the server on POST /setup. We only record the user
+      // into React state here.
+      setAuth(response.user)
       navigate('/', { replace: true })
     },
   })

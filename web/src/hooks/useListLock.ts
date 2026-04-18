@@ -5,7 +5,7 @@ import {
   takeOverListLock,
   type LockHolder,
 } from '@/api/lists'
-import { ApiClientError, getToken } from '@/api/client'
+import { ApiClientError } from '@/api/client'
 import { releaseListLock } from '@/api/lists'
 import {
   on as onLockEvent,
@@ -28,21 +28,19 @@ export interface UseListLockResult {
 // Heartbeat every 30s; backend TTL defaults to 60s.
 const HEARTBEAT_MS = 30_000
 
-// Best-effort release on tab close. `navigator.sendBeacon` is the canonical
-// fire-and-forget primitive but cannot set an Authorization header — and the
-// release endpoint sits behind the JWT middleware. fetch({ keepalive: true })
-// is the modern equivalent that DOES preserve headers across unload, so we
-// use that when available and fall back to a plain fetch (which the browser
-// may cancel if the tab dies too fast).
+// Best-effort release on tab close. With cookie auth the browser attaches
+// the session cookie automatically (same origin, SameSite=Strict satisfied).
+// fetch({ keepalive: true, credentials: 'include' }) preserves the cookie
+// across page unload. navigator.sendBeacon would also work here but returns
+// less useful error telemetry than fetch.
 function bestEffortRelease(listId: string): void {
-  const token = getToken()
   const url = `${window.location.origin}/api/v1/lists/${encodeURIComponent(
     listId,
   )}/lock/release`
   try {
     void fetch(url, {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
       keepalive: true,
     })
   } catch {

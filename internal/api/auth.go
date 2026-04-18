@@ -50,8 +50,16 @@ type joinRequest struct {
 	Password string `json:"password"`
 }
 
+// authResponse is the shape returned by /setup, /login, and /join.
+//
+// As of the cookie-auth cutover the JWT is NOT returned in the body — it is
+// delivered via an HttpOnly Set-Cookie header and is not accessible to
+// JavaScript. We keep the struct field (rendered as empty string) for a short
+// compatibility window so older clients that read `resp.token` get an obvious
+// "" rather than a field-missing deserialization error; new clients should
+// rely solely on the cookie.
 type authResponse struct {
-	Token string `json:"token"`
+	Token string       `json:"token"`
 	User  userResponse `json:"user"`
 }
 
@@ -72,6 +80,12 @@ func (h *AuthHandler) RegisterRoutes(public *echo.Group, publicRateLimited *echo
 	publicRateLimited.POST("/setup", h.Setup)
 	publicRateLimited.POST("/login", h.Login)
 	publicRateLimited.POST("/join", h.Join)
+
+	// Logout clears the session cookie. Does not require auth — accepting it
+	// unauthenticated keeps client logic simple (it can be called even if the
+	// cookie is already invalid) and there's nothing a caller gains from
+	// clearing a cookie they already don't possess.
+	public.POST("/logout", h.Logout)
 
 	protected.POST("/invite", h.CreateInvite)
 	protected.GET("/profile", h.GetProfile)
@@ -162,8 +176,10 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create token"})
 	}
 
+	// Deliver the JWT via HttpOnly cookie — no longer in the response body.
+	auth.SetAuthCookie(c, token)
+
 	return c.JSON(http.StatusCreated, authResponse{
-		Token: token,
 		User: userResponse{
 			ID:          userID,
 			HouseholdID: householdID,
@@ -206,8 +222,10 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create token"})
 	}
 
+	// Deliver the JWT via HttpOnly cookie — no longer in the response body.
+	auth.SetAuthCookie(c, token)
+
 	return c.JSON(http.StatusOK, authResponse{
-		Token: token,
 		User: userResponse{
 			ID:          userID,
 			HouseholdID: householdID,
@@ -215,6 +233,13 @@ func (h *AuthHandler) Login(c echo.Context) error {
 			Name:        name,
 		},
 	})
+}
+
+// Logout clears the session cookie. Safe to call when already logged out.
+// POST /api/v1/logout
+func (h *AuthHandler) Logout(c echo.Context) error {
+	auth.ClearAuthCookie(c)
+	return c.JSON(http.StatusOK, map[string]string{"status": "logged out"})
 }
 
 // CreateInvite generates an invite link with a signed JWT (7-day expiry).
@@ -324,8 +349,10 @@ func (h *AuthHandler) Join(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create token"})
 	}
 
+	// Deliver the JWT via HttpOnly cookie — no longer in the response body.
+	auth.SetAuthCookie(c, token)
+
 	return c.JSON(http.StatusCreated, authResponse{
-		Token: token,
 		User: userResponse{
 			ID:          userID,
 			HouseholdID: claims.HouseholdID,

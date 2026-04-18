@@ -1,17 +1,26 @@
 import type { ApiError } from '@/types'
 
-const TOKEN_KEY = 'cartledger_token'
-
+// --- Token shim (post cookie-auth cutover) -----------------------------------
+//
+// We migrated from Authorization: Bearer to an HttpOnly session cookie. These
+// functions are kept as no-op shims so existing call sites (useAuth,
+// useListLock, a handful of pages) keep compiling while we prune them. Cookie
+// auth happens automatically via fetch `credentials: 'include'` below.
+//
+// getToken() always returns null — JavaScript cannot read HttpOnly cookies,
+// which is the whole point. setToken()/clearToken() are no-ops; the server
+// manages cookie lifecycle via Set-Cookie headers on /login, /setup, /join,
+// and /logout.
 export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY)
+  return null
 }
 
-export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token)
+export function setToken(_token: string): void {
+  // no-op: the server sets the HttpOnly cookie
 }
 
 export function clearToken(): void {
-  localStorage.removeItem(TOKEN_KEY)
+  // no-op: the server clears the cookie on POST /logout
 }
 
 function getBaseUrl(): string {
@@ -32,7 +41,8 @@ export class ApiClientError extends Error {
 
 async function handleResponse<T>(response: Response): Promise<T> {
   if (response.status === 401) {
-    clearToken()
+    // Cookie expired / missing. Send the user back to /login; the server has
+    // already cleared (or never set) our cookie.
     window.location.href = '/login'
     throw new ApiClientError(401, 'Unauthorized')
   }
@@ -62,17 +72,11 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return data as T
 }
 
-function authHeaders(): HeadersInit {
-  const token = getToken()
-  if (!token) return {}
-  return { Authorization: `Bearer ${token}` }
-}
-
 export async function get<T>(path: string): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'GET',
+    credentials: 'include',
     headers: {
-      ...authHeaders(),
       Accept: 'application/json',
     },
   })
@@ -82,8 +86,8 @@ export async function get<T>(path: string): Promise<T> {
 export async function post<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
-      ...authHeaders(),
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
@@ -95,8 +99,8 @@ export async function post<T>(path: string, body?: unknown): Promise<T> {
 export async function put<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'PUT',
+    credentials: 'include',
     headers: {
-      ...authHeaders(),
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
@@ -108,8 +112,8 @@ export async function put<T>(path: string, body?: unknown): Promise<T> {
 export async function del<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'DELETE',
+    credentials: 'include',
     headers: {
-      ...authHeaders(),
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       Accept: 'application/json',
     },
@@ -121,8 +125,8 @@ export async function del<T>(path: string, body?: unknown): Promise<T> {
 export async function patch<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'PATCH',
+    credentials: 'include',
     headers: {
-      ...authHeaders(),
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
@@ -134,8 +138,8 @@ export async function patch<T>(path: string, body?: unknown): Promise<T> {
 export async function postMultipart<T>(path: string, formData: FormData): Promise<T> {
   const response = await fetch(`${getBaseUrl()}${path}`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
-      ...authHeaders(),
       // Do NOT set Content-Type — browser sets it with boundary for multipart
     },
     body: formData,

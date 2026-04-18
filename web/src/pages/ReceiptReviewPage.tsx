@@ -3,7 +3,6 @@ import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
 import { getReceipt, deleteReceipt, type ReceiptDetail } from '@/api/receipts'
-import { getToken } from '@/api/client'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 
@@ -184,7 +183,7 @@ function ReceiptReviewPage() {
               {imagePaths.map((path, idx) => (
                 <ReceiptMagnifier
                   key={idx}
-                  src={`/api/v1/files/${path}?token=${encodeURIComponent(getToken() ?? '')}`}
+                  src={`/api/v1/files/${path}`}
                   alt={`Receipt page ${idx + 1}`}
                 />
               ))}

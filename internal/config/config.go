@@ -51,6 +51,22 @@ type Config struct {
 	// Convenience macros: "loopback" expands to 127.0.0.0/8 + ::1/128,
 	// "private" expands to RFC1918 + loopback + link-local ranges.
 	TrustedProxies []netip.Prefix
+	// AllowedOrigins is the parsed ALLOWED_ORIGINS list: scheme+host entries
+	// (e.g. "https://cartledger.example.com") that the WebSocket upgrade
+	// handler accepts as Origin. Populated from ALLOWED_ORIGINS env var; in
+	// non-production mode a localhost dev default is applied when unset.
+	// Production mode REQUIRES an explicit allow-list (Validate fails if unset).
+	AllowedOrigins []string
+}
+
+// defaultDevAllowedOrigins is the default ALLOWED_ORIGINS set used in non-
+// production mode when the env var is unset. Covers Vite dev server + the Go
+// server's own port, both on localhost and 127.0.0.1.
+var defaultDevAllowedOrigins = []string{
+	"http://localhost:5173",
+	"http://localhost:8079",
+	"http://127.0.0.1:5173",
+	"http://127.0.0.1:8079",
 }
 
 // loopbackProxyCIDRs is the expansion of TRUST_PROXY="loopback".
@@ -141,6 +157,14 @@ func Load() (*Config, error) {
 	}
 	cfg.TrustedProxies = trustedProxies
 
+	// Parse ALLOWED_ORIGINS: comma-separated scheme+host entries. In dev mode,
+	// default to a localhost set when unset. In prod, leave empty and let
+	// Validate fail with a clear error.
+	cfg.AllowedOrigins = parseAllowedOrigins(os.Getenv("ALLOWED_ORIGINS"))
+	if len(cfg.AllowedOrigins) == 0 && !isProduction() {
+		cfg.AllowedOrigins = append([]string(nil), defaultDevAllowedOrigins...)
+	}
+
 	// JWT_SECRET dev/prod policy. In non-production mode, synthesize an
 	// ephemeral secret so `make dev` and tests Just Work. In production,
 	// Validate will reject unset / default values.
@@ -202,6 +226,14 @@ func (c *Config) Validate() error {
 	// fast on bind with a clearer error than anything we invent here).
 	if strings.TrimSpace(c.Port) == "" {
 		errs = append(errs, errors.New("PORT: must not be empty"))
+	}
+
+	// In production, ALLOWED_ORIGINS must be explicitly set. The dev default
+	// (localhost) is never applied in prod, so an empty list here means the
+	// operator forgot to set it — fail loudly rather than silently accept
+	// cross-site WebSocket upgrades.
+	if isProduction() && len(c.AllowedOrigins) == 0 {
+		errs = append(errs, errors.New("ALLOWED_ORIGINS: must be set in production (comma-separated scheme+host list, e.g. https://cartledger.example.com)"))
 	}
 
 	return errors.Join(errs...)
@@ -278,6 +310,28 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	slog.Warn("config: invalid env var; using default", "key", key, "value", v, "default", fallback)
 	return fallback
+}
+
+// parseAllowedOrigins parses a comma-separated ALLOWED_ORIGINS value into a
+// normalized list of scheme+host entries. Each entry has surrounding whitespace
+// and trailing slashes stripped; empty entries are dropped. An empty or all-
+// whitespace input returns nil (the caller applies dev-mode defaults).
+func parseAllowedOrigins(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.TrimRight(p, "/")
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // getEnvDuration parses a time.Duration env var (e.g. "60s", "5m") and falls

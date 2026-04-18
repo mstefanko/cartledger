@@ -41,25 +41,22 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	// Security response headers (CSP, HSTS on TLS, framing/referrer/MIME hardening).
 	e.Use(SecurityHeaders())
 
-	// CORS: permissive for dev (JWT_SECRET == default), same-origin for prod.
-	if cfg.JWTSecret == "change-me-in-production" {
-		e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-			AllowOrigins: []string{"*"},
-			AllowMethods: []string{
-				http.MethodGet, http.MethodPost, http.MethodPut,
-				http.MethodPatch, http.MethodDelete, http.MethodOptions,
-			},
-			AllowHeaders:     []string{"Authorization", "Content-Type"},
-			AllowCredentials: false,
-		}))
-	} else {
-		e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-			AllowOrigins:     []string{},
-			AllowMethods:     []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete},
-			AllowHeaders:     []string{"Authorization", "Content-Type"},
-			AllowCredentials: false,
-		}))
-	}
+	// CORS: cookie auth requires AllowCredentials=true AND a concrete origin
+	// allow-list (browsers refuse credentialed requests to "*"). We reuse
+	// cfg.AllowedOrigins — the same list used for WS Origin validation — so
+	// operators have a single config knob. In same-origin deploys (frontend
+	// and API on the same host), CORS never actually fires; this block is
+	// only relevant to dev (Vite on 5173 -> Go on 8079) and future split
+	// deployments.
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: cfg.AllowedOrigins,
+		AllowMethods: []string{
+			http.MethodGet, http.MethodPost, http.MethodPut,
+			http.MethodPatch, http.MethodDelete, http.MethodOptions,
+		},
+		AllowHeaders:     []string{"Authorization", "Content-Type", "X-API-Key"},
+		AllowCredentials: true,
+	}))
 
 	// --- Route groups ---
 
@@ -180,34 +177,23 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	reviewHandler := &ReviewHandler{DB: database, Cfg: cfg, Hub: hub}
 	reviewHandler.RegisterRoutes(protected)
 
-	// Serve uploaded receipt images. Accepts JWT via Authorization header
-	// or ?token= query param (needed for <img> tags which can't send headers).
+	// Serve uploaded receipt images. Auth is cookie-first (browsers DO send
+	// cookies on same-origin <img src=>); ?token= query fallback is kept but
+	// emits a deprecation warning so operators can monitor usage.
 	v1.GET("/files/*", func(c echo.Context) error {
-		// Auth: check header first, then query param.
-		token := ""
-		if h := c.Request().Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			token = strings.TrimPrefix(h, "Bearer ")
+		if _, err := auth.AuthenticateWithQueryToken(c, cfg.JWTSecret); err != nil {
+			return err
 		}
-		if token == "" {
-			token = c.QueryParam("token")
-		}
-		if token == "" {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "missing token"})
-		}
-		if _, err := auth.ValidateAuthToken(cfg.JWTSecret, token); err != nil {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid token"})
-		}
-
 		filePath := c.Param("*")
 		if containsDotDot(filePath) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
 		}
-
 		return c.File(filePath)
 	})
 
-	// WebSocket endpoint (auth via query param, not middleware).
-	wsHandler := &WSHandler{Hub: hub, JWTSecret: cfg.JWTSecret}
+	// WebSocket endpoint — auth handled inside the handler (multi-source
+	// reader: cookie, Bearer, X-API-Key, or ?token= fallback).
+	wsHandler := NewWSHandler(hub, cfg)
 	v1.GET("/ws", wsHandler.HandleWS)
 
 	// --- Static file serving (catch-all for SPA) ---

@@ -1,4 +1,4 @@
-import { get, post, put, del, setToken } from './client'
+import { get, post, put, del } from './client'
 import type {
   StatusResponse,
   SetupRequest,
@@ -15,16 +15,19 @@ export async function getStatus(): Promise<StatusResponse> {
   return get<StatusResponse>('/status')
 }
 
+// setup / login / join: the server sets the session cookie via Set-Cookie.
+// The response body carries the user object only (the `token` field is a
+// legacy artefact that will be empty post-cutover; do NOT rely on it).
 export async function setup(data: SetupRequest): Promise<SetupResponse> {
-  const response = await post<SetupResponse>('/setup', data)
-  setToken(response.token)
-  return response
+  return post<SetupResponse>('/setup', data)
 }
 
 export async function login(data: LoginRequest): Promise<LoginResponse> {
-  const response = await post<LoginResponse>('/login', data)
-  setToken(response.token)
-  return response
+  return post<LoginResponse>('/login', data)
+}
+
+export async function logout(): Promise<{ status: string }> {
+  return post<{ status: string }>('/logout')
 }
 
 export async function invite(): Promise<InviteResponse> {
@@ -36,9 +39,7 @@ export async function validateInvite(token: string): Promise<ValidateInviteRespo
 }
 
 export async function join(data: JoinRequest): Promise<JoinResponse> {
-  const response = await post<JoinResponse>('/join', data)
-  setToken(response.token)
-  return response
+  return post<JoinResponse>('/join', data)
 }
 
 export async function getProfile(): Promise<{ user: { id: string; household_id: string; email: string; name: string }; household_name: string }> {

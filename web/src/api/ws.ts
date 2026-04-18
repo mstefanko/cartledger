@@ -1,6 +1,5 @@
 import ReconnectingWebSocket from 'reconnecting-websocket'
 import type { QueryClient } from '@tanstack/react-query'
-import { getToken } from './client'
 import { emit as emitLockEvent } from './lockEvents'
 import type {
   LockAcquiredPayload,
@@ -12,9 +11,11 @@ import type { WSMessage } from '@/types'
 let socket: ReconnectingWebSocket | null = null
 
 function getWsUrl(): string {
+  // Cookie auth: browsers attach same-origin cookies to WebSocket upgrade
+  // requests automatically (subject to SameSite rules, which our Strict
+  // cookie satisfies for same-origin connects). No token in the URL.
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const token = getToken()
-  return `${protocol}//${window.location.host}/api/v1/ws?token=${encodeURIComponent(token ?? '')}`
+  return `${protocol}//${window.location.host}/api/v1/ws`
 }
 
 export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocket {

@@ -27,7 +27,9 @@ function JoinPage() {
   const mutation = useMutation({
     mutationFn: (data: JoinRequest) => join(data),
     onSuccess: (response) => {
-      setAuth(response.token, response.user)
+      // Cookie is set by the server on POST /join. We only record the user
+      // into React state here.
+      setAuth(response.user)
       navigate('/', { replace: true })
     },
   })
