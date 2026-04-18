@@ -40,9 +40,18 @@ export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocke
 
     // Invalidate relevant React Query caches based on message type
     switch (message.type) {
-      case 'receipt.complete':
+      case 'receipt.complete': {
         void queryClient.invalidateQueries({ queryKey: ['receipts'] })
+        // Also refresh the single-receipt detail cache so the currently-open
+        // ReceiptReviewPage flips out of its optimistic "processing" banner
+        // when the worker finishes (success or error, either way the row
+        // now has fresh status + error_message).
+        const payload = (message.payload ?? {}) as { receipt_id?: string }
+        if (payload.receipt_id) {
+          void queryClient.invalidateQueries({ queryKey: ['receipt', payload.receipt_id] })
+        }
         break
+      }
       case 'list.updated':
       case 'list.item.updated': {
         // Also invalidate the single-list detail cache so the currently-open

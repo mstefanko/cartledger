@@ -2,9 +2,10 @@ import { useState, useRef, useCallback } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
-import { getReceipt, deleteReceipt, type ReceiptDetail } from '@/api/receipts'
+import { getReceipt, deleteReceipt, reprocessReceipt, type ReceiptDetail } from '@/api/receipts'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
+import { ApiClientError } from '@/api/client'
 
 const LENS_SIZE = 280
 const ZOOM = 0.75
@@ -89,6 +90,34 @@ function ReceiptReviewPage() {
     },
   })
 
+  const [retryError, setRetryError] = useState<string | null>(null)
+  const retryMutation = useMutation({
+    mutationFn: () => reprocessReceipt(id!),
+    onMutate: async () => {
+      // Flip the detail cache to "processing" optimistically; the ws
+      // 'receipt.complete' event will invalidate ['receipt', id] when
+      // the worker finishes (success or failure).
+      await queryClient.cancelQueries({ queryKey: ['receipt', id] })
+      const previous = queryClient.getQueryData<ReceiptDetail>(['receipt', id])
+      if (previous) {
+        queryClient.setQueryData<ReceiptDetail>(['receipt', id], {
+          ...previous,
+          status: 'processing',
+          error_message: null,
+        })
+      }
+      return { previous }
+    },
+    onError: (err, _vars, ctx) => {
+      if (ctx?.previous) queryClient.setQueryData(['receipt', id], ctx.previous)
+      setRetryError(err instanceof ApiClientError ? err.message : 'Retry failed')
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['receipt', id] })
+      void queryClient.invalidateQueries({ queryKey: ['receipts'] })
+    },
+  })
+
   if (!id) {
     return (
       <div className="py-8">
@@ -155,6 +184,44 @@ function ReceiptReviewPage() {
               {receipt.card_last4 ? ` \u00b7\u00b7\u00b7\u00b7${receipt.card_last4}` : ''}
             </span>
           )}
+        </div>
+      )}
+
+      {receipt?.status === 'error' && (
+        <div
+          role="alert"
+          className="mb-4 rounded-lg border border-red-200 bg-red-50 p-4"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-red-800">
+                Extraction failed
+              </p>
+              <p className="mt-1 text-sm text-red-700">
+                {receipt.error_message || 'Processing failed (no details)'}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => { setRetryError(null); retryMutation.mutate() }}
+              disabled={retryMutation.isPending}
+            >
+              {retryMutation.isPending ? 'Retrying...' : 'Retry extraction'}
+            </Button>
+          </div>
+          {retryError && (
+            <p className="mt-2 text-xs text-red-600">{retryError}</p>
+          )}
+        </div>
+      )}
+
+      {receipt?.status === 'processing' && (
+        <div
+          role="status"
+          className="mb-4 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700"
+        >
+          Processing... this usually takes a few seconds.
         </div>
       )}
 

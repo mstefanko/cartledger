@@ -100,6 +100,9 @@ export interface Receipt {
   card_last4: string | null
   receipt_time: string | null
   created_at: string
+  // Populated when status='error' — the worker's most recent failure reason.
+  // Cleared on successful reprocess (see POST /receipts/:id/reprocess).
+  error_message?: string | null
 }
 
 export interface LineItem {

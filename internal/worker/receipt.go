@@ -91,6 +91,37 @@ var ErrQueueFull = fmt.Errorf("receipt processing queue is full")
 // and no longer accepts new jobs.
 var ErrWorkerShuttingDown = fmt.Errorf("receipt worker is shutting down")
 
+// ErrImagesGone is returned by Resubmit when the receipt's on-disk image
+// directory no longer exists (e.g. retention policy deleted it). The caller
+// should surface this as 410 Gone rather than 500, because the situation is
+// deterministic and user-actionable (re-upload the receipt).
+var ErrImagesGone = fmt.Errorf("receipt images no longer on disk")
+
+// Resubmit re-enqueues an existing receipt for background processing. Unlike
+// Submit, this is for user-initiated retries: it reconstructs the ReceiptJob
+// by locating the receipt's image directory under <DataDir>/receipts/<id>
+// (the canonical layout established in the Scan handler).
+//
+// Returns:
+//   - ErrImagesGone if the image directory is missing.
+//   - ErrQueueFull / ErrWorkerShuttingDown propagated from Submit.
+//
+// The caller (API handler) is responsible for flipping status='pending' and
+// clearing error_message before calling Resubmit; that ordering lets us fail
+// fast (no DB mutation) if the queue is closed or the images are gone.
+func (w *ReceiptWorker) Resubmit(receiptID, householdID string) error {
+	imageDir := filepath.Join(w.cfg.DataDir, "receipts", receiptID)
+	info, err := os.Stat(imageDir)
+	if err != nil || !info.IsDir() {
+		return ErrImagesGone
+	}
+	return w.Submit(ReceiptJob{
+		ReceiptID:   receiptID,
+		HouseholdID: householdID,
+		ImageDir:    imageDir,
+	})
+}
+
 // Submit enqueues a receipt job for background processing.
 // Returns ErrQueueFull if the queue is at capacity, allowing the caller to return 503.
 // Returns ErrWorkerShuttingDown if Shutdown has been initiated.

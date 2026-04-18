@@ -60,3 +60,15 @@ export async function confirmReceipt(
     { status: 'reviewed' },
   )
 }
+
+// Re-enqueue a failed (or still-pending) receipt for background processing.
+// Server returns 202 with {id, status: 'pending'}. The UI should flip the
+// card to "processing" and wait for the 'receipt.complete' WS event (which
+// invalidates the receipts/receipt caches).
+export async function reprocessReceipt(
+  receiptId: string,
+): Promise<{ id: string; status: string }> {
+  return post<{ id: string; status: string }>(
+    `/receipts/${encodeURIComponent(receiptId)}/reprocess`,
+  )
+}

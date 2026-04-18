@@ -105,9 +105,15 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	protected.Use(rateLimiter.Middleware(TierGlobal))
 	// Per-method rate limiter: GETs -> read tier, non-GETs -> write tier.
 	// Overrides tighten specific high-cost routes:
-	//   POST /api/v1/receipts/scan -> worker-submit (LLM-triggering)
+	//   POST /api/v1/receipts/scan            -> worker-submit (LLM-triggering)
+	//   POST /api/v1/receipts/:id/reprocess   -> worker-submit (LLM-triggering;
+	//                                            same cost surface as scan,
+	//                                            hard-capped to prevent a
+	//                                            retry-click storm from blowing
+	//                                            the per-household budget)
 	protected.Use(rateLimiter.ProtectedMethodMiddleware(map[string]string{
-		"/api/v1/receipts/scan": TierWorkerSubmit,
+		"/api/v1/receipts/scan":          TierWorkerSubmit,
+		"/api/v1/receipts/:id/reprocess": TierWorkerSubmit,
 	}))
 
 	// --- Health / readiness / liveness probes (all public, no auth) ---
@@ -185,7 +191,7 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	aliasHandler := &AliasHandler{DB: database, Cfg: cfg}
 	aliasHandler.RegisterRoutes(protected)
 
-	receiptHandler := &ReceiptHandler{DB: database, Cfg: cfg, Worker: receiptWorker}
+	receiptHandler := &ReceiptHandler{DB: database, Cfg: cfg, Worker: receiptWorker, Guard: llmGuard}
 	receiptHandler.RegisterRoutes(protected)
 
 	matchingHandler := &MatchingHandler{DB: database, Cfg: cfg}

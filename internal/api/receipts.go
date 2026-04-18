@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/imaging"
+	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
@@ -27,6 +29,10 @@ type ReceiptHandler struct {
 	DB     *sql.DB
 	Cfg    *config.Config
 	Worker *worker.ReceiptWorker
+	// Guard is optional. When non-nil, the Reprocess handler uses it to
+	// pre-flight budget + circuit-breaker state so users get a fast 503
+	// with a clear message instead of enqueueing a doomed job.
+	Guard *llm.GuardedExtractor
 }
 
 // --- Request / Response types ---
@@ -39,13 +45,14 @@ type updateLineItemRequest struct {
 }
 
 type receiptListItem struct {
-	ID          string  `json:"id"`
-	StoreName   *string `json:"store_name"`
-	ReceiptDate string  `json:"receipt_date"`
-	Total       *string `json:"total"`
-	Status      string  `json:"status"`
-	ItemCount   int     `json:"item_count"`
-	CreatedAt   string  `json:"created_at"`
+	ID           string  `json:"id"`
+	StoreName    *string `json:"store_name"`
+	ReceiptDate  string  `json:"receipt_date"`
+	Total        *string `json:"total"`
+	Status       string  `json:"status"`
+	ItemCount    int     `json:"item_count"`
+	CreatedAt    string  `json:"created_at"`
+	ErrorMessage *string `json:"error_message,omitempty"`
 }
 
 type lineItemResponse struct {
@@ -86,10 +93,11 @@ type receiptDetailResponse struct {
 	CardType    *string            `json:"card_type,omitempty"`
 	CardLast4   *string            `json:"card_last4,omitempty"`
 	ReceiptTime *string            `json:"receipt_time,omitempty"`
-	ImagePaths  *string            `json:"image_paths,omitempty"`
-	RawLLMJSON  *string            `json:"raw_llm_json,omitempty"`
-	CreatedAt   string             `json:"created_at"`
-	LineItems   []lineItemResponse `json:"line_items"`
+	ImagePaths   *string            `json:"image_paths,omitempty"`
+	RawLLMJSON   *string            `json:"raw_llm_json,omitempty"`
+	CreatedAt    string             `json:"created_at"`
+	ErrorMessage *string            `json:"error_message,omitempty"`
+	LineItems    []lineItemResponse `json:"line_items"`
 }
 
 // uploadBodyLimit caps the request body for multipart receipt uploads.
@@ -109,6 +117,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.GET("/:id", h.Get)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
 	receipts.POST("/:id/accept-suggestions", h.AcceptSuggestions)
+	receipts.POST("/:id/reprocess", h.Reprocess)
 	receipts.PUT("/:id", h.UpdateReceipt)
 	receipts.DELETE("/:id", h.Delete)
 }
@@ -229,6 +238,116 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	})
 }
 
+// Reprocess re-enqueues a failed (or still-pending) receipt so the worker
+// can take another pass. User-initiated only — there is no automatic
+// retry loop; composes with the error_message surfaced in Get so the user
+// can see *why* the last attempt failed.
+//
+// POST /api/v1/receipts/:id/reprocess
+//
+// Status map:
+//
+//	200/202 — accepted, job enqueued
+//	401     — no/invalid JWT (middleware)
+//	404     — receipt not found (also covers cross-household lookups)
+//	409     — receipt is in a state that disallows reprocess (processing/matched/reviewed)
+//	410     — receipt images no longer on disk (retention policy deleted them)
+//	503     — LLM budget exhausted, breaker open, or worker queue full
+//
+// The endpoint is mounted under the worker-submit rate-limit tier (see
+// router.go) because it triggers an LLM call, same cost surface as /scan.
+func (h *ReceiptHandler) Reprocess(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	// 1. Verify receipt exists + belongs to this household, and read status.
+	var status string
+	err := h.DB.QueryRow(
+		"SELECT status FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&status)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 2. Only allow reprocess from recoverable states. 'processing' means
+	// the worker is actively handling it; 'matched'/'reviewed' are successful
+	// terminal states where a silent re-extract would overwrite line-item
+	// edits and product matches the user already curated.
+	if status != "error" && status != "pending" {
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error":  fmt.Sprintf("cannot reprocess receipt in status %q", status),
+			"status": status,
+		})
+	}
+
+	// 3. Pre-flight the LLM guard if wired. No point enqueueing a job
+	// that will fail on the very first guard check inside the worker —
+	// tell the user immediately so the UI doesn't flicker to "processing"
+	// only to flip back to "error" a moment later.
+	if h.Guard != nil {
+		if err := llm.CheckBudget(h.Guard.DB(), householdID, h.Guard.Budget()); err != nil {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"error": "LLM monthly budget exhausted; raise LLM_MONTHLY_TOKEN_BUDGET or wait until next month",
+			})
+		}
+		if h.Guard.Breaker() != nil && h.Guard.Breaker().IsOpen() {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"error": "LLM temporarily unavailable (circuit breaker open); try again in a minute",
+			})
+		}
+	}
+
+	// 4. Flip status back to pending and clear the old error_message so
+	// the UI reflects the retry immediately. Do this BEFORE Resubmit so
+	// even if enqueue returns 503 below, the row is consistent with the
+	// user's intent (retryable), not stuck at 'error'.
+	//
+	// If Resubmit fails, we roll the row back to 'error' so List/Get
+	// accurately reflect the failed retry.
+	_, err = h.DB.Exec(
+		"UPDATE receipts SET status = 'pending', error_message = NULL WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	// 5. Re-enqueue via the worker. Resubmit re-reads image paths from disk
+	// so we never require the user to re-upload.
+	if err := h.Worker.Resubmit(receiptID, householdID); err != nil {
+		// Roll back the status flip.
+		_, _ = h.DB.Exec(
+			"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
+			err.Error(), receiptID,
+		)
+		switch {
+		case errors.Is(err, worker.ErrImagesGone):
+			return c.JSON(http.StatusGone, map[string]string{
+				"error": "receipt images are no longer on disk; please re-upload the receipt",
+			})
+		case errors.Is(err, worker.ErrQueueFull), errors.Is(err, worker.ErrWorkerShuttingDown):
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"error": "server busy, please try again later",
+			})
+		default:
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to enqueue receipt"})
+		}
+	}
+
+	// 6. Return 202 with the minimal receipt shape that the frontend needs
+	// to flip its local view optimistically. Full detail is available via
+	// GET /receipts/:id, and the ws 'receipt.complete' event will prompt
+	// the client to refetch when processing finishes.
+	return c.JSON(http.StatusAccepted, map[string]string{
+		"id":     receiptID,
+		"status": "pending",
+	})
+}
+
 // List returns all receipts for the authenticated household.
 // GET /api/v1/receipts
 func (h *ReceiptHandler) List(c echo.Context) error {
@@ -236,6 +355,7 @@ func (h *ReceiptHandler) List(c echo.Context) error {
 
 	rows, err := h.DB.Query(
 		`SELECT r.id, s.name, r.receipt_date, r.total, r.status, r.created_at,
+		        r.error_message,
 		        (SELECT COUNT(*) FROM line_items WHERE receipt_id = r.id) as item_count
 		 FROM receipts r
 		 LEFT JOIN stores s ON r.store_id = s.id
@@ -254,7 +374,7 @@ func (h *ReceiptHandler) List(c echo.Context) error {
 		var receiptDate time.Time
 		var total *decimal.Decimal
 		var createdAt time.Time
-		if err := rows.Scan(&r.ID, &r.StoreName, &receiptDate, &total, &r.Status, &createdAt, &r.ItemCount); err != nil {
+		if err := rows.Scan(&r.ID, &r.StoreName, &receiptDate, &total, &r.Status, &createdAt, &r.ErrorMessage, &r.ItemCount); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		r.ReceiptDate = receiptDate.Format("2006-01-02")
@@ -287,7 +407,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		`SELECT r.id, r.household_id, r.store_id, s.name, r.scanned_by, r.receipt_date,
 		        r.subtotal, r.tax, r.total, r.status, r.llm_provider,
 		        r.card_type, r.card_last4, r.receipt_time,
-		        r.image_paths, r.raw_llm_json, r.created_at
+		        r.image_paths, r.raw_llm_json, r.created_at, r.error_message
 		 FROM receipts r
 		 LEFT JOIN stores s ON r.store_id = s.id
 		 WHERE r.id = ? AND r.household_id = ?`,
@@ -297,7 +417,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		&resp.ScannedBy, &receiptDate, &subtotal, &tax, &total,
 		&resp.Status, &resp.LLMProvider,
 		&resp.CardType, &resp.CardLast4, &resp.ReceiptTime,
-		&resp.ImagePaths, &resp.RawLLMJSON, &createdAt,
+		&resp.ImagePaths, &resp.RawLLMJSON, &createdAt, &resp.ErrorMessage,
 	)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
