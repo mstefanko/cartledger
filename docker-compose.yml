@@ -1,20 +1,53 @@
 services:
   cartledger:
     build: .
+    # Match the non-root user baked into the Dockerfile (uid:gid 10001:10001).
+    user: "10001:10001"
     ports:
-      - "8080:8080"
+      - "8079:8079"
     volumes:
-      - ./data:/data          # SQLite DB + receipt images
+      # Host-mounted persistent data (SQLite DB + receipt images). Must be
+      # writable by uid 10001 on the host.
+      - ./data:/data
     environment:
+      - PORT=8079
+      - DATA_DIR=/data
       - CARTLEDGER_DB_PATH=/data/cartledger.db
       - CARTLEDGER_UPLOAD_DIR=/data/receipts
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}      # optional fallback
+      - JWT_SECRET=${JWT_SECRET}
       # Integrations (Mealie, Tandoor, Grocy, ...) are configured per-household
       # in the UI at Settings -> Integrations. Set ALLOW_PRIVATE_INTEGRATIONS=true
       # if your Mealie is reachable on a LAN/private address.
       - ALLOW_PRIVATE_INTEGRATIONS=${ALLOW_PRIVATE_INTEGRATIONS:-false}
     restart: unless-stopped
+
+    # Container filesystem is immutable; only /data (bind mount) and /tmp
+    # (tmpfs) are writable.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=64m,mode=1777
+
+    # Hardening: drop every Linux capability and forbid privilege escalation.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # /livez is added by the Go server. Uses wget from the alpine runtime stage.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8079/livez"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Resource limits — tune for deployment. These defaults are conservative
+    # for a small household receipt tracker running on a NAS / Pi-class host.
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 1.0
 
   # Optional: Mealie alongside (if not already running)
   # mealie:
