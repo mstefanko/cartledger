@@ -35,6 +35,11 @@ type Config struct {
 	GeminiAPIKey    string
 	LLMProvider     string // "claude", "claude-cli", "gemini", "mock" (empty = auto-detect)
 	LLMModel        string // Claude model ID (default: claude-sonnet-4-20250514)
+	// LLMMonthlyTokenBudget is the per-household monthly LLM token cap
+	// (input + output, combined). 0 means no cap. A reasonable self-host
+	// default is 2_000_000 (~$6/mo at Sonnet pricing). See
+	// internal/llm/usage.go.
+	LLMMonthlyTokenBudget int64
 	JWTSecret       string
 	// AllowPrivateIntegrations, when true, permits integration base_urls that
 	// resolve to loopback / link-local / RFC1918 / IPv6 ULA addresses. Default
@@ -150,6 +155,7 @@ func Load() (*Config, error) {
 		GeminiAPIKey:             getEnv("GEMINI_API_KEY", ""),
 		LLMProvider:              getEnv("LLM_PROVIDER", ""),
 		LLMModel:                 getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
+		LLMMonthlyTokenBudget:    getEnvInt64("LLM_MONTHLY_TOKEN_BUDGET", 0),
 		JWTSecret:                os.Getenv("JWT_SECRET"), // no default — policy applied below
 		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
 		LockInactivityTTL:        getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
@@ -339,6 +345,22 @@ func parseAllowedOrigins(raw string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// getEnvInt64 parses a base-10 int64 env var. On missing/malformed input
+// the default is returned (with a warning on malformed).
+func getEnvInt64(key string, fallback int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	var n int64
+	_, err := fmt.Sscanf(v, "%d", &n)
+	if err != nil {
+		slog.Warn("config: invalid int64; using default", "key", key, "value", v, "err", err, "default", fallback)
+		return fallback
+	}
+	return n
 }
 
 // getEnvDuration parses a time.Duration env var (e.g. "60s", "5m") and falls

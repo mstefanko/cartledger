@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -39,6 +40,7 @@ type ReceiptJob struct {
 type ReceiptWorker struct {
 	jobs        chan ReceiptJob
 	llmClient   llm.Client
+	guard       *llm.GuardedExtractor // wraps llmClient with budget + circuit breaker
 	matchEngine *matcher.Engine
 	db          *sql.DB
 	hub         *ws.Hub
@@ -53,10 +55,14 @@ type ReceiptWorker struct {
 }
 
 // NewReceiptWorker creates a new ReceiptWorker and starts the goroutine pool.
-func NewReceiptWorker(concurrency int, llmClient llm.Client, matchEngine *matcher.Engine, db *sql.DB, hub *ws.Hub, cfg *config.Config) *ReceiptWorker {
+// guard is optional — when non-nil, the worker calls guard.ExtractForHousehold
+// (which enforces budget + circuit breaker) instead of llmClient.ExtractReceipt.
+// Passing nil keeps pre-guard behavior (used by existing tests).
+func NewReceiptWorker(concurrency int, llmClient llm.Client, guard *llm.GuardedExtractor, matchEngine *matcher.Engine, db *sql.DB, hub *ws.Hub, cfg *config.Config) *ReceiptWorker {
 	w := &ReceiptWorker{
 		jobs:        make(chan ReceiptJob, 100),
 		llmClient:   llmClient,
+		guard:       guard,
 		matchEngine: matchEngine,
 		db:          db,
 		hub:         hub,
@@ -68,6 +74,14 @@ func NewReceiptWorker(concurrency int, llmClient llm.Client, matchEngine *matche
 		go w.process()
 	}
 	return w
+}
+
+// QueueDepth returns the current number of jobs buffered in the worker
+// channel. It is a best-effort snapshot safe to call concurrently — the
+// value can change between read and use. Exposed for operational metrics
+// (see internal/api/metrics.go cartledger_worker_queue_depth gauge).
+func (w *ReceiptWorker) QueueDepth() int {
+	return len(w.jobs)
 }
 
 // ErrQueueFull is returned when the worker queue cannot accept more jobs.
@@ -278,8 +292,33 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 
 	// 2. Send to LLM vision API.
 	slog.Info("worker: calling LLM", "receipt_id", job.ReceiptID, "images", len(images), "provider", w.llmClient.Provider())
-	extraction, err := w.llmClient.ExtractReceipt(images)
+	var extraction *llm.ReceiptExtraction
+	if w.guard != nil {
+		extraction, err = w.guard.ExtractForHousehold(job.HouseholdID, images)
+	} else {
+		extraction, err = w.llmClient.ExtractReceipt(images)
+	}
 	if err != nil {
+		// Budget + breaker errors are terminal for THIS receipt — mark the
+		// row with a specific error_message so the user understands why
+		// the receipt stalled. Other errors fall through to the generic
+		// "status='error'" path in runJob.
+		if errors.Is(err, llm.ErrBudgetExceeded) {
+			_, _ = w.db.Exec(
+				"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
+				"LLM budget exceeded for this month; edit receipt manually or raise LLM_MONTHLY_TOKEN_BUDGET",
+				job.ReceiptID,
+			)
+			return fmt.Errorf("llm extraction: %w", err)
+		}
+		if errors.Is(err, llm.ErrCircuitOpen) {
+			_, _ = w.db.Exec(
+				"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
+				"LLM temporarily unavailable (circuit breaker open)",
+				job.ReceiptID,
+			)
+			return fmt.Errorf("llm extraction: %w", err)
+		}
 		return fmt.Errorf("llm extraction: %w", err)
 	}
 	slog.Info("worker: LLM returned", "receipt_id", job.ReceiptID, "store", extraction.StoreName, "items", len(extraction.Items))

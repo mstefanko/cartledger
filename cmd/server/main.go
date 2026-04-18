@@ -14,6 +14,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/api"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
+	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
 	"github.com/mstefanko/cartledger/internal/matcher"
@@ -102,9 +103,39 @@ func main() {
 		slog.Info("llm provider selected", "provider", "claude", "model", cfg.LLMModel)
 	}
 
+	// Wrap the LLM client with the per-household budget + process-local
+	// circuit breaker (internal/llm/guarded.go). Breaker tuning uses
+	// sensible defaults; operators can override via future env vars if
+	// needed.
+	breaker := llm.NewBreaker(5, 60*time.Second, 120*time.Second, 30*time.Minute)
+	llmGuard := llm.NewGuardedExtractor(llmClient, database, cfg.LLMMonthlyTokenBudget, breaker)
+	slog.Info("llm guard wired", "monthly_budget_tokens", cfg.LLMMonthlyTokenBudget)
+
 	// Create matching engine and receipt worker.
 	matchEngine := matcher.NewEngine(database)
-	receiptWorker := worker.NewReceiptWorker(2, llmClient, matchEngine, database, hub, cfg)
+	receiptWorker := worker.NewReceiptWorker(2, llmClient, llmGuard, matchEngine, database, hub, cfg)
+
+	// Initialize Prometheus metrics. The sampler goroutines start
+	// immediately; Close() is deferred below so they stop cleanly on
+	// shutdown. Default Go collector + ProcessCollector (CPU/mem/FDs) are
+	// registered automatically by the default registry — we do not add
+	// them explicitly.
+	metrics, err := api.NewMetrics(api.MetricsConfig{
+		DataDir: cfg.DataDir,
+		Worker:  receiptWorker,
+	})
+	if err != nil {
+		fatalExit("init metrics", "err", err)
+	}
+	defer metrics.Close()
+
+	// Wire metrics into components that emit counter increments. These
+	// setters are single-threaded (called during startup) so no lock is
+	// needed on the recorder fields.
+	if cc, ok := llmClient.(*llm.ClaudeClient); ok {
+		cc.SetMetrics(metrics)
+	}
+	imaging.SetFallbackRecorder(metrics)
 
 	// First-run bootstrap: if the users table is empty, print a setup URL
 	// containing a signed one-time token. The token is persisted in the DB
@@ -118,7 +149,7 @@ func main() {
 	}
 
 	// Set up Echo with router, middleware, and all routes.
-	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap)
+	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics)
 	defer rateLimiter.Close()
 
 	// Graceful shutdown via signal.NotifyContext.

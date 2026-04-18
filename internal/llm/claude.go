@@ -14,10 +14,29 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 )
 
+// TokenRecorder is the optional interface a metrics collector implements
+// to receive per-call LLM token counts. Kept in the llm package so no
+// import cycle forms (internal/api already imports internal/llm).
+//
+// Implementations must be safe to call concurrently. A nil recorder is
+// ignored by the Claude client.
+type TokenRecorder interface {
+	RecordLLMTokens(provider, model string, inputTokens, outputTokens int64)
+}
+
 // ClaudeClient implements the Client interface using Anthropic's Claude API.
 type ClaudeClient struct {
-	client *anthropic.Client
-	model  string
+	client  *anthropic.Client
+	model   string
+	metrics TokenRecorder // optional; nil disables token metric emission
+}
+
+// SetMetrics attaches a TokenRecorder that will be notified after each
+// successful call. Passing nil disables metric emission. Not safe to call
+// concurrently with ExtractReceiptWithUsage — intended to be called once
+// during wiring in cmd/server/main.go.
+func (c *ClaudeClient) SetMetrics(m TokenRecorder) {
+	c.metrics = m
 }
 
 // receiptTool defines the tool schema for structured receipt extraction.
@@ -90,10 +109,22 @@ func (c *ClaudeClient) Provider() string {
 	return "claude"
 }
 
-// ExtractReceipt sends receipt images to Claude and returns structured extraction data.
+// ExtractReceipt satisfies the Client interface. It delegates to
+// ExtractReceiptWithUsage and discards the token counts. The guarded
+// wrapper (internal/llm/guarded.go) calls ExtractReceiptWithUsage directly
+// so it can record per-household usage and honor budget/breaker state.
 func (c *ClaudeClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error) {
+	extraction, _, _, err := c.ExtractReceiptWithUsage(images)
+	return extraction, err
+}
+
+// ExtractReceiptWithUsage sends receipt images to Claude and returns structured
+// extraction data along with the token counts reported by the API. The existing
+// token-usage log line (slog.Info "claude: token usage") is preserved so that
+// operators who already scrape it are unaffected.
+func (c *ClaudeClient) ExtractReceiptWithUsage(images [][]byte) (*ReceiptExtraction, int64, int64, error) {
 	if len(images) == 0 {
-		return nil, fmt.Errorf("at least one image is required")
+		return nil, 0, 0, fmt.Errorf("at least one image is required")
 	}
 
 	// Build content blocks: images first, then text prompt.
@@ -117,9 +148,12 @@ func (c *ClaudeClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, erro
 		ToolChoice: anthropic.ToolChoiceParamOfTool("extract_receipt"),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claude API call failed: %w", err)
+		return nil, 0, 0, fmt.Errorf("claude API call failed: %w", err)
 	}
 
+	// Preserve the original token-usage log (per CLAUDE.md: "Token usage
+	// logged after every call"). The guarded wrapper additionally upserts
+	// into llm_usage_monthly.
 	slog.Info("claude: token usage",
 		"model", c.model,
 		"input", resp.Usage.InputTokens,
@@ -128,18 +162,26 @@ func (c *ClaudeClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, erro
 		"cache_read", resp.Usage.CacheReadInputTokens,
 	)
 
+	inputTokens := resp.Usage.InputTokens
+	outputTokens := resp.Usage.OutputTokens
+
+	// Emit Prometheus token counters (no-op when metrics recorder is unset).
+	if c.metrics != nil {
+		c.metrics.RecordLLMTokens("claude", c.model, inputTokens, outputTokens)
+	}
+
 	// Find the tool_use block in the response.
 	for _, block := range resp.Content {
 		if block.Type == "tool_use" && block.Name == "extract_receipt" {
 			var extraction ReceiptExtraction
 			if err := json.Unmarshal(block.Input, &extraction); err != nil {
-				return nil, fmt.Errorf("failed to parse tool_use input: %w", err)
+				return nil, inputTokens, outputTokens, fmt.Errorf("failed to parse tool_use input: %w", err)
 			}
-			return &extraction, nil
+			return &extraction, inputTokens, outputTokens, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no extract_receipt tool_use block in response")
+	return nil, inputTokens, outputTokens, fmt.Errorf("no extract_receipt tool_use block in response")
 }
 
 // detectMediaType inspects the first bytes of image data to determine its MIME type.

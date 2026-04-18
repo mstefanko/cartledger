@@ -13,6 +13,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
@@ -25,7 +26,7 @@ import (
 // that stand up a router with pre-populated users); the Setup handler then
 // rejects every call with 401, which matches the user-facing behavior of
 // "setup already completed".
-func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap) (*echo.Echo, *RateLimiter) {
+func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics) (*echo.Echo, *RateLimiter) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -38,6 +39,15 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	// security-headers middleware so they see the true client IP / proto.
 	// Only honors X-Forwarded-* when the direct peer matches a TRUST_PROXY CIDR.
 	e.Use(RealIP(cfg.TrustedProxies))
+
+	// Prometheus HTTP metrics. Runs early so every downstream handler shows
+	// up in the latency histogram, but after Recover (a panicked handler
+	// still produces a metric via the deferred observation in the wrapped
+	// handler) and after RealIP (so future per-client labels would see the
+	// resolved IP — we do NOT label on IP today to avoid cardinality blow-up).
+	if metrics != nil {
+		e.Use(metrics.HTTPMiddleware)
+	}
 
 	// Request logging.
 	e.Use(middleware.Logger())
@@ -144,6 +154,20 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 		return c.JSON(http.StatusOK, map[string]string{"status": "alive"})
 	})
 
+	// /metrics — Prometheus scrape endpoint. Intentionally unauthenticated
+	// (standard Prometheus convention: operators firewall the metrics
+	// endpoint or expose it on a separate port). SECURITY NOTE: this
+	// endpoint leaks operational details (request rates, queue depths,
+	// storage sizes, LLM token counts per model). Operators running the
+	// binary on an internet-facing host MUST either:
+	//   (a) restrict /metrics at the reverse-proxy / firewall layer, or
+	//   (b) front the scraper with a private network / VPN.
+	// Registered at the root (not under /api/v1) to match the de-facto
+	// Prometheus convention that scrapers expect.
+	if metrics != nil {
+		e.GET("/metrics", metrics.Handler())
+	}
+
 	// --- Mount handlers ---
 
 	authHandler := &AuthHandler{DB: database, Cfg: cfg, Bootstrap: bootstrap}
@@ -187,6 +211,9 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	reviewHandler := &ReviewHandler{DB: database, Cfg: cfg, Hub: hub}
 	reviewHandler.RegisterRoutes(protected)
+
+	adminHandler := &AdminHandler{DB: database, Cfg: cfg, Guard: llmGuard}
+	adminHandler.RegisterRoutes(protected)
 
 	// Serve uploaded receipt images. Auth is cookie-first (browsers DO send
 	// cookies on same-origin <img src=>); ?token= query fallback is kept but

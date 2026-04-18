@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"log/slog"
+	"strings"
 
 	// Register GIF decoder.
 	_ "image/gif"
@@ -76,12 +77,53 @@ func StripMetadata(raw []byte, jpegQuality int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// FallbackRecorder is the optional interface implemented by a metrics
+// collector that counts preprocessing fallbacks. The reason label should
+// be low-cardinality — currently only "decode_failed" or "encode_failed"
+// are produced. A nil recorder disables metric emission.
+//
+// The recorder is an explicit package-level hook (SetFallbackRecorder)
+// rather than a parameter to every call so that the hundreds of callers
+// of PreprocessReceipt elsewhere in the code stay unchanged.
+type FallbackRecorder interface {
+	RecordPreprocessFallback(reason string)
+}
+
+var fallbackRecorder FallbackRecorder
+
+// SetFallbackRecorder wires a metrics collector to be notified when
+// PreprocessReceipt(WithOptions) falls back to the raw image. Intended
+// to be called once at startup from cmd/server/main.go. Calling with
+// nil disables metric emission. Not safe to call concurrently with
+// preprocessing calls.
+func SetFallbackRecorder(r FallbackRecorder) {
+	fallbackRecorder = r
+}
+
+// recordFallback is the internal hook that classifies an error into a
+// low-cardinality reason label and forwards to the recorder when set.
+func recordFallback(err error) {
+	if fallbackRecorder == nil || err == nil {
+		return
+	}
+	msg := err.Error()
+	reason := "other"
+	switch {
+	case strings.HasPrefix(msg, "decode image"):
+		reason = "decode_failed"
+	case strings.HasPrefix(msg, "encode jpeg"):
+		reason = "encode_failed"
+	}
+	fallbackRecorder.RecordPreprocessFallback(reason)
+}
+
 // PreprocessReceipt preprocesses a receipt image. On any failure, it returns
 // the original raw bytes and a nil error — preprocessing must never block a scan.
 func PreprocessReceipt(raw []byte) ([]byte, error) {
 	processed, err := doPreprocess(raw, DefaultOptions())
 	if err != nil {
 		slog.Warn("image preprocessing failed, using raw image", "err", err)
+		recordFallback(err)
 		return raw, nil
 	}
 	return processed, nil
@@ -92,6 +134,7 @@ func PreprocessReceiptWithOptions(raw []byte, opts Options) ([]byte, error) {
 	processed, err := doPreprocess(raw, opts)
 	if err != nil {
 		slog.Warn("image preprocessing failed, using raw image", "err", err)
+		recordFallback(err)
 		return raw, nil
 	}
 	return processed, nil
