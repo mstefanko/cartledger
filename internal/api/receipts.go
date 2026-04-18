@@ -12,10 +12,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
@@ -90,10 +92,19 @@ type receiptDetailResponse struct {
 	LineItems   []lineItemResponse `json:"line_items"`
 }
 
+// uploadBodyLimit caps the request body for multipart receipt uploads.
+//
+// Per-file cap is 10 MB (see Scan). A single scan accepts multiple images
+// (front/back, multi-page receipts); 50 MB allows ~5 full-size images plus
+// multipart framing overhead while still preventing pathological uploads from
+// OOMing the process. Tightened later via a config knob if needed.
+const uploadBodyLimit = "50M"
+
 // RegisterRoutes mounts receipt endpoints onto the protected group.
 func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts := protected.Group("/receipts")
-	receipts.POST("/scan", h.Scan)
+	// Cap multipart upload size before it is read into memory / disk.
+	receipts.POST("/scan", h.Scan, middleware.BodyLimit(uploadBodyLimit))
 	receipts.GET("", h.List)
 	receipts.GET("/:id", h.Get)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
@@ -163,17 +174,30 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to read uploaded file"})
 		}
 
-		dst, err := os.Create(destPath)
+		raw, err := io.ReadAll(src)
+		src.Close()
 		if err != nil {
-			src.Close()
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save image"})
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to read uploaded file"})
 		}
 
-		_, err = io.Copy(dst, src)
-		src.Close()
-		dst.Close()
+		// Strip EXIF/GPS and other metadata by re-encoding the image before
+		// saving the "original" copy to disk. Phone uploads commonly embed
+		// GPS coordinates; without this, any household member who can view
+		// the receipt image could recover the uploader's location.
+		// Quality 95 is near-lossless — this is our archival copy for
+		// debug/rescan, not the LLM input (which is further compressed by
+		// the preprocess step in the worker).
+		scrubbed, err := imaging.StripMetadata(raw, 95)
 		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to write image"})
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("file %s could not be decoded as an image: %v", fh.Filename, err),
+			})
+		}
+
+		// PNG input → re-encoded as PNG; JPEG → re-encoded as JPEG. Both
+		// preserve the on-disk extension we already chose from Content-Type.
+		if err := os.WriteFile(destPath, scrubbed, 0o644); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save image"})
 		}
 
 		imagePaths = append(imagePaths, destPath)

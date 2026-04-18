@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"image/png"
 	"log"
 
 	// Register GIF decoder.
@@ -39,6 +40,40 @@ func DefaultOptions() Options {
 		CropThreshold: 170,
 		CropMinRatio:  0.9,
 	}
+}
+
+// StripMetadata re-encodes an image to drop all metadata (EXIF/GPS, XMP,
+// IPTC, color profiles, etc.). This is important for privacy: phone photos
+// commonly embed GPS coordinates, which would otherwise leak household
+// members' locations to anyone who can view the receipt image.
+//
+// JPEG input is re-encoded as JPEG at the given quality (95 recommended for
+// near-lossless originals). PNG input is re-encoded as PNG (lossless). GIF
+// and WebP inputs are normalized to JPEG at the given quality.
+//
+// On any failure (unknown format, decode error, encode error), returns the
+// error — callers must decide whether to abort the save or accept the raw
+// (EXIF-carrying) bytes. For privacy-critical callers, treat the error as
+// fatal and refuse to persist.
+func StripMetadata(raw []byte, jpegQuality int) ([]byte, error) {
+	img, format, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("decode image (%s): %w", format, err)
+	}
+
+	var buf bytes.Buffer
+	switch format {
+	case "png":
+		if err := png.Encode(&buf, img); err != nil {
+			return nil, fmt.Errorf("encode png: %w", err)
+		}
+	default:
+		// jpeg, gif, webp → jpeg.
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: jpegQuality}); err != nil {
+			return nil, fmt.Errorf("encode jpeg: %w", err)
+		}
+	}
+	return buf.Bytes(), nil
 }
 
 // PreprocessReceipt preprocesses a receipt image. On any failure, it returns

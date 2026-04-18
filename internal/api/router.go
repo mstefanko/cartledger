@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"io/fs"
 	"net/http"
@@ -31,6 +32,9 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	// Panic recovery.
 	e.Use(middleware.Recover())
+
+	// Security response headers (CSP, HSTS on TLS, framing/referrer/MIME hardening).
+	e.Use(SecurityHeaders())
 
 	// CORS: permissive for dev (JWT_SECRET == default), same-origin for prod.
 	if cfg.JWTSecret == "change-me-in-production" {
@@ -83,9 +87,48 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	protected := v1.Group("")
 	protected.Use(auth.JWTMiddleware(cfg.JWTSecret))
 
-	// Health check (public).
+	// --- Health / readiness / liveness probes (all public, no auth) ---
+
+	// pingDB runs a short-timeout DB ping; returns the error (or nil).
+	pingDB := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return database.PingContext(ctx)
+	}
+
+	// /health — liveness + DB connectivity. 503 if the DB is unreachable.
 	public.GET("/health", func(c echo.Context) error {
+		if err := pingDB(); err != nil {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"status": "unhealthy",
+				"error":  "database unreachable",
+			})
+		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// /readyz — ready to serve traffic. DB must ping AND worker must be wired.
+	// The worker exposes no IsRunning hook, so presence is the best we can check.
+	public.GET("/readyz", func(c echo.Context) error {
+		if err := pingDB(); err != nil {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"status": "not_ready",
+				"error":  "database unreachable",
+			})
+		}
+		if receiptWorker == nil {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"status": "not_ready",
+				"error":  "worker not initialized",
+			})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "ready"})
+	})
+
+	// /livez — process is up. Intentionally does NOT touch the DB so that a
+	// failing DB doesn't cause the orchestrator to kill the pod.
+	public.GET("/livez", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "alive"})
 	})
 
 	// --- Mount handlers ---
