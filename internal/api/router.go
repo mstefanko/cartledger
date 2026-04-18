@@ -10,7 +10,6 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	"golang.org/x/time/rate"
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
@@ -21,7 +20,12 @@ import (
 )
 
 // NewRouter creates and configures the Echo router with all middleware and routes.
-func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store) *echo.Echo {
+//
+// bootstrap may be nil when the caller has no first-run token (e.g. tests
+// that stand up a router with pre-populated users); the Setup handler then
+// rejects every call with 401, which matches the user-facing behavior of
+// "setup already completed".
+func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap) (*echo.Echo, *RateLimiter) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -58,36 +62,43 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 		AllowCredentials: true,
 	}))
 
+	// --- Rate limiter (tiered, in-memory) ---
+	// Key design points (see internal/api/ratelimit.go for the full rationale):
+	//   * auth tier (login/setup/join): 5rps/b10 per IP — brute-force defense.
+	//   * read tier (GET): 20rps/b40 per household.
+	//   * write tier (non-GET): 10rps/b20 per household.
+	//   * worker-submit (POST /receipts/scan): 3rps/b6 per household — hard
+	//     cap on LLM cost surface.
+	//   * global (protected fallback): 50rps/b100 per household/IP.
+	// RATE_LIMIT_ENABLED=false turns the middleware into a pass-through for
+	// local testing; default is enabled.
+	rateLimiter := NewRateLimiter(cfg.RateLimitEnabled)
+
 	// --- Route groups ---
 
 	v1 := e.Group("/api/v1")
 
-	// Public routes (no auth required), with rate limiting on auth endpoints.
+	// Public routes (no auth required).
 	public := v1.Group("")
-	authRateLimiter := middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
-		Skipper: middleware.DefaultSkipper,
-		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
-			middleware.RateLimiterMemoryStoreConfig{
-				Rate:      rate.Every(6 * time.Second), // 10 requests per minute
-				Burst:     10,
-				ExpiresIn: 3 * time.Minute,
-			},
-		),
-		IdentifierExtractor: func(ctx echo.Context) (string, error) {
-			return ctx.RealIP(), nil
-		},
-		ErrorHandler: func(context echo.Context, err error) error {
-			return context.JSON(http.StatusForbidden, map[string]string{"error": "rate limit identifier error"})
-		},
-		DenyHandler: func(context echo.Context, identifier string, err error) error {
-			return context.JSON(http.StatusTooManyRequests, map[string]string{"error": "too many requests, please try again later"})
-		},
-	})
-	publicRateLimited := v1.Group("", authRateLimiter)
+	// Public sub-group gated by the auth-tier rate limiter (login/setup/join).
+	// Keyed on c.RealIP() because JWT claims aren't populated on these
+	// unauthenticated endpoints.
+	publicRateLimited := v1.Group("", rateLimiter.Middleware(TierAuth))
 
-	// Protected routes (auth required).
+	// Protected routes (auth required). JWTMiddleware populates household_id
+	// and user_id on the context, which the per-method rate limiter reads
+	// below — so JWTMiddleware MUST be first.
 	protected := v1.Group("")
 	protected.Use(auth.JWTMiddleware(cfg.JWTSecret))
+	// Global catch-all for any authenticated traffic — protects against
+	// cheap-but-high-volume endpoints slipping past narrower buckets.
+	protected.Use(rateLimiter.Middleware(TierGlobal))
+	// Per-method rate limiter: GETs -> read tier, non-GETs -> write tier.
+	// Overrides tighten specific high-cost routes:
+	//   POST /api/v1/receipts/scan -> worker-submit (LLM-triggering)
+	protected.Use(rateLimiter.ProtectedMethodMiddleware(map[string]string{
+		"/api/v1/receipts/scan": TierWorkerSubmit,
+	}))
 
 	// --- Health / readiness / liveness probes (all public, no auth) ---
 
@@ -135,7 +146,7 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	// --- Mount handlers ---
 
-	authHandler := &AuthHandler{DB: database, Cfg: cfg}
+	authHandler := &AuthHandler{DB: database, Cfg: cfg, Bootstrap: bootstrap}
 	authHandler.RegisterRoutes(public, publicRateLimited, protected)
 
 	storeHandler := &StoreHandler{DB: database, Cfg: cfg}
@@ -219,7 +230,7 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 		return c.HTMLBlob(http.StatusOK, indexHTML)
 	})
 
-	return e
+	return e, rateLimiter
 }
 
 // containsDotDot checks for path traversal attempts.

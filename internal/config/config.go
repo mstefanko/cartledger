@@ -57,6 +57,12 @@ type Config struct {
 	// non-production mode a localhost dev default is applied when unset.
 	// Production mode REQUIRES an explicit allow-list (Validate fails if unset).
 	AllowedOrigins []string
+	// RateLimitEnabled toggles the tiered per-route rate limiter (see
+	// internal/api/ratelimit.go). Default true. Set RATE_LIMIT_ENABLED=false
+	// for local testing where throttling is inconvenient. Hard-coded tier
+	// values are NOT configurable — operators can't usefully tune them
+	// without load-testing data.
+	RateLimitEnabled bool
 }
 
 // defaultDevAllowedOrigins is the default ALLOWED_ORIGINS set used in non-
@@ -147,6 +153,7 @@ func Load() (*Config, error) {
 		JWTSecret:                os.Getenv("JWT_SECRET"), // no default — policy applied below
 		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
 		LockInactivityTTL:        getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
+		RateLimitEnabled:         getEnvBool("RATE_LIMIT_ENABLED", true),
 	}
 
 	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty

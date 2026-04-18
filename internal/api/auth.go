@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -25,8 +26,9 @@ var emailRegex = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 
 // AuthHandler holds dependencies for auth-related endpoints.
 type AuthHandler struct {
-	DB  *sql.DB
-	Cfg *config.Config
+	DB        *sql.DB
+	Cfg       *config.Config
+	Bootstrap *Bootstrap
 }
 
 // --- Request / Response types ---
@@ -106,7 +108,27 @@ func (h *AuthHandler) Status(c echo.Context) error {
 
 // Setup handles first-boot setup: creates household + user in a single transaction.
 // POST /api/v1/setup
+//
+// A one-time bootstrap token (printed to stderr on first boot when users is
+// empty) is REQUIRED. The client may pass it as either:
+//   - query parameter: ?bootstrap=<token>
+//   - header: X-Bootstrap-Token: <token>
+//
+// Without a matching token the request is rejected with 401, even when the
+// users table is empty — this prevents a race where a public /setup endpoint
+// would otherwise be first-come-first-serve before the operator pastes the
+// URL.
 func (h *AuthHandler) Setup(c echo.Context) error {
+	// Validate the bootstrap token FIRST so we don't waste bcrypt CPU on a
+	// rejected request.
+	candidate := c.QueryParam("bootstrap")
+	if candidate == "" {
+		candidate = c.Request().Header.Get("X-Bootstrap-Token")
+	}
+	if h.Bootstrap == nil || !h.Bootstrap.Check(candidate) {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or missing bootstrap token"})
+	}
+
 	var req setupRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -169,6 +191,14 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 
 	if err := tx.Commit(); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	// Invalidate the bootstrap token so it cannot be replayed. Best-effort:
+	// if the DB update fails we still succeed the setup — the in-memory token
+	// is already cleared, and the next /setup call would fail on "users
+	// already exist" anyway.
+	if err := h.Bootstrap.MarkConsumed(h.DB); err != nil {
+		slog.Warn("bootstrap token consume failed (harmless — users row already exists)", "err", err)
 	}
 
 	token, err := auth.CreateAuthToken(h.Cfg.JWTSecret, userID, householdID)

@@ -106,8 +106,20 @@ func main() {
 	matchEngine := matcher.NewEngine(database)
 	receiptWorker := worker.NewReceiptWorker(2, llmClient, matchEngine, database, hub, cfg)
 
+	// First-run bootstrap: if the users table is empty, print a setup URL
+	// containing a signed one-time token. The token is persisted in the DB
+	// so restarts don't invalidate an already-pasted URL.
+	bootstrap, err := api.LoadOrGenerateBootstrapToken(database)
+	if err != nil {
+		fatalExit("load bootstrap token", "err", err)
+	}
+	if bootstrap.HasToken() {
+		api.PrintBootstrapBanner(cfg, bootstrap.Token())
+	}
+
 	// Set up Echo with router, middleware, and all routes.
-	e := api.NewRouter(database, cfg, hub, receiptWorker, lockStore)
+	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap)
+	defer rateLimiter.Close()
 
 	// Graceful shutdown via signal.NotifyContext.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
