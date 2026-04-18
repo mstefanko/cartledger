@@ -1,7 +1,7 @@
 package api
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/gorilla/websocket"
@@ -42,7 +42,7 @@ func (h *WSHandler) HandleWS(c echo.Context) error {
 
 	conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
-		log.Printf("ws: upgrade error: %v", err)
+		slog.Error("ws: upgrade error", "err", err)
 		return nil // Upgrade already wrote a response on error.
 	}
 

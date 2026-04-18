@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -112,7 +112,7 @@ func (w *ReceiptWorker) process() {
 // shutdown wg-accounting stays obvious at the call site.
 func (w *ReceiptWorker) runJob(job ReceiptJob) {
 	if err := w.processJob(job); err != nil {
-		log.Printf("worker: failed to process receipt %s: %v", job.ReceiptID, err)
+		slog.Error("worker: failed to process receipt", "receipt_id", job.ReceiptID, "err", err)
 		// Update receipt status to error.
 		_, _ = w.db.Exec(
 			"UPDATE receipts SET status = 'error' WHERE id = ?",
@@ -172,7 +172,7 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 			requeued++
 			w.markPending(job.ReceiptID)
 		}
-		log.Printf("worker: shutdown complete — all in-flight jobs finished, %d buffered requeued as pending", requeued)
+		slog.Info("worker: shutdown complete", "in_flight_finished", true, "requeued", requeued)
 		return nil
 	case <-ctx.Done():
 		// Deadline hit. Drain whatever is still buffered and mark those
@@ -186,13 +186,13 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 			case job, ok := <-w.jobs:
 				if !ok {
 					// Channel closed and drained.
-					log.Printf("worker: shutdown deadline exceeded — %d buffered requeued as pending; in-flight goroutines may still be running", requeued)
+					slog.Warn("worker: shutdown deadline exceeded", "requeued", requeued, "note", "in-flight goroutines may still be running")
 					return ctx.Err()
 				}
 				requeued++
 				w.markPending(job.ReceiptID)
 			default:
-				log.Printf("worker: shutdown deadline exceeded — %d buffered requeued as pending; in-flight goroutines may still be running", requeued)
+				slog.Warn("worker: shutdown deadline exceeded", "requeued", requeued, "note", "in-flight goroutines may still be running")
 				return ctx.Err()
 			}
 		}
@@ -208,7 +208,7 @@ func (w *ReceiptWorker) markPending(receiptID string) {
 		receiptID,
 	)
 	if err != nil {
-		log.Printf("worker: failed to mark receipt %s pending on shutdown: %v", receiptID, err)
+		slog.Error("worker: failed to mark receipt pending on shutdown", "receipt_id", receiptID, "err", err)
 	}
 }
 
@@ -239,13 +239,13 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		// Falls back to raw image on any error.
 		originalSize := len(data)
 		processed, _ := imaging.PreprocessReceipt(data)
-		log.Printf("worker: preprocessed %s (%d KB → %d KB)", entry.Name(), originalSize/1024, len(processed)/1024)
+		slog.Debug("worker: image preprocessed", "name", entry.Name(), "orig_kb", originalSize/1024, "processed_kb", len(processed)/1024)
 
 		// Save preprocessed version alongside original.
 		processedName := "processed_" + entry.Name()
 		processedPath := filepath.Join(job.ImageDir, processedName)
 		if err := os.WriteFile(processedPath, processed, 0644); err != nil {
-			log.Printf("WARN: failed to save preprocessed image: %v", err)
+			slog.Warn("worker: failed to save preprocessed image", "err", err)
 			// Fall back to original path for display.
 			processedPaths = append(processedPaths, filepath.Join(job.ImageDir, entry.Name()))
 		} else {
@@ -265,7 +265,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			strings.Join(processedPaths, ","), job.ReceiptID,
 		)
 		if err != nil {
-			log.Printf("WARN: failed to update image_paths: %v", err)
+			slog.Warn("worker: failed to update image_paths", "err", err)
 		}
 	}
 
@@ -277,12 +277,12 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	})
 
 	// 2. Send to LLM vision API.
-	log.Printf("worker: calling LLM for receipt %s (%d images, provider=%s)", job.ReceiptID, len(images), w.llmClient.Provider())
+	slog.Info("worker: calling LLM", "receipt_id", job.ReceiptID, "images", len(images), "provider", w.llmClient.Provider())
 	extraction, err := w.llmClient.ExtractReceipt(images)
 	if err != nil {
 		return fmt.Errorf("llm extraction: %w", err)
 	}
-	log.Printf("worker: LLM returned for receipt %s (store=%s, items=%d)", job.ReceiptID, extraction.StoreName, len(extraction.Items))
+	slog.Info("worker: LLM returned", "receipt_id", job.ReceiptID, "store", extraction.StoreName, "items", len(extraction.Items))
 
 	// 3. Store raw_llm_json on the receipt.
 	rawJSON, err := json.Marshal(extraction)
@@ -331,7 +331,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 
 		if err == sql.ErrNoRows {
 			storeID = uuid.New().String()
-			log.Printf("worker: creating new store %q (id=%s)", extraction.StoreName, storeID)
+			slog.Info("worker: creating new store", "store_name", extraction.StoreName, "store_id", storeID)
 			_, err = tx.Exec(
 				`INSERT INTO stores (id, household_id, name, address, city, state, zip, store_number, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -343,7 +343,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			if err != nil {
 				return fmt.Errorf("create store: %w", err)
 			}
-			log.Printf("worker: store created successfully")
+			slog.Debug("worker: store created successfully")
 		} else if err != nil {
 			return fmt.Errorf("lookup store: %w", err)
 		} else {
@@ -363,7 +363,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	}
 
 	// Update receipt with extraction data.
-	log.Printf("worker: updating receipt %s with extraction data", job.ReceiptID)
+	slog.Debug("worker: updating receipt with extraction data", "receipt_id", job.ReceiptID)
 	_, err = tx.Exec(
 		`UPDATE receipts SET store_id = ?, receipt_date = ?, receipt_time = ?,
 		 subtotal = ?, tax = ?, total = ?,
@@ -397,7 +397,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		// Rule 1: Raw name matches multi-pack pattern AND quantity=1.
 		if packPattern.MatchString(item.RawName) && item.Quantity == 1 {
 			packOverloadCaps[i] = 0.6
-			log.Printf("worker: flagged pack overload (pattern) for %q", item.RawName)
+			slog.Debug("worker: flagged pack overload (pattern)", "raw_name", item.RawName)
 		}
 
 		// Rule 2: unit="each" AND quantity=1 AND total_price > 8.0 AND category in flaggable set.
@@ -410,7 +410,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 				if _, already := packOverloadCaps[i]; !already {
 					packOverloadCaps[i] = 0.7
 				}
-				log.Printf("worker: flagged pack overload (price) for %q ($%.2f)", item.RawName, item.TotalPrice)
+				slog.Debug("worker: flagged pack overload (price)", "raw_name", item.RawName, "total_price", item.TotalPrice)
 			}
 		}
 	}

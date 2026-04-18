@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,7 +78,7 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("generate ephemeral JWT_SECRET: %w", err)
 		}
 		cfg.JWTSecret = secret
-		log.Printf("WARNING: JWT_SECRET unset or default; generated ephemeral secret. Sessions will invalidate on restart. Set JWT_SECRET or CARTLEDGER_ENV=production for persistent sessions.")
+		slog.Warn("JWT_SECRET unset or default; generated ephemeral secret — sessions will invalidate on restart. Set JWT_SECRET or CARTLEDGER_ENV=production for persistent sessions.")
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -204,7 +204,7 @@ func getEnvBool(key string, fallback bool) bool {
 	case "0", "false", "FALSE", "False", "no", "NO", "No", "off", "OFF", "Off":
 		return false
 	}
-	log.Printf("config: invalid %s=%q; using default %v", key, v, fallback)
+	slog.Warn("config: invalid env var; using default", "key", key, "value", v, "default", fallback)
 	return fallback
 }
 
@@ -217,7 +217,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Printf("config: invalid %s=%q (%v); using default %s", key, v, err, fallback)
+		slog.Warn("config: invalid duration; using default", "key", key, "value", v, "err", err, "default", fallback)
 		return fallback
 	}
 	return d

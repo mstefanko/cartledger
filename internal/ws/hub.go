@@ -2,7 +2,7 @@ package ws
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -71,7 +71,7 @@ func (h *Hub) Run() {
 			}
 			h.households[client.HouseholdID][client] = true
 			h.mu.Unlock()
-			log.Printf("ws: client registered user=%s household=%s", client.UserID, client.HouseholdID)
+			slog.Debug("ws: client registered", "user", client.UserID, "household", client.HouseholdID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -85,12 +85,12 @@ func (h *Hub) Run() {
 				}
 			}
 			h.mu.Unlock()
-			log.Printf("ws: client unregistered user=%s household=%s", client.UserID, client.HouseholdID)
+			slog.Debug("ws: client unregistered", "user", client.UserID, "household", client.HouseholdID)
 
 		case msg := <-h.broadcast:
 			data, err := json.Marshal(msg)
 			if err != nil {
-				log.Printf("ws: marshal broadcast error: %v", err)
+				slog.Error("ws: marshal broadcast error", "err", err)
 				continue
 			}
 			h.mu.RLock()
@@ -134,7 +134,7 @@ func (c *Client) readPump() {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Printf("ws: read error user=%s: %v", c.UserID, err)
+				slog.Warn("ws: read error", "user", c.UserID, "err", err)
 			}
 			break
 		}

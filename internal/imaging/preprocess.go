@@ -8,7 +8,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
-	"log"
+	"log/slog"
 
 	// Register GIF decoder.
 	_ "image/gif"
@@ -81,7 +81,7 @@ func StripMetadata(raw []byte, jpegQuality int) ([]byte, error) {
 func PreprocessReceipt(raw []byte) ([]byte, error) {
 	processed, err := doPreprocess(raw, DefaultOptions())
 	if err != nil {
-		log.Printf("WARN: image preprocessing failed, using raw image: %v", err)
+		slog.Warn("image preprocessing failed, using raw image", "err", err)
 		return raw, nil
 	}
 	return processed, nil
@@ -91,7 +91,7 @@ func PreprocessReceipt(raw []byte) ([]byte, error) {
 func PreprocessReceiptWithOptions(raw []byte, opts Options) ([]byte, error) {
 	processed, err := doPreprocess(raw, opts)
 	if err != nil {
-		log.Printf("WARN: image preprocessing failed, using raw image: %v", err)
+		slog.Warn("image preprocessing failed, using raw image", "err", err)
 		return raw, nil
 	}
 	return processed, nil

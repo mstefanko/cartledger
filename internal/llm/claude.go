@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -120,9 +120,13 @@ func (c *ClaudeClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, erro
 		return nil, fmt.Errorf("claude API call failed: %w", err)
 	}
 
-	log.Printf("claude: model=%s input=%d output=%d cache_create=%d cache_read=%d",
-		c.model, resp.Usage.InputTokens, resp.Usage.OutputTokens,
-		resp.Usage.CacheCreationInputTokens, resp.Usage.CacheReadInputTokens)
+	slog.Info("claude: token usage",
+		"model", c.model,
+		"input", resp.Usage.InputTokens,
+		"output", resp.Usage.OutputTokens,
+		"cache_create", resp.Usage.CacheCreationInputTokens,
+		"cache_read", resp.Usage.CacheReadInputTokens,
+	)
 
 	// Find the tool_use block in the response.
 	for _, block := range resp.Content {
