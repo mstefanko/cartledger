@@ -42,9 +42,13 @@ func SecurityHeaders() echo.MiddlewareFunc {
 			h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 			h.Set("Content-Security-Policy", contentSecurityPolicy)
 
-			// Only emit HSTS on HTTPS requests. c.IsTLS() handles direct TLS;
-			// X-Forwarded-Proto covers the typical reverse-proxy deployment.
-			if c.IsTLS() || c.Request().Header.Get("X-Forwarded-Proto") == "https" {
+			// Only emit HSTS on HTTPS requests. c.IsTLS() alone would miss the
+			// reverse-proxy case (proxy terminates TLS and forwards to the app
+			// over plain HTTP). RealIP middleware sets "real_proto" based on
+			// X-Forwarded-Proto — but only for trusted proxies, so this can't
+			// be spoofed by arbitrary clients.
+			proto, _ := c.Get("real_proto").(string)
+			if c.IsTLS() || proto == "https" {
 				h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 			}
 

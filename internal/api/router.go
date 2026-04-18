@@ -27,11 +27,16 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	// --- Global middleware ---
 
+	// Panic recovery must be first so every later middleware is protected.
+	e.Use(middleware.Recover())
+
+	// Real-IP resolution. MUST run before logging, rate-limiting, and
+	// security-headers middleware so they see the true client IP / proto.
+	// Only honors X-Forwarded-* when the direct peer matches a TRUST_PROXY CIDR.
+	e.Use(RealIP(cfg.TrustedProxies))
+
 	// Request logging.
 	e.Use(middleware.Logger())
-
-	// Panic recovery.
-	e.Use(middleware.Recover())
 
 	// Security response headers (CSP, HSTS on TLS, framing/referrer/MIME hardening).
 	e.Use(SecurityHeaders())

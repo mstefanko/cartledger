@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,69 @@ type Config struct {
 	// before the sweeper reclaims it. Placeholder default — see
 	// tmp/ux_flows/multi-store-implementation-plan.md §6 Q5.
 	LockInactivityTTL time.Duration
+	// TrustedProxies is the parsed TRUST_PROXY list: reverse-proxy peer CIDRs
+	// whose X-Forwarded-* headers should be honored. Empty means no proxy is
+	// trusted (safer default). Populated by Load from the TRUST_PROXY env var.
+	// Convenience macros: "loopback" expands to 127.0.0.0/8 + ::1/128,
+	// "private" expands to RFC1918 + loopback + link-local ranges.
+	TrustedProxies []netip.Prefix
+}
+
+// loopbackProxyCIDRs is the expansion of TRUST_PROXY="loopback".
+var loopbackProxyCIDRs = []string{
+	"127.0.0.0/8",
+	"::1/128",
+}
+
+// privateProxyCIDRs is the expansion of TRUST_PROXY="private": RFC1918 +
+// loopback + link-local (IPv4 169.254/16 and IPv6 fe80::/10) + IPv6 ULA fc00::/7.
+var privateProxyCIDRs = []string{
+	"127.0.0.0/8",
+	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+	"fe80::/10",
+	"fc00::/7",
+}
+
+// parseTrustedProxies parses the raw TRUST_PROXY env value into a slice of
+// netip.Prefix. An empty string returns (nil, nil). The literal values
+// "loopback" and "private" expand to predefined CIDR sets. Otherwise the
+// value is split on commas, each entry trimmed, and each parsed via
+// netip.ParsePrefix. Any parse failure aborts with a descriptive error.
+func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	var entries []string
+	switch raw {
+	case "loopback":
+		entries = loopbackProxyCIDRs
+	case "private":
+		entries = privateProxyCIDRs
+	default:
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			entries = append(entries, part)
+		}
+	}
+
+	out := make([]netip.Prefix, 0, len(entries))
+	for _, e := range entries {
+		p, err := netip.ParsePrefix(e)
+		if err != nil {
+			return nil, fmt.Errorf("TRUST_PROXY: invalid CIDR %q: %w", e, err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // Load reads configuration from environment variables with sensible defaults,
@@ -68,6 +132,14 @@ func Load() (*Config, error) {
 		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
 		LockInactivityTTL:        getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
 	}
+
+	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty
+	// value leaves TrustedProxies nil — no proxies trusted.
+	trustedProxies, err := parseTrustedProxies(os.Getenv("TRUST_PROXY"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.TrustedProxies = trustedProxies
 
 	// JWT_SECRET dev/prod policy. In non-production mode, synthesize an
 	// ephemeral secret so `make dev` and tests Just Work. In production,
