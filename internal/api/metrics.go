@@ -66,6 +66,15 @@ type Metrics struct {
 	// sweep). Processed images are never deleted.
 	retentionDeletedTotal *prometheus.CounterVec
 
+	// Backup operations. Wired to internal/backup.Runner via the Record*
+	// helpers below. Duration is a histogram keyed on the final status so
+	// operators can separate successful-run latency from failed-run latency.
+	// Size is a gauge (last observed bytes of the most recent complete
+	// archive). Missing-images is a counter summed across all runs.
+	backupDurationSeconds *prometheus.HistogramVec
+	backupSizeBytes       prometheus.Gauge
+	backupMissingImages   prometheus.Counter
+
 	// Background sampler lifecycle.
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -151,6 +160,26 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 		},
 		[]string{"reason"},
 	)
+	m.backupDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "cartledger_backup_duration_seconds",
+			Help:    "Time to produce a backup archive, by final status (complete|failed).",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+		},
+		[]string{"status"},
+	)
+	m.backupSizeBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "cartledger_backup_size_bytes",
+			Help: "Size in bytes of the most recent successful backup archive.",
+		},
+	)
+	m.backupMissingImages = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "cartledger_backup_missing_images_total",
+			Help: "Cumulative count of image files referenced from DB rows but absent from disk across all backup runs.",
+		},
+	)
 
 	for _, c := range []prometheus.Collector{
 		m.httpRequestsTotal,
@@ -160,6 +189,9 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 		m.preprocessFallbacksTotal,
 		m.storageBytes,
 		m.retentionDeletedTotal,
+		m.backupDurationSeconds,
+		m.backupSizeBytes,
+		m.backupMissingImages,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, err
@@ -290,6 +322,37 @@ func (m *Metrics) RecordRetentionDeleted(reason string, n int) {
 		reason = "age"
 	}
 	m.retentionDeletedTotal.WithLabelValues(reason).Add(float64(n))
+}
+
+// RecordBackupDuration is called by internal/backup.Runner once per backup
+// run. status is "complete" or "failed". Safe for nil receiver so the runner
+// can skip a nil-check when metrics aren't wired (tests).
+func (m *Metrics) RecordBackupDuration(status string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	m.backupDurationSeconds.WithLabelValues(status).Observe(d.Seconds())
+}
+
+// RecordBackupSize updates the gauge with the archive size from the most
+// recent successful backup. Safe for nil receiver.
+func (m *Metrics) RecordBackupSize(bytes int64) {
+	if m == nil || bytes < 0 {
+		return
+	}
+	m.backupSizeBytes.Set(float64(bytes))
+}
+
+// RecordBackupMissingImages increments the cumulative missing-images counter
+// by `n`. Safe for nil receiver and no-op when n <= 0.
+func (m *Metrics) RecordBackupMissingImages(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.backupMissingImages.Add(float64(n))
 }
 
 // sampleQueueDepth ticks every `interval` and snapshots worker.QueueDepth()

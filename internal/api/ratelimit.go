@@ -23,6 +23,12 @@ const (
 	TierWrite        = "write"
 	TierWorkerSubmit = "worker-submit"
 	TierGlobal       = "global"
+	// TierBackupCreate is the tightest tier in the system: POST /backups is
+	// a heavy operation (VACUUM, tar, gzip, retention sweep) and not one
+	// users need to hammer — 1 per hour per household is generous for the
+	// interactive case and stops an accidental click-loop from flooding the
+	// DB's vacuum path.
+	TierBackupCreate = "backup-create"
 )
 
 // tierConfig describes the token-bucket parameters for one tier.
@@ -44,6 +50,9 @@ var tierConfigs = map[string]tierConfig{
 	TierWrite:        {rps: 10, burst: 20},
 	TierWorkerSubmit: {rps: 3, burst: 6},
 	TierGlobal:       {rps: 50, burst: 100},
+	// 1/hour = 1 / 3600 rps; burst 1 keeps the first request in a fresh
+	// bucket succeeding without ever allowing two-in-a-row.
+	TierBackupCreate: {rps: rate.Limit(1.0 / 3600.0), burst: 1},
 }
 
 // limiterEntry pairs a rate.Limiter with a last-touched timestamp so stale

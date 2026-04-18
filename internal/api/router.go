@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,7 +15,9 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 
 	"github.com/mstefanko/cartledger/internal/auth"
+	"github.com/mstefanko/cartledger/internal/backup"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
 	"github.com/mstefanko/cartledger/internal/worker"
@@ -28,7 +31,7 @@ import (
 // that stand up a router with pre-populated users); the Setup handler then
 // rejects every call with 401, which matches the user-facing behavior of
 // "setup already completed".
-func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics) (*echo.Echo, *RateLimiter) {
+func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore) (*echo.Echo, *RateLimiter) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -222,6 +225,20 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	adminHandler := &AdminHandler{DB: database, Cfg: cfg, Guard: llmGuard}
 	adminHandler.RegisterRoutes(protected)
+
+	// Backup admin surface. The Runner + BackupStore are constructed in
+	// cmd/server/serve.go so the same instances drive the CLI and HTTP.
+	if backupRunner != nil && backupStore != nil {
+		backupHandler := &BackupHandler{
+			DB:      database,
+			Cfg:     cfg,
+			Runner:  backupRunner,
+			Store:   backupStore,
+			Log:     slog.Default(),
+			Limiter: rateLimiter,
+		}
+		backupHandler.RegisterRoutes(protected)
+	}
 
 	// Serve uploaded receipt images. Auth is cookie-first (browsers DO send
 	// cookies on same-origin <img src=>); ?token= query fallback is kept but

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mstefanko/cartledger/internal/api"
+	"github.com/mstefanko/cartledger/internal/backup"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/imaging"
@@ -170,6 +172,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		)
 	}
 
+	// Backup store + runner. Shared across the CLI subcommand and HTTP
+	// surface so there is exactly one code path in production.
+	backupStore := db.NewBackupStore(database)
+	backupRunner := backup.NewRunner(database, backupStore, cfg, slog.Default(), metrics)
+	backupRunner.SetBuildInfo(version, commit)
+
+	// Reconcile any status='running' backup rows left behind by a crash /
+	// kill mid-backup, and sweep any orphaned tmp-*.db + orphan .tar.gz
+	// files under BackupDir. Best-effort: errors are logged, not fatal.
+	{
+		recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := backupStore.ReconcileRunning(recCtx); err != nil {
+			slog.Warn("backup: reconcile running failed", "err", err)
+		}
+		recCancel()
+		sweepOrphanBackupArtifacts(backupStore, cfg.BackupDir())
+	}
+
 	// First-run bootstrap: if the users table is empty, print a setup URL
 	// containing a signed one-time token. The token is persisted in the DB
 	// so restarts don't invalidate an already-pasted URL.
@@ -182,7 +202,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up Echo with router, middleware, and all routes.
-	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics)
+	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore)
 	defer rateLimiter.Close()
 
 	// Graceful shutdown via signal.NotifyContext.
@@ -228,4 +248,68 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	slog.Info("server stopped")
 	return nil
+}
+
+// sweepOrphanBackupArtifacts removes stale files under BackupDir that aren't
+// referenced by any row in the backups table. Two cases:
+//   - tmp-*.db / cartledger-backup-*.db: vacuum temp files from a crashed run.
+//     Always safe to remove; they are single-owner scratch space.
+//   - *.tar.gz: orphan archive files with no corresponding DB row (e.g. the
+//     row was deleted but the file wasn't). Removed so operators see a
+//     consistent view via GET /api/v1/backups.
+//
+// Errors are logged, never fatal — a transient I/O failure here should not
+// block the server from booting.
+func sweepOrphanBackupArtifacts(store *db.BackupStore, backupDir string) {
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("backup: sweep readdir failed", "dir", backupDir, "err", err)
+		}
+		return
+	}
+
+	// Build the set of filenames we expect to find on disk.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := store.List(ctx)
+	if err != nil {
+		slog.Warn("backup: sweep list rows failed", "err", err)
+		return
+	}
+	expected := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		expected[r.Filename] = struct{}{}
+	}
+
+	var removedTmp, removedOrphan int
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		path := filepath.Join(backupDir, name)
+		switch {
+		case strings.HasPrefix(name, "tmp-") && strings.HasSuffix(name, ".db"),
+			strings.HasPrefix(name, "cartledger-backup-") && strings.HasSuffix(name, ".db"):
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				slog.Warn("backup: remove tmp file failed", "path", path, "err", err)
+				continue
+			}
+			removedTmp++
+		case strings.HasSuffix(name, ".tar.gz"):
+			if _, ok := expected[name]; ok {
+				continue
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				slog.Warn("backup: remove orphan archive failed", "path", path, "err", err)
+				continue
+			}
+			removedOrphan++
+		}
+	}
+	if removedTmp > 0 || removedOrphan > 0 {
+		slog.Info("backup: swept stale artifacts",
+			"tmp_db", removedTmp, "orphan_archives", removedOrphan)
+	}
 }

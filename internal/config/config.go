@@ -80,6 +80,11 @@ type Config struct {
 	// DATA_DIR/receipts/ to age out originals. Default 24h. Env:
 	// IMAGE_RETENTION_SWEEP_INTERVAL (Go duration, e.g. "24h", "6h").
 	ImageRetentionSweepInterval time.Duration
+	// BackupRetainCount is the max number of status='complete' backup rows
+	// (and their archive files) to keep on disk. When a new backup finishes
+	// the runner prunes oldest-first down to this count. Env:
+	// BACKUP_RETAIN_COUNT. Default 5; validated positive in Load.
+	BackupRetainCount int
 }
 
 // defaultDevAllowedOrigins is the default ALLOWED_ORIGINS set used in non-
@@ -174,6 +179,7 @@ func Load() (*Config, error) {
 		RateLimitEnabled:         getEnvBool("RATE_LIMIT_ENABLED", true),
 		ImageRetentionDays:          int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
 		ImageRetentionSweepInterval: getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
+		BackupRetainCount:           int(getEnvInt64("BACKUP_RETAIN_COUNT", 5)),
 	}
 
 	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty
@@ -206,6 +212,14 @@ func Load() (*Config, error) {
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+
+	// Materialize the BackupDir eagerly so the HTTP / CLI / runner surfaces
+	// can rely on its presence without each one calling MkdirAll. Mirrors the
+	// implicit "DATA_DIR exists and is writable" invariant set by Validate's
+	// ensureWritableDir above.
+	if err := os.MkdirAll(cfg.BackupDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("create backup dir: %w", err)
 	}
 	return cfg, nil
 }
@@ -255,6 +269,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("PORT: must not be empty"))
 	}
 
+	// BACKUP_RETAIN_COUNT must be positive; 0 would mean "prune every backup
+	// on completion", which is never a useful configuration.
+	if c.BackupRetainCount <= 0 {
+		errs = append(errs, errors.New("BACKUP_RETAIN_COUNT: must be positive"))
+	}
+
 	// In production, ALLOWED_ORIGINS must be explicitly set. The dev default
 	// (localhost) is never applied in prod, so an empty list here means the
 	// operator forgot to set it — fail loudly rather than silently accept
@@ -269,6 +289,19 @@ func (c *Config) Validate() error {
 // DBPath returns the full path to the SQLite database file.
 func (c *Config) DBPath() string {
 	return filepath.Join(c.DataDir, "cartledger.db")
+}
+
+// BackupDir returns the directory where backup archives live. Created by
+// Load() after validation so callers can assume it exists.
+func (c *Config) BackupDir() string {
+	return filepath.Join(c.DataDir, "backups")
+}
+
+// RestorePendingDir returns the directory where a staged restore archive
+// lives between HTTP upload and the next server boot. Not created eagerly —
+// only the restore flow writes here, and it mkdirs on demand.
+func (c *Config) RestorePendingDir() string {
+	return filepath.Join(c.DataDir, "restore-pending")
 }
 
 // isProduction reports whether the process is running in production mode.

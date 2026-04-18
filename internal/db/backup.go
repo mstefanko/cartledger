@@ -4,6 +4,9 @@
 //
 //	cartledger.db           – dump produced by `VACUUM INTO`
 //	receipts/<uuid>/...     – all files under DATA_DIR/receipts (optional)
+//	products/<uuid>/...     – all files under DATA_DIR/products (always included
+//	                          when the directory exists; product_images.image_path
+//	                          references these)
 //	MANIFEST.json           – metadata (schema version, timestamps, counts)
 //
 // Backup is driven from a *sql.DB so tests can use an in-process database.
@@ -54,18 +57,22 @@ type BackupResult struct {
 // BackupOptions configures a Backup call.
 type BackupOptions struct {
 	DB                *sql.DB
-	DataDir           string // directory containing cartledger.db + receipts/
+	DataDir           string // directory containing cartledger.db + receipts/ + products/
 	OutputPath        string // tar.gz destination
 	CartledgerVersion string
 	CartledgerCommit  string
 	// IncludeReceipts controls whether receipts/ is archived. Default true.
+	// Note: products/ is always archived when the directory exists — there is
+	// no operator-facing opt-out because every product image is referenced
+	// from product_images.image_path and a silent loss would be data loss.
 	IncludeReceipts bool
 }
 
 // Backup performs a WAL checkpoint, VACUUM INTO a temp file, and writes a
-// gzipped tar containing the DB snapshot, receipts, and MANIFEST.json. The
-// output file's SHA256 is computed from the on-disk bytes (re-read) so we
-// never return a hash that disagrees with the file shipped to the operator.
+// gzipped tar containing the DB snapshot, receipts, product images, and
+// MANIFEST.json. The output file's SHA256 is computed from the on-disk
+// bytes (re-read) so we never return a hash that disagrees with the file
+// shipped to the operator.
 func Backup(opts BackupOptions) (*BackupResult, error) {
 	if opts.DB == nil {
 		return nil, errors.New("backup: DB is required")
@@ -168,10 +175,35 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 		}
 	}
 
+	// c. Add products/. Always archived when the directory exists — product
+	//    images are referenced from product_images.image_path and losing
+	//    them on restore would be silent data loss. Fresh installs without
+	//    any product uploads won't have the directory yet; that's fine
+	//    (skip gracefully on ENOENT, matching the receipts/ pattern above).
+	productsDir := filepath.Join(opts.DataDir, "products")
+	if info, err := os.Stat(productsDir); err == nil && info.IsDir() {
+		added, bytes, err := addDirToTar(tw, productsDir, "products", createdAt)
+		if err != nil {
+			tw.Close()
+			gzw.Close()
+			out.Close()
+			os.Remove(opts.OutputPath)
+			return nil, fmt.Errorf("add products: %w", err)
+		}
+		totalBytes += bytes
+		fileCount += added
+	} else if err != nil && !os.IsNotExist(err) {
+		tw.Close()
+		gzw.Close()
+		out.Close()
+		os.Remove(opts.OutputPath)
+		return nil, fmt.Errorf("stat products: %w", err)
+	}
+
 	manifest.FileCount = fileCount
 	manifest.TotalBytes = totalBytes
 
-	// c. Add MANIFEST.json (last, so counts reflect everything above).
+	// d. Add MANIFEST.json (last, so counts reflect everything above).
 	mbytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		tw.Close()

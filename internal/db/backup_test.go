@@ -134,6 +134,101 @@ func TestBackupProducesArchiveWithManifest(t *testing.T) {
 	}
 }
 
+// seedProductsDir writes a fake product image under DATA_DIR/products so a
+// backup test can assert product images are archived alongside receipts.
+func seedProductsDir(t *testing.T, dataDir string) {
+	t.Helper()
+	p := filepath.Join(dataDir, "products", "pppp", "thumb.png")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(p, []byte("fake png bytes"), 0o644); err != nil {
+		t.Fatalf("write product image: %v", err)
+	}
+}
+
+// TestBackupIncludesProducts proves that when both DATA_DIR/receipts/ and
+// DATA_DIR/products/ exist, the archive contains entries from both trees
+// (products/ archived unconditionally — no operator opt-out).
+func TestBackupIncludesProducts(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "cartledger.db")
+	database := seedTestDB(t, dbPath)
+	defer database.Close()
+	seedReceiptsDir(t, dataDir)
+	seedProductsDir(t, dataDir)
+
+	outPath := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if _, err := Backup(BackupOptions{
+		DB:              database,
+		DataDir:         dataDir,
+		OutputPath:      outPath,
+		IncludeReceipts: true,
+	}); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	have := map[string]bool{}
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar read: %v", err)
+		}
+		// Guard: every entry path must be relative (zip-slip defense).
+		if filepath.IsAbs(hdr.Name) || strings.HasPrefix(hdr.Name, "/") {
+			t.Errorf("absolute tar entry: %q", hdr.Name)
+		}
+		have[hdr.Name] = true
+	}
+	for _, want := range []string{
+		"receipts/aaaa/front.jpg",
+		"receipts/bbbb/front.jpg",
+		"products/pppp/thumb.png",
+	} {
+		if !have[want] {
+			t.Errorf("archive missing %q; have=%v", want, have)
+		}
+	}
+}
+
+// TestBackupNoProductsDir proves that a fresh install (no products/ at all)
+// still produces a valid backup without erroring out.
+func TestBackupNoProductsDir(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "cartledger.db")
+	database := seedTestDB(t, dbPath)
+	defer database.Close()
+	seedReceiptsDir(t, dataDir)
+	// Intentionally do NOT create products/.
+
+	outPath := filepath.Join(t.TempDir(), "backup.tar.gz")
+	res, err := Backup(BackupOptions{
+		DB:              database,
+		DataDir:         dataDir,
+		OutputPath:      outPath,
+		IncludeReceipts: true,
+	})
+	if err != nil {
+		t.Fatalf("backup on install-without-products failed: %v", err)
+	}
+	if res.Bytes <= 0 {
+		t.Errorf("expected non-empty archive")
+	}
+}
+
 func TestBackupSkipReceipts(t *testing.T) {
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "cartledger.db")
