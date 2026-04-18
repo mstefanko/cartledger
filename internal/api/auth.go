@@ -70,6 +70,7 @@ type userResponse struct {
 	HouseholdID string `json:"household_id"`
 	Email       string `json:"email"`
 	Name        string `json:"name"`
+	IsAdmin     bool   `json:"is_admin"`
 }
 
 // RegisterRoutes mounts auth endpoints onto the given Echo groups.
@@ -181,8 +182,11 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create household"})
 	}
 
+	// The Setup path is gated on "users table is empty" — so the user we're
+	// creating here is definitionally the first user and gets is_admin=1.
+	// The /join path does NOT promote; only the bootstrap-gated /setup does.
 	_, err = tx.Exec(
-		"INSERT INTO users (id, household_id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		"INSERT INTO users (id, household_id, email, name, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
 		userID, householdID, req.Email, req.UserName, passwordHash, now,
 	)
 	if err != nil {
@@ -215,6 +219,7 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 			HouseholdID: householdID,
 			Email:       req.Email,
 			Name:        req.UserName,
+			IsAdmin:     true,
 		},
 	})
 }
@@ -232,10 +237,11 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
 	var userID, householdID, name, passwordHash string
+	var isAdmin bool
 	err := h.DB.QueryRow(
-		"SELECT id, household_id, name, password_hash FROM users WHERE email = ?",
+		"SELECT id, household_id, name, password_hash, is_admin FROM users WHERE email = ?",
 		req.Email,
-	).Scan(&userID, &householdID, &name, &passwordHash)
+	).Scan(&userID, &householdID, &name, &passwordHash, &isAdmin)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
 	}
@@ -261,6 +267,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 			HouseholdID: householdID,
 			Email:       req.Email,
 			Name:        name,
+			IsAdmin:     isAdmin,
 		},
 	})
 }
@@ -400,8 +407,8 @@ func (h *AuthHandler) GetProfile(c echo.Context) error {
 
 	var user userResponse
 	err := h.DB.QueryRow(
-		"SELECT id, household_id, email, name FROM users WHERE id = ?", userID,
-	).Scan(&user.ID, &user.HouseholdID, &user.Email, &user.Name)
+		"SELECT id, household_id, email, name, is_admin FROM users WHERE id = ?", userID,
+	).Scan(&user.ID, &user.HouseholdID, &user.Email, &user.Name, &user.IsAdmin)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}

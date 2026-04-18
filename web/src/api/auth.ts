@@ -54,7 +54,7 @@ export async function join(data: JoinRequest): Promise<JoinResponse> {
   return post<JoinResponse>('/join', data)
 }
 
-export async function getProfile(): Promise<{ user: { id: string; household_id: string; email: string; name: string }; household_name: string }> {
+export async function getProfile(): Promise<{ user: { id: string; household_id: string; email: string; name: string; is_admin: boolean }; household_name: string }> {
   return get('/profile')
 }
 

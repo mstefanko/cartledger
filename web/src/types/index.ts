@@ -16,6 +16,7 @@ export interface User {
   household_id: string
   email: string
   name: string
+  is_admin: boolean
   // password_hash is never serialized (json:"-")
   created_at: string
 }

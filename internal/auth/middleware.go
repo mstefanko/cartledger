@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -176,6 +177,42 @@ func AuthenticateWithQueryToken(c echo.Context, secret string) (*Claims, error) 
 		return nil, echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
 	}
 	return claims, nil
+}
+
+// RequireAdmin returns a middleware that checks `users.is_admin` for the
+// authenticated user and rejects with 403 if the flag isn't set. MUST be
+// chained AFTER JWTMiddleware — it relies on ContextKeyUserID being present.
+//
+// The admin check is a single primary-key lookup against users; we don't
+// bother caching since admin-gated routes are rare (backup/restore/promote)
+// and the DB lookup avoids the stale-JWT problem we'd hit if is_admin lived
+// in claims.
+func RequireAdmin(db *sql.DB) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			userID := UserIDFrom(c)
+			if userID == "" {
+				return c.JSON(http.StatusUnauthorized, map[string]string{
+					"error": "missing or invalid token",
+				})
+			}
+			var isAdmin bool
+			err := db.QueryRow("SELECT is_admin FROM users WHERE id = ?", userID).Scan(&isAdmin)
+			if err != nil {
+				slog.Warn("admin check: db lookup failed", "user_id", userID, "err", err)
+				return c.JSON(http.StatusInternalServerError, map[string]string{
+					"error": "database error",
+				})
+			}
+			if !isAdmin {
+				slog.Warn("admin check: forbidden", "user_id", userID, "path", c.Request().URL.Path)
+				return c.JSON(http.StatusForbidden, map[string]string{
+					"error": "admin required",
+				})
+			}
+			return next(c)
+		}
+	}
 }
 
 // UserIDFrom extracts the user_id from the echo context.

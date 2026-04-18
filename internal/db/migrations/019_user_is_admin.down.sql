@@ -1,0 +1,3 @@
+-- SQLite can't drop a column without a full table rebuild before 3.35.
+-- For a self-host tool, leaving the column in place on down is acceptable;
+-- it's a nullable-safe boolean with a default and breaks nothing.
