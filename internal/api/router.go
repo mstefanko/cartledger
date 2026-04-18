@@ -251,8 +251,24 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
 		}
 
-		// Rebase onto <DataDir>/receipts and canonicalize.
+		// Receipt image paths are stored as filepath.Join(DataDir, "receipts",
+		// <uuid>, <file>) in internal/api/receipts.go and processed_* writes in
+		// internal/worker/receipt.go. Depending on whether DataDir is absolute
+		// (Docker: /data) or relative (dev: ./data), the stored value is
+		// correspondingly absolute or relative. The SPA requests that stored
+		// path verbatim via /api/v1/files/<path>, so we see forms like:
+		//   /api/v1/files//data/receipts/<uuid>/1.jpg   (absolute DataDir)
+		//   /api/v1/files/data/receipts/<uuid>/1.jpg    (relative DataDir)
+		//   /api/v1/files/<uuid>/1.jpg                  (receipt-relative — ideal)
+		//
+		// Normalize by stripping any "…/receipts/" prefix: whatever remains is
+		// receipt-relative and begins with the UUID. If no "receipts/" segment
+		// is found, treat the whole thing as already receipt-relative. All
+		// three forms converge on the containment + ownership checks below.
 		trimmed := strings.TrimLeft(rawPath, "/")
+		if idx := strings.LastIndex(trimmed, "receipts/"); idx >= 0 {
+			trimmed = trimmed[idx+len("receipts/"):]
+		}
 		joined := filepath.Join(absBase, filepath.Clean("/"+trimmed))
 		absTarget, err := filepath.Abs(joined)
 		if err != nil {
