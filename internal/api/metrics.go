@@ -61,6 +61,11 @@ type Metrics struct {
 	// periodically; labeled by type=original|processed).
 	storageBytes *prometheus.GaugeVec
 
+	// Retention deletions: counter of original image files removed by the
+	// retention janitor, labeled by reason ("age" for the normal mtime-based
+	// sweep). Processed images are never deleted.
+	retentionDeletedTotal *prometheus.CounterVec
+
 	// Background sampler lifecycle.
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -139,6 +144,13 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 		},
 		[]string{"type"},
 	)
+	m.retentionDeletedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cartledger_retention_deleted_total",
+			Help: "Total original receipt image files removed by the retention janitor, by reason.",
+		},
+		[]string{"reason"},
+	)
 
 	for _, c := range []prometheus.Collector{
 		m.httpRequestsTotal,
@@ -147,6 +159,7 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 		m.llmTokensTotal,
 		m.preprocessFallbacksTotal,
 		m.storageBytes,
+		m.retentionDeletedTotal,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, err
@@ -265,6 +278,18 @@ func (m *Metrics) RecordPreprocessFallback(reason string) {
 		reason = "unknown"
 	}
 	m.preprocessFallbacksTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordRetentionDeleted is called by the retention janitor each time it
+// removes an original receipt image file. Safe for nil receiver.
+func (m *Metrics) RecordRetentionDeleted(reason string, n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	if reason == "" {
+		reason = "age"
+	}
+	m.retentionDeletedTotal.WithLabelValues(reason).Add(float64(n))
 }
 
 // sampleQueueDepth ticks every `interval` and snapshots worker.QueueDepth()

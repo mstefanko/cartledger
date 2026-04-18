@@ -68,6 +68,18 @@ type Config struct {
 	// values are NOT configurable — operators can't usefully tune them
 	// without load-testing data.
 	RateLimitEnabled bool
+	// ImageRetentionDays is the retention window for original receipt image
+	// uploads (files under DATA_DIR/receipts/<uuid>/ NOT prefixed
+	// "processed_"). When > 0, a background janitor deletes original files
+	// whose mtime is older than this many days; processed_* files are kept
+	// forever (they're the only thing the review UI can display). 0 (default)
+	// disables the janitor entirely. A reasonable self-host value is 90.
+	// Env: IMAGE_RETENTION_DAYS.
+	ImageRetentionDays int
+	// ImageRetentionSweepInterval is how often the retention janitor walks
+	// DATA_DIR/receipts/ to age out originals. Default 24h. Env:
+	// IMAGE_RETENTION_SWEEP_INTERVAL (Go duration, e.g. "24h", "6h").
+	ImageRetentionSweepInterval time.Duration
 }
 
 // defaultDevAllowedOrigins is the default ALLOWED_ORIGINS set used in non-
@@ -160,6 +172,8 @@ func Load() (*Config, error) {
 		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
 		LockInactivityTTL:        getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
 		RateLimitEnabled:         getEnvBool("RATE_LIMIT_ENABLED", true),
+		ImageRetentionDays:          int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
+		ImageRetentionSweepInterval: getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
 	}
 
 	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty

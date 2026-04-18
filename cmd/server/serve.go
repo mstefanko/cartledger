@@ -141,6 +141,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	imaging.SetFallbackRecorder(metrics)
 
+	// Image retention janitor (2.5). Only started when
+	// IMAGE_RETENTION_DAYS > 0. Deletes originals older than the
+	// configured window; processed_* files are kept forever (review UI
+	// depends on them). See internal/imaging/retention.go.
+	var retentionJanitor *imaging.Janitor
+	if cfg.ImageRetentionDays > 0 {
+		retentionJanitor = imaging.NewJanitor(cfg.DataDir, cfg.ImageRetentionDays, cfg.ImageRetentionSweepInterval)
+		retentionJanitor.SetMetrics(metrics)
+		slog.Info("retention janitor enabled",
+			"days", cfg.ImageRetentionDays,
+			"sweep_interval", cfg.ImageRetentionSweepInterval,
+		)
+	}
+
 	// First-run bootstrap: if the users table is empty, print a setup URL
 	// containing a signed one-time token. The token is persisted in the DB
 	// so restarts don't invalidate an already-pasted URL.
@@ -159,6 +173,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Graceful shutdown via signal.NotifyContext.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Start the retention janitor now that we have a cancellable context.
+	// Stop is deferred so it runs during graceful shutdown.
+	if retentionJanitor != nil {
+		retentionJanitor.Start(ctx)
+		defer retentionJanitor.Stop()
+	}
 
 	// Start server in a goroutine.
 	go func() {

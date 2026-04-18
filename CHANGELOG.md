@@ -46,6 +46,16 @@ Once setup succeeds, the token is marked consumed and `/setup` rejects
 every further call with 401.
 
 ### Added
+- **Image retention janitor** (`internal/imaging/retention.go`): when
+  `IMAGE_RETENTION_DAYS > 0`, a background goroutine sweeps
+  `DATA_DIR/receipts/<uuid>/` every `IMAGE_RETENTION_SWEEP_INTERVAL`
+  (default `24h`) and deletes original uploads whose mtime predates the
+  window. Preprocessed images (`processed_*`) are kept forever — the
+  review UI depends on them. New Prometheus counter
+  `cartledger_retention_deleted_total{reason="age"}` tracks deletions.
+  Reprocessing a receipt whose original has been aged out returns
+  `410 Gone` (existing behavior). Defaults to disabled (`0`);
+  recommended self-host value is `90`.
 - Session auth via `__Host-cartledger_session` cookie over HTTPS (plain
   `cartledger_session` over HTTP), `HttpOnly`, `SameSite=Strict`, `Path=/`.
   Shell / iOS-Shortcut users can still authenticate via `Authorization:
