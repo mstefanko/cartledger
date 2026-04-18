@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/mstefanko/cartledger/internal/backup"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
 )
@@ -55,6 +56,16 @@ func runRestore(archivePath string, force bool) error {
 	maxVersion, err := db.MaxMigrationVersion()
 	if err != nil {
 		return fmt.Errorf("enumerate migrations: %w", err)
+	}
+
+	// Validate the archive with the same guards the HTTP / startup surfaces
+	// use (symlink + hardlink rejection, SQLite-magic check on cartledger.db,
+	// allowlist on entry names). db.Restore below also runs its own
+	// zip-slip / schema-version guards via the shared ValidateTarEntryPath
+	// helper; calling ValidateArchive first means the CLI fails fast on
+	// malicious archives before touching DataDir.
+	if _, err := backup.ValidateArchive(absArchive, maxVersion); err != nil {
+		return fmt.Errorf("validate archive: %w", err)
 	}
 
 	res, err := db.Restore(db.RestoreOptions{

@@ -365,36 +365,15 @@ func Restore(opts RestoreOptions) (*RestoreResult, error) {
 			continue // already consumed
 		}
 
-		// Traversal defense: forbid absolute paths and `..` anywhere.
-		// filepath.IsLocal (Go 1.20+) enforces both.
-		if !filepath.IsLocal(name) {
-			return nil, fmt.Errorf("unsafe tar entry path: %q (absolute or traversal)", hdr.Name)
-		}
-		// Extra belt-and-suspenders: reject explicit `..` segments even on
-		// platforms where IsLocal's semantics differ.
-		if strings.Contains(name, "..") {
-			parts := strings.Split(name, "/")
-			for _, p := range parts {
-				if p == ".." {
-					return nil, fmt.Errorf("unsafe tar entry path: %q (traversal segment)", hdr.Name)
-				}
-			}
-		}
-
-		dest := filepath.Join(opts.DataDir, filepath.FromSlash(name))
-		// Defense in depth: verify the joined path is still under DataDir.
 		absDataDir, err := filepath.Abs(opts.DataDir)
 		if err != nil {
 			return nil, fmt.Errorf("abs data dir: %w", err)
 		}
-		absDest, err := filepath.Abs(dest)
+		absDest, err := ValidateTarEntryPath(hdr.Name, absDataDir)
 		if err != nil {
-			return nil, fmt.Errorf("abs dest: %w", err)
+			return nil, err
 		}
-		if !strings.HasPrefix(absDest+string(filepath.Separator), absDataDir+string(filepath.Separator)) &&
-			absDest != absDataDir {
-			return nil, fmt.Errorf("unsafe tar entry path: %q (escapes data dir)", hdr.Name)
-		}
+		dest := absDest
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -437,6 +416,41 @@ func Restore(opts RestoreOptions) (*RestoreResult, error) {
 		FileCount:  fileCount,
 		TotalBytes: totalBytes,
 	}, nil
+}
+
+// ValidateTarEntryPath enforces the zip-slip / traversal guards used by both
+// the legacy Restore path and the Phase B staged-restore validator. Returns
+// the cleaned, DataDir-resolved destination path on success, or an error
+// describing why the entry is unsafe. The returned path is always under
+// absDataDir when err == nil (absDataDir must itself already be absolute).
+//
+// Exported so internal/backup/restore.go can reuse exactly the same guard
+// semantics without duplicating the IsLocal + containment logic.
+func ValidateTarEntryPath(rawName, absDataDir string) (string, error) {
+	name := filepath.ToSlash(rawName)
+	if !filepath.IsLocal(name) {
+		return "", fmt.Errorf("unsafe tar entry path: %q (absolute or traversal)", rawName)
+	}
+	// Belt-and-suspenders: reject explicit `..` segments even on platforms
+	// where IsLocal's semantics differ.
+	if strings.Contains(name, "..") {
+		for _, p := range strings.Split(name, "/") {
+			if p == ".." {
+				return "", fmt.Errorf("unsafe tar entry path: %q (traversal segment)", rawName)
+			}
+		}
+	}
+	dest := filepath.Join(absDataDir, filepath.FromSlash(name))
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		return "", fmt.Errorf("abs dest: %w", err)
+	}
+	sep := string(filepath.Separator)
+	if absDest != absDataDir &&
+		!strings.HasPrefix(absDest+sep, absDataDir+sep) {
+		return "", fmt.Errorf("unsafe tar entry path: %q (escapes data dir)", rawName)
+	}
+	return absDest, nil
 }
 
 // readManifest makes a streaming pass over the archive to find MANIFEST.json.

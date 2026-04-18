@@ -73,6 +73,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
+	// Apply any staged restore BEFORE opening the database. If a restore was
+	// uploaded via POST /api/v1/backups/restore in a prior process, its
+	// pending tar.gz lives under $DATA_DIR/restore-pending/. We re-validate
+	// the archive (belt-and-suspenders vs. stage-time validation), move the
+	// live DB aside as cartledger.db.pre-restore-<ts>, extract, and log the
+	// pre-restore path so operators have a manual rollback. Any failure
+	// refuses to start — silently leaving a staged restore un-applied is
+	// worse than an outage (operator thinks DB is restored, it isn't).
+	// See docs/ops/migration-recovery.md for recovery procedures.
+	if err := backup.ApplyStagedRestoreIfPresent(cfg, slog.Default()); err != nil {
+		fatalExit("apply staged restore", "err", err)
+	}
+
 	// Open SQLite database with pragmas.
 	database, err := db.Open(cfg.DBPath())
 	if err != nil {
