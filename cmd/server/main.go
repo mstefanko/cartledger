@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -20,10 +21,14 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
-
-	if cfg.JWTSecret == "change-me-in-production" {
-		log.Println("WARNING: Using default JWT secret. Set JWT_SECRET environment variable for production.")
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cartledger: configuration error")
+		fmt.Fprintln(os.Stderr, "-----------------------------------")
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "-----------------------------------")
+		fmt.Fprintln(os.Stderr, "Set the required environment variables (see .env.example) and try again.")
+		os.Exit(1)
 	}
 
 	// Open SQLite database with pragmas.
@@ -56,13 +61,10 @@ func main() {
 		llmClient = llm.NewMockClient()
 		log.Println("LLM provider: mock")
 	default:
-		// Auto-detect: use API if key is set, else fail clearly.
-		if cfg.AnthropicAPIKey != "" {
-			llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey, cfg.LLMModel)
-			log.Printf("LLM provider: claude (direct API, model=%s)", cfg.LLMModel)
-		} else {
-			log.Fatal("ANTHROPIC_API_KEY is required. Set it in .env or as an environment variable.")
-		}
+		// Auto-detect: config.Validate guarantees AnthropicAPIKey is set when
+		// LLMProvider != "mock", so this branch is safe.
+		llmClient = llm.NewClaudeClient(cfg.AnthropicAPIKey, cfg.LLMModel)
+		log.Printf("LLM provider: claude (direct API, model=%s)", cfg.LLMModel)
 	}
 
 	// Create matching engine and receipt worker.
