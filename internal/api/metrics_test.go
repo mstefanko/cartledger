@@ -73,6 +73,56 @@ func TestMetricsNewAndClose(t *testing.T) {
 	}
 }
 
+// TestMetricsBackupCollectorsRegistered guards against a regression where a
+// future refactor drops one of the three backup collectors. They only show
+// up in Gather() after the recorder method is called (Counter/Histogram
+// vecs are silent until observed; the gauge emits zero once touched), so
+// exercise each recorder first and then confirm all three metric names
+// appear in the registry output.
+func TestMetricsBackupCollectorsRegistered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := NewMetrics(MetricsConfig{
+		Registerer:            reg,
+		StorageSampleInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+	defer m.Close()
+
+	// Trigger each backup recorder through the public API so we're testing
+	// the same code path the Runner uses — not poking private fields.
+	m.RecordBackupDuration("complete", 1234*time.Millisecond)
+	m.RecordBackupSize(4096)
+	m.RecordBackupMissingImages(2)
+
+	// Also verify the nil-receiver safety contract holds.
+	var nilM *Metrics
+	nilM.RecordBackupDuration("complete", time.Second)
+	nilM.RecordBackupSize(1)
+	nilM.RecordBackupMissingImages(1)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	required := map[string]bool{
+		"cartledger_backup_duration_seconds":      false,
+		"cartledger_backup_size_bytes":            false,
+		"cartledger_backup_missing_images_total":  false,
+	}
+	for _, mf := range mfs {
+		if _, ok := required[mf.GetName()]; ok {
+			required[mf.GetName()] = true
+		}
+	}
+	for name, seen := range required {
+		if !seen {
+			t.Errorf("backup metric missing from registry: %s", name)
+		}
+	}
+}
+
 // TestHTTPMiddlewareLabels confirms the middleware uses the route TEMPLATE
 // (c.Path()) — not the literal URL path — as the label value. A regression
 // here would cause cardinality explosion in production.

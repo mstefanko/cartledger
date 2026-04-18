@@ -6,11 +6,16 @@
 #   1. Build → launch with mock LLM → /livez
 #   2. Extract bootstrap token from stderr
 #   3. /setup (with X-Bootstrap-Token) → /auth/login → /auth/profile
-#   4. Stop server, back up DATA_DIR
-#   5. Restore into a fresh DATA_DIR, re-launch, re-login
+#   4. Upload a receipt (mock LLM), poll until the worker finishes so the DB
+#      holds a receipt + line items + matched-product state to round-trip
+#   5. Stop server, back up DATA_DIR via the CLI
+#   6. Restore into a fresh DATA_DIR, re-launch, re-login
+#   7. GET /api/v1/receipts on the restored server — assert the uploaded
+#      receipt + its line items survived the backup/restore round-trip
 #
 # Designed to catch ~70% of deploy regressions: config loading, migrations,
-# bootstrap token flow, cookie-based auth, backup/restore round-trip.
+# bootstrap token flow, cookie-based auth, backup/restore round-trip,
+# receipt+line-item persistence through a backup cycle.
 #
 # Usage:
 #   make smoke
@@ -187,24 +192,95 @@ profile_status=$(curl -sS -o /tmp/smoke-profile.json -w '%{http_code}' \
 [[ "${profile_status}" == "200" ]] || { cat /tmp/smoke-profile.json; die "profile returned ${profile_status}"; }
 vlog "profile status=${profile_status}"
 
-# -------- 7. stop server for backup --------
+# -------- 7. upload a receipt (mock LLM fills line items) --------
+# Mint a minimal valid 1x1 PNG so we exercise the upload → scan → worker →
+# line-items pipeline. The mock LLM client ignores pixel data and returns a
+# canned extraction (see internal/llm/testdata/sample-receipt.json) — we just
+# need *some* valid image bytes to clear the content-type + decode checks.
+SAMPLE_PNG="$(mktemp -t cartledger-smoke-sample.XXXXXX).png"
+python3 - "${SAMPLE_PNG}" <<'PY'
+import base64, sys
+# 1x1 transparent PNG — smallest legal encoding.
+data = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+with open(sys.argv[1], "wb") as f:
+    f.write(data)
+PY
+
+log "POST /api/v1/receipts/scan"
+scan_status=$(curl -sS -o /tmp/smoke-scan.json -w '%{http_code}' \
+    -b "${COOKIE_JAR}" \
+    -X POST "${BASE_URL}/api/v1/receipts/scan" \
+    -F "images=@${SAMPLE_PNG};type=image/png")
+[[ "${scan_status}" == "202" || "${scan_status}" == "200" ]] \
+    || { cat /tmp/smoke-scan.json; die "receipt scan returned ${scan_status}"; }
+RECEIPT_ID=$(python3 -c '
+import json, sys
+with open("/tmp/smoke-scan.json") as f:
+    print(json.load(f).get("id",""))
+')
+[[ -n "${RECEIPT_ID}" ]] || { cat /tmp/smoke-scan.json; die "scan response missing id"; }
+vlog "receipt id=${RECEIPT_ID}"
+
+# Poll until the worker finishes. Mock LLM is fast (~ms) but the worker still
+# goes through preprocess + matcher, so give it a generous deadline for
+# loaded CI runners.
+log "polling receipt status"
+final_status=""
+final_items=0
+deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < deadline )); do
+    curl -fsS -o /tmp/smoke-receipt.json \
+        -b "${COOKIE_JAR}" \
+        "${BASE_URL}/api/v1/receipts/${RECEIPT_ID}" || true
+    final_status=$(python3 -c '
+import json
+try:
+    print(json.load(open("/tmp/smoke-receipt.json")).get("status",""))
+except Exception:
+    print("")
+')
+    final_items=$(python3 -c '
+import json
+try:
+    li = json.load(open("/tmp/smoke-receipt.json")).get("line_items") or []
+    print(len(li))
+except Exception:
+    print("0")
+')
+    vlog "poll: status=${final_status} items=${final_items}"
+    if [[ "${final_status}" != "pending" && "${final_status}" != "processing" && -n "${final_status}" ]]; then
+        break
+    fi
+    sleep 0.5
+done
+[[ "${final_status}" != "pending" && "${final_status}" != "processing" && -n "${final_status}" ]] \
+    || { cat /tmp/smoke-receipt.json; die "worker did not finish within 30s (status=${final_status})"; }
+(( final_items > 0 )) || { cat /tmp/smoke-receipt.json; die "worker finished but no line items extracted"; }
+vlog "worker done: status=${final_status} line_items=${final_items}"
+EXPECTED_ITEMS="${final_items}"
+
+# -------- 8. stop server for backup --------
 log "stopping server"
 stop_server
 
-# -------- 8. backup --------
+# -------- 9. backup via CLI --------
+# The `backup` subcommand takes `--out <path>`, not a positional arg. The
+# archive is written outside both DATA_DIRs so the restore target stays empty.
 log "backup → ${BACKUP_FILE}"
-DATA_DIR="${DATA_DIR_ORIG}" "${BIN}" backup "${BACKUP_FILE}" >/dev/null
+DATA_DIR="${DATA_DIR_ORIG}" "${BIN}" backup --out "${BACKUP_FILE}" >/dev/null
 
 [[ -f "${BACKUP_FILE}" ]] || die "backup file not created"
 backup_size=$(wc -c < "${BACKUP_FILE}" | tr -d ' ')
 (( backup_size > 1024 )) || die "backup file too small: ${backup_size} bytes"
 vlog "backup size=${backup_size} bytes"
 
-# -------- 9. restore to fresh DATA_DIR --------
+# -------- 10. restore to fresh DATA_DIR --------
 log "restore → ${DATA_DIR_RESTORED}"
 DATA_DIR="${DATA_DIR_RESTORED}" "${BIN}" restore "${BACKUP_FILE}" >/dev/null
 
-# -------- 10. relaunch against restored DATA_DIR, re-login --------
+# -------- 11. relaunch against restored DATA_DIR, re-login --------
 log "relaunching server against restored DATA_DIR"
 launch_server "${DATA_DIR_RESTORED}" "${STDERR_LOG_RESTORED}"
 
@@ -223,7 +299,39 @@ relogin_status=$(curl -sS -o /tmp/smoke-relogin.json -w '%{http_code}' \
 [[ "${relogin_status}" == "200" ]] || { cat /tmp/smoke-relogin.json; die "re-login after restore returned ${relogin_status}"; }
 vlog "relogin status=${relogin_status}"
 
+# -------- 12. verify receipt + line items round-tripped --------
+log "GET /api/v1/receipts (post-restore round-trip check)"
+receipts_status=$(curl -sS -o /tmp/smoke-receipts.json -w '%{http_code}' \
+    -b "${COOKIE_JAR}" \
+    "${BASE_URL}/api/v1/receipts")
+[[ "${receipts_status}" == "200" ]] || { cat /tmp/smoke-receipts.json; die "receipts list returned ${receipts_status}"; }
+
+# Assert: (a) the receipt we uploaded is present by ID, and (b) its
+# persisted item_count matches what the worker extracted pre-backup.
+python3 - "${RECEIPT_ID}" "${EXPECTED_ITEMS}" <<'PY'
+import json, sys
+wanted_id, wanted_items = sys.argv[1], int(sys.argv[2])
+with open("/tmp/smoke-receipts.json") as f:
+    rows = json.load(f)
+if not isinstance(rows, list) or not rows:
+    print(f"FAIL: receipts list empty or not an array: {rows!r}", file=sys.stderr)
+    sys.exit(1)
+match = next((r for r in rows if r.get("id") == wanted_id), None)
+if match is None:
+    ids = [r.get("id") for r in rows]
+    print(f"FAIL: receipt {wanted_id!r} missing after restore; got ids={ids}", file=sys.stderr)
+    sys.exit(1)
+got_items = int(match.get("item_count") or 0)
+if got_items != wanted_items:
+    print(f"FAIL: item_count={got_items} after restore, expected {wanted_items}", file=sys.stderr)
+    sys.exit(1)
+print(f"OK: receipt {wanted_id[:8]}... round-tripped with {got_items} line items")
+PY
+
 log "stopping server"
 stop_server
+
+# Scrub the sample PNG too.
+rm -f "${SAMPLE_PNG}" 2>/dev/null || true
 
 log "all checks passed"

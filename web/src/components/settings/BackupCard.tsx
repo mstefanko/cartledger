@@ -178,8 +178,16 @@ function BackupCard() {
       </p>
       <p className="text-small text-neutral-400 mt-1">
         Encrypt archives with <code className="text-neutral-500">age</code> or{' '}
-        <code className="text-neutral-500">gpg</code> before uploading to untrusted storage.
-        See <span className="text-neutral-500">docs/ops/backup.md</span> for details.
+        <code className="text-neutral-500">gpg</code> before uploading to untrusted storage. See{' '}
+        <a
+          href="https://github.com/mstefanko/cartledger/blob/main/docs/ops/backup.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-neutral-500 underline hover:text-neutral-300"
+        >
+          docs/ops/backup.md
+        </a>{' '}
+        for details.
       </p>
 
       <Modal
