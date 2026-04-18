@@ -129,6 +129,16 @@ func (w *ReceiptWorker) Resubmit(receiptID, householdID string) error {
 // We hold the mutex across the channel send so Shutdown's close(jobs) cannot
 // race with an in-progress send. The select is non-blocking, so the critical
 // section is cheap.
+//
+// wg-accounting invariant: w.wg.Add(1) happens HERE, after a successful send,
+// while still holding w.mu. The process() loop only calls wg.Done. The
+// consequence is that every job sitting in w.jobs (buffered or in-flight)
+// carries an open wg count, so Shutdown's wg.Wait can block on buffered work
+// that hasn't been picked up yet — AND the drain loop in Shutdown must call
+// wg.Done for each buffered job it pulls out (since we're "handling" it
+// instead of letting process() do so). This closes the race where
+// wg.Wait returned 0 while a process() goroutine was mid-receive but had not
+// yet called Add — making the shutdown deadline effectively zero.
 func (w *ReceiptWorker) Submit(job ReceiptJob) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -137,6 +147,7 @@ func (w *ReceiptWorker) Submit(job ReceiptJob) error {
 	}
 	select {
 	case w.jobs <- job:
+		w.wg.Add(1)
 		return nil
 	default:
 		return ErrQueueFull
@@ -144,10 +155,10 @@ func (w *ReceiptWorker) Submit(job ReceiptJob) error {
 }
 
 // process is the main worker loop that pulls jobs from the channel and processes them.
-// Each pulled job is counted against wg so Shutdown can wait for in-flight work.
+// The wg.Add was performed by Submit; process() only needs to call wg.Done
+// when the job completes (runJob returned or panicked-then-recovered).
 func (w *ReceiptWorker) process() {
 	for job := range w.jobs {
-		w.wg.Add(1)
 		w.runJob(job)
 		w.wg.Done()
 	}
@@ -212,10 +223,13 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 		// All in-flight jobs finished and process() goroutines have exited
 		// (they exit once w.jobs is closed AND drained). Any remaining items
 		// in w.jobs would have been picked up before exit — in practice the
-		// channel is empty here, but drain defensively.
+		// channel is empty here, but drain defensively. wg-accounting: every
+		// Submit added 1; process() calls Done. If we reach a buffered job
+		// via this drain, we must Done it ourselves.
 		for job := range w.jobs {
 			requeued++
 			w.markPending(job.ReceiptID)
+			w.wg.Done()
 		}
 		slog.Info("worker: shutdown complete", "in_flight_finished", true, "requeued", requeued)
 		return nil
@@ -225,7 +239,9 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 		// be running; we cannot interrupt a Claude HTTP call safely. Their
 		// receipt rows will remain at whatever status the tx reached (usually
 		// 'processing' pre-commit, which rolls back on process exit, or
-		// 'matched'/'error' if the tx already committed).
+		// 'matched'/'error' if the tx already committed). wg-accounting: each
+		// buffered job we drain needs a wg.Done (Submit already Add'd 1 for
+		// it).
 		for {
 			select {
 			case job, ok := <-w.jobs:
@@ -236,12 +252,84 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 				}
 				requeued++
 				w.markPending(job.ReceiptID)
+				w.wg.Done()
 			default:
 				slog.Warn("worker: shutdown deadline exceeded", "requeued", requeued, "note", "in-flight goroutines may still be running")
 				return ctx.Err()
 			}
 		}
 	}
+}
+
+// RequeuePending reloads receipts left at status='pending' from a prior run
+// (Shutdown marks in-flight + buffered jobs pending, but the process itself
+// never re-enqueues them on boot). Returns the number of successfully
+// re-submitted receipts. Errors reading the DB are returned; per-receipt
+// Resubmit failures (ErrImagesGone, etc.) are logged and skipped.
+//
+// Caps at 1000 rows per boot to avoid a resubmit storm on massive DBs; if
+// more than the cap exist, logs a warning and leaves the remainder for the
+// next boot (they stay 'pending', so the next call picks up where we left
+// off).
+func (w *ReceiptWorker) RequeuePending(ctx context.Context) (int, error) {
+	const cap = 1000
+	// Query one extra row to detect overflow.
+	rows, err := w.db.QueryContext(ctx,
+		"SELECT id, household_id FROM receipts WHERE status = 'pending' LIMIT ?",
+		cap+1,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("query pending receipts: %w", err)
+	}
+	defer rows.Close()
+
+	type pendingRow struct{ id, householdID string }
+	var pending []pendingRow
+	for rows.Next() {
+		var r pendingRow
+		if err := rows.Scan(&r.id, &r.householdID); err != nil {
+			return 0, fmt.Errorf("scan pending row: %w", err)
+		}
+		pending = append(pending, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate pending rows: %w", err)
+	}
+
+	overflow := len(pending) > cap
+	if overflow {
+		pending = pending[:cap]
+	}
+
+	var resubmitted int
+	for _, r := range pending {
+		if ctx.Err() != nil {
+			slog.Warn("worker: requeue aborted", "reason", ctx.Err(), "resubmitted", resubmitted)
+			return resubmitted, ctx.Err()
+		}
+		err := w.Resubmit(r.id, r.householdID)
+		switch {
+		case err == nil:
+			resubmitted++
+		case errors.Is(err, ErrImagesGone):
+			slog.Warn("worker: requeue skipped — images gone", "receipt_id", r.id)
+		case errors.Is(err, ErrQueueFull):
+			// The queue is full already; stop rather than hammering. Remaining
+			// rows stay 'pending' for the next boot.
+			slog.Warn("worker: requeue stopped — queue full", "resubmitted", resubmitted, "remaining", len(pending)-resubmitted)
+			return resubmitted, nil
+		case errors.Is(err, ErrWorkerShuttingDown):
+			// Shouldn't happen at startup, but handle defensively.
+			slog.Warn("worker: requeue stopped — shutting down", "resubmitted", resubmitted)
+			return resubmitted, nil
+		default:
+			slog.Warn("worker: requeue error — skipping", "receipt_id", r.id, "err", err)
+		}
+	}
+	if overflow {
+		slog.Warn("worker: requeue capped", "cap", cap, "note", "more pending receipts exist; they will be picked up on next boot")
+	}
+	return resubmitted, nil
 }
 
 // markPending sets a receipt's status back to 'pending' so the next boot can

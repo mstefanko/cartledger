@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -224,15 +226,63 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 	// Serve uploaded receipt images. Auth is cookie-first (browsers DO send
 	// cookies on same-origin <img src=>); ?token= query fallback is kept but
 	// emits a deprecation warning so operators can monitor usage.
+	//
+	// SECURITY: The path param is UNTRUSTED. We rebase it onto
+	// <DataDir>/receipts and reject anything that escapes that subtree. We
+	// also enforce receipt ownership: the first path segment is the receipt
+	// UUID, and it must belong to the caller's household. Non-owners get 404
+	// (not 403) to avoid leaking receipt existence across households.
+	//
+	// Expected layout: <DataDir>/receipts/<receipt_uuid>/<image_file>
+	absBase, baseErr := filepath.Abs(filepath.Join(cfg.DataDir, "receipts"))
 	v1.GET("/files/*", func(c echo.Context) error {
-		if _, err := auth.AuthenticateWithQueryToken(c, cfg.JWTSecret); err != nil {
+		claims, err := auth.AuthenticateWithQueryToken(c, cfg.JWTSecret)
+		if err != nil {
 			return err
 		}
-		filePath := c.Param("*")
-		if containsDotDot(filePath) {
+		if baseErr != nil {
+			// Misconfigured data dir — fail closed.
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "storage unavailable"})
+		}
+
+		rawPath := c.Param("*")
+		// Belt-and-suspenders: reject obvious traversal before doing path math.
+		if containsDotDot(rawPath) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
 		}
-		return c.File(filePath)
+
+		// Rebase onto <DataDir>/receipts and canonicalize.
+		trimmed := strings.TrimLeft(rawPath, "/")
+		joined := filepath.Join(absBase, filepath.Clean("/"+trimmed))
+		absTarget, err := filepath.Abs(joined)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
+		}
+		// Enforce containment: absTarget must live under absBase.
+		if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(os.PathSeparator)) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
+		}
+
+		// First segment of the (trimmed, forward-slash) path is the receipt UUID.
+		segs := strings.SplitN(trimmed, "/", 2)
+		if len(segs) < 1 || segs[0] == "" {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+		}
+		receiptID := segs[0]
+
+		// Ownership check: receipt must exist AND belong to caller's household.
+		// On ErrNoRows or mismatch return 404 — revealing 403 would leak
+		// receipt IDs across households.
+		var householdID string
+		qerr := database.QueryRow("SELECT household_id FROM receipts WHERE id = ?", receiptID).Scan(&householdID)
+		if qerr == sql.ErrNoRows || (qerr == nil && householdID != claims.HouseholdID) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+		}
+		if qerr != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+
+		return c.File(absTarget)
 	})
 
 	// WebSocket endpoint — auth handled inside the handler (multi-source

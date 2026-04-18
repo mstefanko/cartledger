@@ -119,6 +119,21 @@ func runServe(cmd *cobra.Command, args []string) error {
 	matchEngine := matcher.NewEngine(database)
 	receiptWorker := worker.NewReceiptWorker(2, llmClient, llmGuard, matchEngine, database, hub, cfg)
 
+	// Re-enqueue any receipts left at status='pending' from a prior shutdown.
+	// Shutdown marks in-flight + buffered jobs pending, but doesn't re-submit
+	// them — that's our job now. Errors here are non-fatal: the rows remain
+	// 'pending' and will be picked up on the next boot.
+	{
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resubmitted, err := receiptWorker.RequeuePending(reqCtx)
+		reqCancel()
+		if err != nil {
+			slog.Warn("worker: requeue pending failed (will retry next boot)", "err", err, "resubmitted", resubmitted)
+		} else if resubmitted > 0 {
+			slog.Info("worker: requeued pending receipts", "count", resubmitted)
+		}
+	}
+
 	// Initialize Prometheus metrics. The sampler goroutines start
 	// immediately; Close() is deferred below so they stop cleanly on
 	// shutdown. Default Go collector + ProcessCollector (CPU/mem/FDs) are
