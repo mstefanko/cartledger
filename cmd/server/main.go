@@ -91,11 +91,22 @@ func main() {
 	<-ctx.Done()
 	log.Println("shutting down...")
 
-	// Give outstanding requests 10 seconds to complete.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := e.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("shutdown error: %v", err)
+	// Stop HTTP server FIRST so no new Submit calls arrive at the worker.
+	// 10s is plenty for in-flight HTTP requests (uploads are multipart but not
+	// long-running — the LLM work is async in the worker).
+	httpShutdownCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer httpCancel()
+	if err := e.Shutdown(httpShutdownCtx); err != nil {
+		log.Printf("http shutdown error: %v", err)
+	}
+	log.Println("http server stopped")
+
+	// Now drain the worker. 30s deadline: finish whatever LLM calls can finish,
+	// and mark the rest as 'pending' so they're re-enqueued on next boot.
+	workerShutdownCtx, workerCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer workerCancel()
+	if err := receiptWorker.Shutdown(workerShutdownCtx); err != nil {
+		log.Printf("worker shutdown error: %v", err)
 	}
 	log.Println("server stopped")
 }

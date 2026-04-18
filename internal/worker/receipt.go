@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +43,13 @@ type ReceiptWorker struct {
 	db          *sql.DB
 	hub         *ws.Hub
 	cfg         *config.Config
+
+	// Shutdown coordination.
+	wg          sync.WaitGroup // tracks in-flight processJob calls
+	mu          sync.Mutex     // guards accepting flag
+	accepting   bool           // true when Submit is allowed
+	shutdown    atomic.Bool    // true once Shutdown was called (idempotent guard)
+	shutdownRes chan struct{}  // closed once Shutdown has fully completed
 }
 
 // NewReceiptWorker creates a new ReceiptWorker and starts the goroutine pool.
@@ -51,6 +61,8 @@ func NewReceiptWorker(concurrency int, llmClient llm.Client, matchEngine *matche
 		db:          db,
 		hub:         hub,
 		cfg:         cfg,
+		accepting:   true,
+		shutdownRes: make(chan struct{}),
 	}
 	for i := 0; i < concurrency; i++ {
 		go w.process()
@@ -61,9 +73,23 @@ func NewReceiptWorker(concurrency int, llmClient llm.Client, matchEngine *matche
 // ErrQueueFull is returned when the worker queue cannot accept more jobs.
 var ErrQueueFull = fmt.Errorf("receipt processing queue is full")
 
+// ErrWorkerShuttingDown is returned by Submit when the worker has begun shutdown
+// and no longer accepts new jobs.
+var ErrWorkerShuttingDown = fmt.Errorf("receipt worker is shutting down")
+
 // Submit enqueues a receipt job for background processing.
 // Returns ErrQueueFull if the queue is at capacity, allowing the caller to return 503.
+// Returns ErrWorkerShuttingDown if Shutdown has been initiated.
+//
+// We hold the mutex across the channel send so Shutdown's close(jobs) cannot
+// race with an in-progress send. The select is non-blocking, so the critical
+// section is cheap.
 func (w *ReceiptWorker) Submit(job ReceiptJob) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.accepting {
+		return ErrWorkerShuttingDown
+	}
 	select {
 	case w.jobs <- job:
 		return nil
@@ -73,25 +99,116 @@ func (w *ReceiptWorker) Submit(job ReceiptJob) error {
 }
 
 // process is the main worker loop that pulls jobs from the channel and processes them.
+// Each pulled job is counted against wg so Shutdown can wait for in-flight work.
 func (w *ReceiptWorker) process() {
 	for job := range w.jobs {
-		if err := w.processJob(job); err != nil {
-			log.Printf("worker: failed to process receipt %s: %v", job.ReceiptID, err)
-			// Update receipt status to error.
-			_, _ = w.db.Exec(
-				"UPDATE receipts SET status = 'error' WHERE id = ?",
-				job.ReceiptID,
-			)
-			w.hub.Broadcast(ws.Message{
-				Type:      ws.EventReceiptComplete,
-				Household: job.HouseholdID,
-				Payload: map[string]interface{}{
-					"receipt_id": job.ReceiptID,
-					"status":     "error",
-					"error":      err.Error(),
-				},
-			})
+		w.wg.Add(1)
+		w.runJob(job)
+		w.wg.Done()
+	}
+}
+
+// runJob executes a single job and handles errors. Split from process() so
+// shutdown wg-accounting stays obvious at the call site.
+func (w *ReceiptWorker) runJob(job ReceiptJob) {
+	if err := w.processJob(job); err != nil {
+		log.Printf("worker: failed to process receipt %s: %v", job.ReceiptID, err)
+		// Update receipt status to error.
+		_, _ = w.db.Exec(
+			"UPDATE receipts SET status = 'error' WHERE id = ?",
+			job.ReceiptID,
+		)
+		w.hub.Broadcast(ws.Message{
+			Type:      ws.EventReceiptComplete,
+			Household: job.HouseholdID,
+			Payload: map[string]interface{}{
+				"receipt_id": job.ReceiptID,
+				"status":     "error",
+				"error":      err.Error(),
+			},
+		})
+	}
+}
+
+// Shutdown stops accepting new submissions, waits for in-flight jobs to finish
+// (up to ctx deadline), and marks any remaining queued jobs' receipts as
+// status='pending' so they will be re-enqueued on next boot.
+//
+// Shutdown is idempotent: subsequent calls return nil immediately after waiting
+// for the first call to complete.
+func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
+	// Idempotency guard: only the first caller runs the shutdown sequence.
+	// Later callers block until the first one has completed.
+	if !w.shutdown.CompareAndSwap(false, true) {
+		<-w.shutdownRes
+		return nil
+	}
+	defer close(w.shutdownRes)
+
+	// Stop accepting new submissions and close the jobs channel so process()
+	// loops can exit once the channel drains. We hold w.mu across the close to
+	// make sure no in-flight Submit is mid-send.
+	w.mu.Lock()
+	w.accepting = false
+	close(w.jobs)
+	w.mu.Unlock()
+
+	// Wait for in-flight jobs (those currently being processed by runJob) to
+	// finish, up to ctx deadline.
+	inFlightDone := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(inFlightDone)
+	}()
+
+	var requeued int
+	select {
+	case <-inFlightDone:
+		// All in-flight jobs finished and process() goroutines have exited
+		// (they exit once w.jobs is closed AND drained). Any remaining items
+		// in w.jobs would have been picked up before exit — in practice the
+		// channel is empty here, but drain defensively.
+		for job := range w.jobs {
+			requeued++
+			w.markPending(job.ReceiptID)
 		}
+		log.Printf("worker: shutdown complete — all in-flight jobs finished, %d buffered requeued as pending", requeued)
+		return nil
+	case <-ctx.Done():
+		// Deadline hit. Drain whatever is still buffered and mark those
+		// receipts pending for the next boot. process() goroutines may still
+		// be running; we cannot interrupt a Claude HTTP call safely. Their
+		// receipt rows will remain at whatever status the tx reached (usually
+		// 'processing' pre-commit, which rolls back on process exit, or
+		// 'matched'/'error' if the tx already committed).
+		for {
+			select {
+			case job, ok := <-w.jobs:
+				if !ok {
+					// Channel closed and drained.
+					log.Printf("worker: shutdown deadline exceeded — %d buffered requeued as pending; in-flight goroutines may still be running", requeued)
+					return ctx.Err()
+				}
+				requeued++
+				w.markPending(job.ReceiptID)
+			default:
+				log.Printf("worker: shutdown deadline exceeded — %d buffered requeued as pending; in-flight goroutines may still be running", requeued)
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+// markPending sets a receipt's status back to 'pending' so the next boot can
+// re-enqueue it. Errors are logged, not returned — we're on the shutdown path
+// and cannot meaningfully recover.
+func (w *ReceiptWorker) markPending(receiptID string) {
+	_, err := w.db.Exec(
+		"UPDATE receipts SET status = 'pending' WHERE id = ?",
+		receiptID,
+	)
+	if err != nil {
+		log.Printf("worker: failed to mark receipt %s pending on shutdown: %v", receiptID, err)
 	}
 }
 
