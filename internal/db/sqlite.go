@@ -28,9 +28,10 @@ func Open(path string) (*sql.DB, error) {
 		"PRAGMA journal_mode=WAL",       // concurrent reads
 		"PRAGMA synchronous=NORMAL",     // faster writes, safe with WAL
 		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",      // 5s wait on locks
+		"PRAGMA busy_timeout=10000",     // 10s wait on locks
 		"PRAGMA cache_size=-20000",      // 20MB cache
 		"PRAGMA mmap_size=268435456",    // 256MB memory-mapped I/O
+		"PRAGMA temp_store=MEMORY",      // temp B-trees in RAM
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
