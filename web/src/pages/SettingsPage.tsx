@@ -8,22 +8,51 @@ import { Modal } from '@/components/ui/Modal'
 import { InviteModal } from '@/components/ui/InviteModal'
 import ConversionsPage from './ConversionsPage'
 import IntegrationsTab from '@/components/settings/IntegrationsTab'
+import BackupCard from '@/components/settings/BackupCard'
+import RestoreCard, { RestoreBanner } from '@/components/settings/RestoreCard'
+import ExportCard from '@/components/settings/ExportCard'
 
-const TABS = ['profile', 'household', 'conversions', 'integrations', 'invite', 'danger'] as const
-type Tab = (typeof TABS)[number]
+const ALL_TABS = [
+  'profile',
+  'household',
+  'conversions',
+  'integrations',
+  'data',
+  'invite',
+  'danger',
+] as const
+type Tab = (typeof ALL_TABS)[number]
 
 const tabLabels: Record<Tab, string> = {
   profile: 'Profile',
   household: 'Household',
   conversions: 'Unit Conversions',
   integrations: 'Integrations',
+  data: 'Data',
   invite: 'Invite Members',
   danger: 'Danger Zone',
 }
 
 function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const activeTab = (searchParams.get('tab') as Tab) || 'profile'
+
+  // The profile response is the only place the SPA learns `is_admin`
+  // (useAuth's User state omits it). This query is already cached by
+  // the ProfileTab/HouseholdTab, so reusing the same key is free.
+  const { data: profile } = useQuery({
+    queryKey: ['profile'],
+    queryFn: getProfile,
+  })
+  const isAdmin = profile?.user.is_admin === true
+
+  // Admin-gated tabs are stripped from the visible list for non-admins.
+  // A non-admin who URL-hacks ?tab=data will be redirected to profile
+  // because the backend already rejects their API calls — no need for
+  // an inline "Forbidden" surface.
+  const visibleTabs = ALL_TABS.filter((t) => (t === 'data' ? isAdmin : true))
+
+  const rawTab = (searchParams.get('tab') as Tab) || 'profile'
+  const activeTab: Tab = visibleTabs.includes(rawTab) ? rawTab : 'profile'
 
   function setTab(tab: Tab) {
     setSearchParams({ tab })
@@ -35,9 +64,11 @@ function SettingsPage() {
         Settings
       </h1>
 
+      <RestoreBanner />
+
       {/* Tab bar */}
       <div className="flex gap-1 border-b border-neutral-200 mb-6 flex-wrap">
-        {TABS.map((tab) => (
+        {visibleTabs.map((tab) => (
           <button
             key={tab}
             type="button"
@@ -60,8 +91,19 @@ function SettingsPage() {
       {activeTab === 'household' && <HouseholdTab />}
       {activeTab === 'conversions' && <ConversionsPage />}
       {activeTab === 'integrations' && <IntegrationsTab />}
+      {activeTab === 'data' && isAdmin && <DataTab />}
       {activeTab === 'invite' && <InviteTab />}
       {activeTab === 'danger' && <DangerTab />}
+    </div>
+  )
+}
+
+function DataTab() {
+  return (
+    <div className="flex flex-col gap-6 max-w-2xl">
+      <BackupCard />
+      <RestoreCard />
+      <ExportCard />
     </div>
   )
 }

@@ -65,6 +65,7 @@ function AuthProvider({ children }: AuthProviderProps) {
           household_id: resp.user.household_id,
           email: resp.user.email,
           name: resp.user.name,
+          is_admin: resp.user.is_admin,
           created_at: '',
         })
       } catch {
