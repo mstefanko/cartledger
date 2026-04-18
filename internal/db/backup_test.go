@@ -437,3 +437,108 @@ func TestMaxMigrationVersion(t *testing.T) {
 		t.Errorf("expected >=15 migrations embedded, got %d", v)
 	}
 }
+
+// TestBackup_ToleratesENOENTDuringWalk proves the retention-prune race is
+// survivable: a file listed by WalkDir but deleted before addFileToTar
+// opens it counts as a missing image, does NOT abort the backup, and the
+// count surfaces in BackupResult.MissingImages. This is the P1-3 fix.
+func TestBackup_ToleratesENOENTDuringWalk(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "cartledger.db")
+	database := seedTestDB(t, dbPath)
+	defer database.Close()
+
+	// Seed three receipt files in a predictable subdirectory so the walk
+	// order is deterministic: a.jpg, b.jpg, c.jpg.
+	dir := filepath.Join(dataDir, "receipts", "rcpt")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	paths := []string{
+		filepath.Join(dir, "a.jpg"),
+		filepath.Join(dir, "b.jpg"),
+		filepath.Join(dir, "c.jpg"),
+	}
+	for _, p := range paths {
+		if err := os.WriteFile(p, []byte("fake jpg"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	// Inject a hook that deletes b.jpg right before addFileToTar opens it.
+	// WalkDir already cached the directory listing, so the hook firing for
+	// b.jpg means os.Open(b.jpg) returns ENOENT — exactly the retention-
+	// janitor race we want to survive.
+	target := paths[1]
+	testHookAddDirBeforeOpen = func(path string) {
+		if path == target {
+			_ = os.Remove(target)
+		}
+	}
+	defer func() { testHookAddDirBeforeOpen = nil }()
+
+	outPath := filepath.Join(t.TempDir(), "backup.tar.gz")
+	res, err := Backup(BackupOptions{
+		DB:              database,
+		DataDir:         dataDir,
+		OutputPath:      outPath,
+		IncludeReceipts: true,
+	})
+	if err != nil {
+		t.Fatalf("Backup aborted on missing mid-walk file, want tolerant: %v", err)
+	}
+	if res.MissingImages != 1 {
+		t.Errorf("MissingImages = %d, want 1", res.MissingImages)
+	}
+
+	// Archive should still contain a.jpg and c.jpg (both present) but not b.jpg.
+	have := map[string]bool{}
+	f, _ := os.Open(outPath)
+	defer f.Close()
+	gzr, _ := gzip.NewReader(f)
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar read: %v", err)
+		}
+		have[hdr.Name] = true
+	}
+	if !have["receipts/rcpt/a.jpg"] {
+		t.Errorf("expected a.jpg in archive, have=%v", have)
+	}
+	if !have["receipts/rcpt/c.jpg"] {
+		t.Errorf("expected c.jpg in archive, have=%v", have)
+	}
+	if have["receipts/rcpt/b.jpg"] {
+		t.Errorf("b.jpg should have been skipped (deleted), have=%v", have)
+	}
+}
+
+// TestBackup_HappyPathMissingImagesZero proves the new MissingImages field
+// is wired through correctly on the success path: no files deleted mid-walk
+// → MissingImages == 0.
+func TestBackup_HappyPathMissingImagesZero(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "cartledger.db")
+	database := seedTestDB(t, dbPath)
+	defer database.Close()
+	seedReceiptsDir(t, dataDir)
+
+	outPath := filepath.Join(t.TempDir(), "backup.tar.gz")
+	res, err := Backup(BackupOptions{
+		DB:              database,
+		DataDir:         dataDir,
+		OutputPath:      outPath,
+		IncludeReceipts: true,
+	})
+	if err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	if res.MissingImages != 0 {
+		t.Errorf("MissingImages = %d, want 0 on happy path", res.MissingImages)
+	}
+}

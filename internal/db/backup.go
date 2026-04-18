@@ -52,6 +52,13 @@ type BackupResult struct {
 	Bytes      int64
 	SHA256     string
 	Manifest   Manifest
+	// MissingImages counts files that were listed by the filesystem walk but
+	// vanished before we could open them for archival. Under a real retention-
+	// prune race (the image-retention janitor deletes a file mid-backup),
+	// ENOENT at open time is expected and tolerable — the missing entry is
+	// skipped, counted here, and the backup continues. Non-ENOENT errors still
+	// abort the backup.
+	MissingImages int
 }
 
 // BackupOptions configures a Backup call.
@@ -139,6 +146,7 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 
 	var totalBytes int64
 	var fileCount int
+	var missingImages int
 
 	// a. Add the DB snapshot.
 	n, err := addFileToTar(tw, tmpDBPath, "cartledger.db", createdAt)
@@ -152,11 +160,14 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 	totalBytes += n
 	fileCount++
 
-	// b. Add receipts/.
+	// b. Add receipts/. ENOENT on a single file mid-walk is counted as a
+	//    missing image (see BackupResult.MissingImages) and the walk
+	//    continues — the retention janitor may prune files between our walk
+	//    and tar steps.
 	receiptsDir := filepath.Join(opts.DataDir, "receipts")
 	if opts.IncludeReceipts || !explicitlyDisabled(opts) {
 		if info, err := os.Stat(receiptsDir); err == nil && info.IsDir() {
-			added, bytes, err := addDirToTar(tw, receiptsDir, "receipts", createdAt)
+			added, bytes, missed, err := addDirToTar(tw, receiptsDir, "receipts", createdAt)
 			if err != nil {
 				tw.Close()
 				gzw.Close()
@@ -166,6 +177,7 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 			}
 			totalBytes += bytes
 			fileCount += added
+			missingImages += missed
 		} else if err != nil && !os.IsNotExist(err) {
 			tw.Close()
 			gzw.Close()
@@ -182,7 +194,7 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 	//    (skip gracefully on ENOENT, matching the receipts/ pattern above).
 	productsDir := filepath.Join(opts.DataDir, "products")
 	if info, err := os.Stat(productsDir); err == nil && info.IsDir() {
-		added, bytes, err := addDirToTar(tw, productsDir, "products", createdAt)
+		added, bytes, missed, err := addDirToTar(tw, productsDir, "products", createdAt)
 		if err != nil {
 			tw.Close()
 			gzw.Close()
@@ -192,6 +204,7 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 		}
 		totalBytes += bytes
 		fileCount += added
+		missingImages += missed
 	} else if err != nil && !os.IsNotExist(err) {
 		tw.Close()
 		gzw.Close()
@@ -262,10 +275,11 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 	}
 
 	return &BackupResult{
-		OutputPath: opts.OutputPath,
-		Bytes:      outSize,
-		SHA256:     hash,
-		Manifest:   manifest,
+		OutputPath:    opts.OutputPath,
+		Bytes:         outSize,
+		SHA256:        hash,
+		Manifest:      manifest,
+		MissingImages: missingImages,
 	}, nil
 }
 
@@ -576,13 +590,33 @@ func addFileToTar(tw *tar.Writer, srcPath, archName string, mtime time.Time) (in
 	return io.Copy(tw, f)
 }
 
+// testHookAddDirBeforeOpen is a test-only seam fired immediately before each
+// addFileToTar call inside addDirToTar. Production callers never set it; it
+// lets ENOENT-tolerance tests deterministically delete a file after WalkDir
+// has listed it but before addFileToTar opens it. Nil in production.
+var testHookAddDirBeforeOpen func(path string)
+
 // addDirToTar walks src recursively and writes every regular file under the
-// given archive prefix. Returns (file count, bytes written).
-func addDirToTar(tw *tar.Writer, src, archPrefix string, mtime time.Time) (int, int64, error) {
+// given archive prefix. Returns (file count, bytes written, missing count).
+//
+// ENOENT on a file that the walk listed but we then fail to open is tolerated:
+// the entry is skipped, missingCount is incremented, and the walk continues.
+// This covers the retention-prune race — the image-retention janitor may
+// delete a file between our WalkDir listing and the addFileToTar Open. Any
+// non-ENOENT error still aborts the walk (bubbled up to the caller).
+func addDirToTar(tw *tar.Writer, src, archPrefix string, mtime time.Time) (int, int64, int, error) {
 	var count int
 	var bytes int64
+	var missing int
 	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// ENOENT on a directory entry itself means the dir was removed
+			// between the parent listing and this visit — log-and-skip is
+			// consistent with the per-file ENOENT policy below.
+			if errors.Is(err, os.ErrNotExist) {
+				missing++
+				return nil
+			}
 			return err
 		}
 		rel, err := filepath.Rel(src, path)
@@ -607,15 +641,27 @@ func addDirToTar(tw *tar.Writer, src, archPrefix string, mtime time.Time) (int, 
 		if !d.Type().IsRegular() {
 			return nil // skip symlinks, sockets, etc.
 		}
+		if testHookAddDirBeforeOpen != nil {
+			testHookAddDirBeforeOpen(path)
+		}
 		n, err := addFileToTar(tw, path, archName, mtime)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// File was removed between WalkDir listing and Open — count
+				// it as missing and carry on. Restore will re-pick up
+				// product_images / receipts.image_paths rows that point at
+				// the absent file; it is the app's job (elsewhere) to
+				// reconcile dangling DB references.
+				missing++
+				return nil
+			}
 			return err
 		}
 		count++
 		bytes += n
 		return nil
 	})
-	return count, bytes, err
+	return count, bytes, missing, err
 }
 
 // sha256File returns the hex-encoded SHA256 of a file plus its size in bytes.

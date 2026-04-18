@@ -35,6 +35,18 @@ var (
 	ErrInsufficientSpace  = errors.New("backup: insufficient disk space for backup")
 )
 
+// errLockBusy is an internal sentinel returned by acquireFileLock when another
+// process already holds the flock. Callers translate this into
+// ErrAlreadyRunning so external API consumers see a single concurrent-backup
+// error regardless of which mutex (in-process sem or cross-process flock)
+// rejected them.
+var errLockBusy = errors.New("backup: lockfile busy")
+
+// lockFilename is the advisory-lock file under BackupDir. Exported-constant
+// name kept stable so ops tooling (e.g. a "is backup running?" shell probe)
+// can test for it.
+const lockFilename = ".backup.lock"
+
 // Recorder is the subset of metrics the runner emits. Kept here as an
 // interface so internal/backup doesn't import internal/api (avoiding a
 // potential cycle: internal/api -> internal/backup for the HTTP handler).
@@ -66,8 +78,16 @@ type Runner struct {
 
 	// sem: buffered chan of cap 1 used as a non-blocking mutex. A successful
 	// send into sem acquires the slot; a full send means another Start is in
-	// flight → caller gets ErrAlreadyRunning.
+	// flight → caller gets ErrAlreadyRunning. Defense in depth — the flock
+	// below is the authoritative cross-process mutex; the sem is a faster
+	// same-process rejection path.
 	sem chan struct{}
+
+	// lock holds the flock handle for the currently-running backup. Non-nil
+	// between begin() and runBody()'s deferred release. Guards against a
+	// second process (e.g. CLI invocation during a running server backup)
+	// starting its own backup.
+	lock *fileLock
 
 	// Build metadata passed through to the manifest (for debuggability of
 	// which cartledger binary produced a given archive).
@@ -169,29 +189,53 @@ func (r *Runner) StartAsync(ctx context.Context) (string, error) {
 }
 
 // begin holds the bookkeeping shared by Start and StartAsync: sem acquire,
-// preflight, schema-version read, and row create. Returns (id, acquired, err).
-// On (err != nil) the semaphore is already released. On (acquired==false)
-// there was no error AND no work to do (shouldn't happen today, but keeps
-// the contract explicit for future callers).
+// cross-process flock acquire, preflight, schema-version read, and row create.
+// Returns (id, acquired, err). On (err != nil) both the semaphore and flock
+// are already released. On (acquired==false) there was no error AND no work
+// to do (shouldn't happen today, but keeps the contract explicit for future
+// callers).
 func (r *Runner) begin(ctx context.Context) (string, bool, error) {
-	// 1. Acquire semaphore non-blocking.
+	// 1. Acquire in-process semaphore non-blocking — fast rejection path for
+	//    a concurrent Start in the same process.
 	select {
 	case r.sem <- struct{}{}:
 	default:
 		return "", false, ErrAlreadyRunning
 	}
 
-	// On any begin-time failure we must release the semaphore ourselves
-	// because runBody (which owns the deferred release) won't run.
-	releaseOnErr := func() { <-r.sem }
+	// On any begin-time failure we must release both the sem AND the flock
+	// ourselves because runBody (which owns the deferred release) won't run.
+	releaseOnErr := func() {
+		if r.lock != nil {
+			r.lock.Release()
+			r.lock = nil
+		}
+		<-r.sem
+	}
 
-	// 2. Preflight disk space.
+	// 2. Acquire cross-process flock on $BackupDir/.backup.lock. This is the
+	//    authoritative mutex — the sem above only guards the same process.
+	//    When the server is running a backup and the CLI is invoked, the CLI
+	//    lands here and is correctly rejected with ErrAlreadyRunning.
+	lockPath := filepath.Join(r.cfg.BackupDir(), lockFilename)
+	lock, err := acquireFileLock(lockPath)
+	if err != nil {
+		if errors.Is(err, errLockBusy) {
+			<-r.sem
+			return "", false, ErrAlreadyRunning
+		}
+		<-r.sem
+		return "", false, fmt.Errorf("acquire backup lock: %w", err)
+	}
+	r.lock = lock
+
+	// 3. Preflight disk space.
 	if err := r.preflight(); err != nil {
 		releaseOnErr()
 		return "", false, err
 	}
 
-	// 3. Schema version for the manifest row.
+	// 4. Schema version for the manifest row.
 	schemaVersion, err := db.CurrentSchemaVersion(r.db)
 	if err != nil {
 		releaseOnErr()
@@ -199,23 +243,35 @@ func (r *Runner) begin(ctx context.Context) (string, bool, error) {
 	}
 
 	started := r.nowFn()
-	filename := formatBackupFilename(started)
 
-	id, err := r.store.Create(ctx, filename, schemaVersion)
+	id, err := r.store.Create(ctx, "", schemaVersion)
 	if err != nil {
 		releaseOnErr()
 		return "", false, fmt.Errorf("create backup row: %w", err)
+	}
+
+	// Filename embeds the DB-generated id so timestamp-second collisions
+	// cannot produce identical archive names. Two backups started in the
+	// same UTC second still write to distinct files because their ids differ.
+	filename := formatBackupFilename(started, id)
+	if err := r.store.SetFilename(ctx, id, filename); err != nil {
+		releaseOnErr()
+		return "", false, fmt.Errorf("set backup filename: %w", err)
 	}
 	return id, true, nil
 }
 
 // runBody is the archive-writing half of Start / StartAsync. It assumes the
-// caller already acquired the semaphore and created a status='running' row;
-// it owns the sem release + metric emission via defer.
+// caller already acquired the semaphore + flock and created a status='running'
+// row; it owns the sem + flock release + metric emission via defer.
 func (r *Runner) runBody(ctx context.Context, id string) error {
 	started := r.nowFn()
 	finalStatus := "failed"
 	defer func() {
+		if r.lock != nil {
+			r.lock.Release()
+			r.lock = nil
+		}
 		<-r.sem
 		if r.rec != nil {
 			r.rec.RecordBackupDuration(finalStatus, r.nowFn().Sub(started))
@@ -256,7 +312,19 @@ func (r *Runner) runBody(ctx context.Context, id string) error {
 		return fmt.Errorf("backup archive: %w", backupErr)
 	}
 
+	// Merge the two missing-image sources:
+	//   1. db.Backup.MissingImages — authoritative count of files that vanished
+	//      between the walk and the tar Open (retention-prune race).
+	//   2. r.countMissingImages — referenced-from-DB paths that are absent
+	//      from the pre-backup filesystem snapshot.
+	// The max() takes whichever source saw more misses; neither is a strict
+	// subset of the other (db.Backup catches races we can't see from the
+	// DB side, countMissingImages catches orphan DB rows whose file was
+	// already gone before the backup started).
 	missingImages := r.countMissingImages(ctx, preSnapshot)
+	if result.MissingImages > missingImages {
+		missingImages = result.MissingImages
+	}
 
 	completedAt := r.nowFn().UTC()
 	size := result.Bytes
@@ -487,10 +555,11 @@ func (r *Runner) markFailed(ctx context.Context, id, archivePath string, cause e
 }
 
 // formatBackupFilename produces the canonical archive name. The timestamp is
-// UTC; the id is assigned by the store and reflected into the filename for
-// easy correlation in operator shells.
-func formatBackupFilename(t time.Time) string {
-	return fmt.Sprintf("backup-%s.tar.gz", t.UTC().Format("20060102T150405Z"))
+// UTC and the DB-generated id is embedded so two backups started in the same
+// UTC second cannot collide on disk (the id is 32 hex chars from 16 random
+// bytes — unique across every process and every restart).
+func formatBackupFilename(t time.Time, id string) string {
+	return fmt.Sprintf("backup-%s-%s.tar.gz", t.UTC().Format("20060102T150405Z"), id)
 }
 
 // fileSizeOrZero returns the size of the file at path, or 0 on any error.

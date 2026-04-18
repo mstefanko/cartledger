@@ -36,11 +36,11 @@ type BackupUpdateOpts struct {
 
 // Create inserts a new backup row with status='running' and created_at=now.
 // Returns the generated ID (16-byte hex, same convention as integrations).
+//
+// The filename argument may be empty when the caller wants to stamp the ID
+// into the archive name — callers in that mode use SetFilename immediately
+// after Create. A non-empty filename is inserted as-is.
 func (s *BackupStore) Create(ctx context.Context, filename string, schemaVersion int) (string, error) {
-	if filename == "" {
-		return "", errors.New("backup: filename required")
-	}
-
 	id, err := newBackupID()
 	if err != nil {
 		return "", fmt.Errorf("generate id: %w", err)
@@ -56,6 +56,29 @@ func (s *BackupStore) Create(ctx context.Context, filename string, schemaVersion
 		return "", fmt.Errorf("insert backup: %w", err)
 	}
 	return id, nil
+}
+
+// SetFilename updates a row's filename column. Used by the Runner to stamp
+// the DB-generated id into the archive filename after Create (the id is only
+// known after the INSERT returns). Returns an error if the row doesn't exist.
+func (s *BackupStore) SetFilename(ctx context.Context, id, filename string) error {
+	if id == "" {
+		return errors.New("backup: id required")
+	}
+	if filename == "" {
+		return errors.New("backup: filename required")
+	}
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE backups SET filename = ? WHERE id = ?`, filename, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update backup filename: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("backup %s: not found", id)
+	}
+	return nil
 }
 
 // UpdateStatus flips a row's status and applies any provided optional updates

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
@@ -322,12 +321,13 @@ func TestRunner_Start_Prunes_OlderThanRetention(t *testing.T) {
 	defer cleanup()
 	cfg.BackupRetainCount = 1
 
-	// First backup succeeds; second should prune the first.
+	// First backup succeeds; second should prune the first. No sleep needed:
+	// filenames embed the DB-generated id, so back-to-back backups in the
+	// same UTC second are guaranteed distinct on disk.
 	id1, err := r.Start(context.Background())
 	if err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
-	time.Sleep(1100 * time.Millisecond) // ensure the second archive name differs (1-second timestamp resolution)
 	id2, err := r.Start(context.Background())
 	if err != nil {
 		t.Fatalf("second Start: %v", err)
@@ -349,4 +349,107 @@ func TestRunner_Start_Prunes_OlderThanRetention(t *testing.T) {
 	if row1 != nil {
 		t.Errorf("expected id1 row deleted, got %+v", row1)
 	}
+}
+
+// TestRunner_FilenameUniquenessUnderBurst runs N backups serialized through
+// the semaphore and asserts every resulting filename is distinct. Guards
+// against the second-granularity collision described in P1-2: two backups
+// started in the same UTC second must produce distinct on-disk archive
+// names (the DB-generated id is stamped into the filename for this).
+func TestRunner_FilenameUniquenessUnderBurst(t *testing.T) {
+	r, _, database, cleanup := setup(t)
+	defer cleanup()
+
+	seen := make(map[string]bool)
+	for i := 0; i < 5; i++ {
+		id, err := r.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start #%d: %v", i, err)
+		}
+		row, err := db.NewBackupStore(database).Get(context.Background(), id)
+		if err != nil || row == nil {
+			t.Fatalf("Get #%d: err=%v row=%v", i, err, row)
+		}
+		if seen[row.Filename] {
+			t.Fatalf("filename collision at i=%d: %q", i, row.Filename)
+		}
+		seen[row.Filename] = true
+	}
+	if len(seen) != 5 {
+		t.Errorf("expected 5 distinct filenames, got %d", len(seen))
+	}
+}
+
+// TestRunner_FlockAcrossRunners verifies that two Runner instances pointing
+// at the same BackupDir cannot both start a backup concurrently. Simulates
+// the server + CLI scenario from P1-1: when one process holds the flock,
+// the second process gets ErrAlreadyRunning — NOT a silent parallel run,
+// and NOT a spurious "server restarted during backup" reconcile.
+//
+// Two Runner instances means two in-process semaphores, so the only thing
+// stopping the second from proceeding is the cross-process flock.
+func TestRunner_FlockAcrossRunners(t *testing.T) {
+	// Share one DATA_DIR (hence one BackupDir hence one lockfile) between
+	// two Runners. The first runner is returned only so we share its config
+	// / DB; we don't Start through it because we want r2 to race on the
+	// lockfile itself, not on r1's in-process semaphore.
+	_, cfg, database, cleanup := setup(t)
+	defer cleanup()
+
+	store := db.NewBackupStore(database)
+	r2 := NewRunner(database, store, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	r2.SetDiskChecker(fakeDisk{free: 1 << 40})
+
+	// Manually occupy r1's flock (without going through Start, which would
+	// also occupy the sem and complete synchronously). We need r2 to race
+	// *only* on the flock, not on r1's per-process sem.
+	lockPath := filepath.Join(cfg.BackupDir(), lockFilename)
+	lock, err := acquireFileLock(lockPath)
+	if err != nil {
+		t.Fatalf("acquire test lock: %v", err)
+	}
+
+	// r2.Start must now fail with ErrAlreadyRunning because it can't get the
+	// flock, even though r2's in-process sem is free.
+	if _, err := r2.Start(context.Background()); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("r2.Start: expected ErrAlreadyRunning while flock held, got %v", err)
+	}
+
+	// Release and confirm r2 now succeeds.
+	lock.Release()
+	if _, err := r2.Start(context.Background()); err != nil {
+		t.Errorf("r2.Start after lock release: want nil, got %v", err)
+	}
+}
+
+// TestRunner_LockfileCreatedAndReleased verifies the flock file itself is
+// created under BackupDir and that successive Start calls can re-acquire it
+// (i.e. the runner is releasing properly). Not as strong as the two-Runner
+// test above but faster and independent of internal flock semantics.
+func TestRunner_LockfileCreatedAndReleased(t *testing.T) {
+	r, cfg, _, cleanup := setup(t)
+	defer cleanup()
+
+	lockPath := filepath.Join(cfg.BackupDir(), lockFilename)
+
+	// First Start: lockfile must exist after completion (we keep it around
+	// so subsequent acquires don't race on mkdir).
+	if _, err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start #1: %v", err)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Errorf("lockfile missing after first Start: %v", err)
+	}
+
+	// Second Start: must succeed — lock released, no residual flock.
+	if _, err := r.Start(context.Background()); err != nil {
+		t.Errorf("Start #2 after release: %v", err)
+	}
+
+	// Sanity: after all Starts complete, a fresh flock attempt must succeed.
+	lock, err := acquireFileLock(lockPath)
+	if err != nil {
+		t.Fatalf("manual acquire after Starts: %v", err)
+	}
+	lock.Release()
 }

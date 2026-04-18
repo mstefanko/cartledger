@@ -16,6 +16,13 @@ import (
 	"github.com/mstefanko/cartledger/internal/db"
 )
 
+// Note: ReconcileRunning is intentionally NOT invoked from this CLI path. The
+// server already reconciles at startup (cmd/server/serve.go) and doing it here
+// would race: a CLI invocation during an in-flight server backup would flip
+// the server's status='running' row to 'failed' while the backup is still
+// alive. Cross-process mutual exclusion is enforced instead via
+// backup.Runner's flock on $BackupDir/.backup.lock.
+
 // newBackupCmd builds `cartledger backup [--out <file>]`.
 //
 // The CLI and HTTP surfaces share the same internal/backup.Runner so there
@@ -76,11 +83,6 @@ func runBackup(outPath string) error {
 // and recording a row in the backups table. This mirrors the HTTP surface.
 func runManagedBackup(cfg *config.Config, database *sql.DB) error {
 	store := db.NewBackupStore(database)
-	// Startup hygiene the server does too — clean up any crashed-run rows so
-	// the CLI never trips over a leftover status='running' ghost.
-	recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = store.ReconcileRunning(recCtx)
-	recCancel()
 
 	runner := backup.NewRunner(database, store, cfg, slog.Default(), nil)
 	runner.SetBuildInfo(version, commit)
