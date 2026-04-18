@@ -1,0 +1,76 @@
+# GoReleaser config for CartLedger.
+#
+# The Go binary embeds web/dist via //go:embed (see web/embed.go), so the
+# frontend MUST be built before `goreleaser build/release` runs. The `before`
+# hook below handles that; the CI workflow also installs Node + npm before
+# invoking goreleaser.
+#
+# Docker images are NOT built here — the existing multi-stage Dockerfile is
+# used directly by the release workflow's separate `docker` job.
+version: 2
+
+project_name: cartledger
+
+before:
+  hooks:
+    # Ensure Go module cache is warm.
+    - go mod tidy
+    # Build the React SPA so //go:embed finds web/dist/*.
+    - sh -c "cd web && npm ci && npm run build"
+
+builds:
+  - id: cartledger
+    main: ./cmd/server
+    binary: cartledger
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "^style:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: mstefanko
+    name: cartledger
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"
