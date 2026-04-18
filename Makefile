@@ -6,7 +6,7 @@ ifneq (,$(wildcard .env))
   export
 endif
 
-.PHONY: run kill restart build dev
+.PHONY: run kill restart build dev smoke
 
 # Kill server and any orphaned claude CLI subprocesses
 kill:
@@ -30,3 +30,10 @@ dev: kill
 	@echo "starting backend on :$(PORT) and frontend on :5173"
 	@cd web && npm run dev &
 	@go run ./cmd/server
+
+# End-to-end self-hosting smoke test. Builds the binary, walks the bootstrap →
+# setup → login → profile → backup → restore → re-login flow against a fresh
+# DATA_DIR. Uses the mock LLM client (no API key required). VERBOSE=1 for
+# detailed output. See scripts/smoke.sh.
+smoke:
+	@./scripts/smoke.sh

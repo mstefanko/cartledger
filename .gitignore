@@ -10,6 +10,7 @@ data/
 
 # Build output
 cartledger
+bin/
 web/dist/
 
 # Claude Code local settings
