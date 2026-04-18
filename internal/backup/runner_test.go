@@ -453,3 +453,53 @@ func TestRunner_LockfileCreatedAndReleased(t *testing.T) {
 	}
 	lock.Release()
 }
+
+// TestRunner_SetFilenameFailure_CleansOrphanRow simulates a DB error between
+// store.Create (row inserted with status='running') and store.SetFilename. The
+// orphan running row would otherwise linger until the next server startup
+// reconcile. Verifies begin() flips it to 'failed' and releases the sem+flock.
+func TestRunner_SetFilenameFailure_CleansOrphanRow(t *testing.T) {
+	r, cfg, database, cleanup := setup(t)
+	defer cleanup()
+
+	injected := errors.New("injected: set filename failed")
+	r.setFilenameFn = func(_ context.Context, _, _ string) error {
+		return injected
+	}
+
+	_, err := r.Start(context.Background())
+	if err == nil || !errors.Is(err, injected) {
+		t.Fatalf("Start error = %v, want wrapped %v", err, injected)
+	}
+
+	rows, err := db.NewBackupStore(database).List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].Status != "failed" {
+		t.Errorf("row status = %q, want failed", rows[0].Status)
+	}
+	if rows[0].Error == nil || *rows[0].Error == "" {
+		t.Errorf("row error unset; want the SetFilename wrapper message")
+	}
+	if rows[0].CompletedAt == nil {
+		t.Errorf("completed_at unset on failed row")
+	}
+
+	// Sem + flock must be released so the next Start succeeds without a sleep.
+	r.setFilenameFn = nil
+	if _, err := r.Start(context.Background()); err != nil {
+		t.Errorf("follow-up Start after cleanup: %v", err)
+	}
+
+	// Flock file must be re-acquirable by an external caller too.
+	lockPath := filepath.Join(cfg.BackupDir(), lockFilename)
+	lk, err := acquireFileLock(lockPath)
+	if err != nil {
+		t.Fatalf("external flock after cleanup: %v", err)
+	}
+	lk.Release()
+}

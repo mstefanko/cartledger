@@ -97,6 +97,12 @@ type Runner struct {
 	// nowFn is injected for tests. Defaults to time.Now.
 	nowFn func() time.Time
 
+	// setFilenameFn is a test seam for the SetFilename step in begin(). Nil in
+	// production, where begin() calls r.store.SetFilename directly. Tests
+	// override it to simulate a failure between Create and SetFilename and
+	// assert the orphan running row is cleaned up.
+	setFilenameFn func(ctx context.Context, id, filename string) error
+
 	mu sync.Mutex // guards version/commit if someone later adds hot reload
 }
 
@@ -254,7 +260,15 @@ func (r *Runner) begin(ctx context.Context) (string, bool, error) {
 	// cannot produce identical archive names. Two backups started in the
 	// same UTC second still write to distinct files because their ids differ.
 	filename := formatBackupFilename(started, id)
-	if err := r.store.SetFilename(ctx, id, filename); err != nil {
+	setFn := r.store.SetFilename
+	if r.setFilenameFn != nil {
+		setFn = r.setFilenameFn
+	}
+	if err := setFn(ctx, id, filename); err != nil {
+		// The row is already inserted with status='running' — flip it to
+		// 'failed' so startup reconciliation doesn't have to sweep it on
+		// the next boot, and so List/UI doesn't show a ghost pending row.
+		r.markFailed(ctx, id, "", fmt.Errorf("set backup filename: %w", err))
 		releaseOnErr()
 		return "", false, fmt.Errorf("set backup filename: %w", err)
 	}
