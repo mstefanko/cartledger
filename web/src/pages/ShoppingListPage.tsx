@@ -279,31 +279,45 @@ function ShoppingListPage() {
 
   // Estimated total for unchecked items.
   //
-  // Price-source fallback chain (applied identically in per-store bucket
-  // subtotals below — keeping both paths in lockstep preserves the
-  // `estimatedTotal == sum(bucket.subtotal)` invariant called out at `:270`):
+  // The per-row price source DIFFERS by mode — the two chains are not
+  // interchangeable and mixing them was the bug this branching fixes.
   //
+  // Multi-store mode (also applied identically in per-store bucket subtotals
+  // below — keeping both paths in lockstep preserves the
+  // `estimatedTotal == sum(bucket.subtotal)` invariant):
   //   1. assigned_store_price — latest price at THIS row's effective store
   //      (populated only when the assigned store has history for the product).
-  //   2. cheapest_price       — lowest price seen at any store. This is the
-  //      "best guess" when the assigned store has no history; it matches
-  //      what the gray Info badge surfaces to the user.
+  //   2. cheapest_price       — lowest price seen at any store; the "best
+  //      guess" when the assigned store has no history. Matches what the
+  //      gray Info badge surfaces to the user.
   //   3. estimated_price      — last-seen-anywhere fallback.
   //
-  // `store_price` is intentionally NOT in this chain. It is scoped to the
-  // list's `preferred_store_id`, not the per-row assigned store, and falling
-  // back to it would reintroduce the cross-store mis-attribution bug the
-  // plan targets (a ShoppingRite bucket could silently quote a Costco price).
+  //   In multi-store mode `store_price` is intentionally EXCLUDED: it is
+  //   scoped to the list's `preferred_store_id`, not the per-row assigned
+  //   store, so using it would cross-attribute (e.g. a ShoppingRite bucket
+  //   silently quoting a Costco price).
+  //
+  // Single-store mode:
+  //   1. store_price          — the effective store for every row IS the
+  //      list's `preferred_store_id`, and `store_price` is already scoped to
+  //      that preferred store on the response, so it is the correct primary
+  //      source here (assigned_store_id is not meaningful in single-store
+  //      mode — all rows share the preferred store).
+  //   2. cheapest_price       — same best-guess fallback as multi-store.
+  //   3. estimated_price      — last-seen-anywhere fallback.
   const estimatedTotal = useMemo(() => {
     return uncheckedItems.reduce((sum, item) => {
-      const price =
-        item.assigned_store_price ??
-        item.cheapest_price ??
-        item.estimated_price
+      const price = multiStoreMode
+        ? item.assigned_store_price ??
+          item.cheapest_price ??
+          item.estimated_price
+        : item.store_price ??
+          item.cheapest_price ??
+          item.estimated_price
       if (price) return sum + parseFloat(price)
       return sum
     }, 0)
-  }, [uncheckedItems])
+  }, [uncheckedItems, multiStoreMode])
 
   // Potential savings + optimize-CTA signal.
   //
@@ -680,18 +694,32 @@ function ShoppingListPage() {
     onError: handleWriteError,
   })
 
-  // Optimize Price: reassign every unchecked item to its cheapest known store
-  // and flip to multi-store mode. Groups items by target store id and issues
-  // one bulk-update per group (the PATCH endpoint takes a single patch value
-  // per call, so batching by target store is the minimum-call shape).
-  // Destructive — overrides any existing assigned_store_id. Product owner OK.
+  // Optimize Price: reassign every 'worse'-state unchecked item to its
+  // cheapest known store and (in single-store mode) flip to multi-store mode.
+  // Groups items by target store id and issues one bulk-update per group (the
+  // PATCH endpoint takes a single patch value per call, so batching by target
+  // store is the minimum-call shape). Destructive — overrides any existing
+  // assigned_store_id. Product owner OK.
+  //
+  // The `deriveBadgeState(...) === 'worse'` filter matches the CTA gating in
+  // `canOptimize` above: unknown-state rows (no history at the effective
+  // store) would be overclaim reassignments — we have no comparison basis to
+  // justify moving them. Filter applies unconditionally; in single-store mode
+  // an unknown row means "no history at preferred store", same overclaim.
+  // See PLAN-best-price-neutral-state.md "Downstream impacts".
   const optimizePriceMutation = useMutation({
     mutationFn: async () => {
       if (!listId) return
       const storeList = storesQuery.data ?? []
+      const preferredId = listQuery.data?.preferred_store_id ?? null
       const byTargetStore = new Map<string, string[]>()
       for (const item of uncheckedItems) {
         if (!item.cheapest_store || !item.cheapest_price) continue
+        const effectiveStoreId = multiStoreMode
+          ? item.assigned_store_id
+          : preferredId
+        const state = deriveBadgeState(item, effectiveStoreId, storeList)
+        if (state.kind !== 'worse') continue
         const target = storeList.find(
           (s) => (s.nickname ?? s.name) === item.cheapest_store,
         )
@@ -1429,6 +1457,15 @@ function ShoppingListPage() {
                 {optimizePriceMutation.isPending ? 'Optimizing…' : 'Optimize price'}
               </button>
             </div>
+          ) : hasUnknownOnly ? (
+            // Mirror ListTotalsBar's wording exactly (see
+            // web/src/components/lists/ListTotalsBar.tsx:85). When every
+            // non-best row is in 'unknown' state we can't claim the estimate
+            // is optimal — we just don't have price history at the selected
+            // store to compare against.
+            <p className="text-small text-neutral-500 mt-2">
+              Some items have no price history at the selected store.
+            </p>
           ) : (
             <p className="text-small text-neutral-500 mt-2">Estimate is the best possible.</p>
           )}
