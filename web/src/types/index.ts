@@ -479,6 +479,7 @@ export interface ListItemWithPrice {
   assigned_store_name: string | null
   assigned_store_price: string | null
   store_history_count: number
+  storage_zone: 'produce' | 'cold' | 'frozen' | 'other'
 }
 
 export interface ShoppingListDetail {

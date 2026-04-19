@@ -28,6 +28,13 @@ import { StoreAssignDropdown } from '@/components/lists/StoreAssignDropdown'
 import { ListTotalsBar } from '@/components/lists/ListTotalsBar'
 import { BatchActionBar } from '@/components/lists/BatchActionBar'
 import { CircleCheck, CircleAlert, Info } from 'lucide-react'
+import { ZoneLegend } from '@/components/ZoneLegend'
+import {
+  ZONE_COLOR,
+  ZONE_LABEL,
+  zoneSortOrder,
+  type StorageZone,
+} from '@/lib/zones'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -36,6 +43,26 @@ import type {
   CreateListItemRequest,
   Store,
 } from '@/types'
+
+// Defensive zone resolver — the backend should always populate storage_zone,
+// but in-flight payloads from older servers or partial responses may be
+// undefined. Defaulting to 'other' puts unclassified items in the catch-all
+// bucket rather than crashing the sort or coloring the row `undefined`.
+function getZone(item: ListItemWithPrice): StorageZone {
+  return (item.storage_zone as StorageZone | undefined) ?? 'other'
+}
+
+// Composite sort key for Shopping Zones v1:
+//   (zone order, user-defined sort_order, created_at)
+// — zone groups items visually; sort_order lets the user reorder within a
+// zone; created_at breaks ties deterministically when sort_order collides.
+function compareByZone(a: ListItemWithPrice, b: ListItemWithPrice): number {
+  const dz = zoneSortOrder(getZone(a)) - zoneSortOrder(getZone(b))
+  if (dz !== 0) return dz
+  const ds = (a.sort_order ?? 0) - (b.sort_order ?? 0)
+  if (ds !== 0) return ds
+  return a.created_at.localeCompare(b.created_at)
+}
 
 // Badge state machine for the best-price indicator on each list-item row.
 //
@@ -269,11 +296,12 @@ function ShoppingListPage() {
     return [...groups, ...products]
   }, [groupsQuery.data, productsQuery.data])
 
-  // Separate checked and unchecked items
+  // Separate checked and unchecked items. Sorted by the Shopping Zones v1
+  // composite key — see compareByZone for the ordering rationale.
   const { uncheckedItems, checkedItems } = useMemo(() => {
     if (!list) return { uncheckedItems: [], checkedItems: [] }
-    const unchecked = list.items.filter((i) => !i.checked)
-    const checked = list.items.filter((i) => i.checked)
+    const unchecked = list.items.filter((i) => !i.checked).sort(compareByZone)
+    const checked = list.items.filter((i) => i.checked).sort(compareByZone)
     return { uncheckedItems: unchecked, checkedItems: checked }
   }, [list])
 
@@ -422,6 +450,13 @@ function ShoppingListPage() {
       ) {
         bucket.hasUnknown = true
       }
+    }
+    // Sort items within each bucket by the Shopping Zones composite key so
+    // per-bucket ordering matches the single-store mode. `uncheckedItems` is
+    // already sorted, so this is defensive — but making it explicit here keeps
+    // bucket ordering correct even if callers change how items feed in.
+    for (const bucket of buckets.values()) {
+      bucket.items.sort(compareByZone)
     }
     const unassigned = buckets.get(UNASSIGNED_KEY)
     const assigned = Array.from(buckets.values())
@@ -1187,6 +1222,8 @@ function ShoppingListPage() {
               </>
             )}
           </div>
+          <div className="flex items-center gap-1 shrink-0">
+          <ZoneLegend />
           <Button
             variant={multiStoreMode ? 'primary' : 'outlined'}
             size="sm"
@@ -1213,6 +1250,7 @@ function ShoppingListPage() {
               {multiStoreMode ? 'Single store' : 'Multi-store'}
             </span>
           </Button>
+          </div>
         </div>
       )}
 
@@ -1221,7 +1259,11 @@ function ShoppingListPage() {
       {multiStoreMode ? (
         <div className="flex flex-col gap-4">
           {groupedItems.map((group) => (
-            <div key={group.storeId ?? '__unassigned__'} className="flex flex-col gap-1">
+            // gap-0 here is intentional — adaptive margin-top on each
+            // ListItemRow draws the same-zone vs. zone-change spacing. A
+            // container gap would STACK with that margin and blow out the
+            // between-zone gaps. See Phase 5.6/5.7.
+            <div key={group.storeId ?? '__unassigned__'} className="flex flex-col gap-0">
               <div className="flex items-center justify-between mb-1">
                 <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide">
                   {group.storeName} ({group.items.length})
@@ -1232,7 +1274,7 @@ function ShoppingListPage() {
                   </span>
                 )}
               </div>
-              {group.items.map((item) => (
+              {group.items.map((item, idx) => (
                 <ListItemRow
                   key={item.id}
                   item={item}
@@ -1254,14 +1296,19 @@ function ShoppingListPage() {
                     assignStoreMutation.mutate({ itemId: item.id, storeId })
                   }
                   preferredStoreId={list.preferred_store_id}
+                  adaptiveGap
+                  prevZone={idx > 0 ? getZone(group.items[idx - 1]!) : null}
                 />
               ))}
             </div>
           ))}
         </div>
       ) : (
-        <div className="flex flex-col gap-1">
-          {uncheckedItems.map((item) => (
+        // gap-0 — adaptive margin-top on each ListItemRow encodes zone grouping
+        // (4px within a zone, 12px at zone boundaries). A container gap would
+        // stack with those margins. See Phase 5.6/5.7.
+        <div className="flex flex-col gap-0">
+          {uncheckedItems.map((item, idx) => (
             <ListItemRow
               key={item.id}
               item={item}
@@ -1283,6 +1330,8 @@ function ShoppingListPage() {
                 assignStoreMutation.mutate({ itemId: item.id, storeId })
               }
               preferredStoreId={list.preferred_store_id}
+              adaptiveGap
+              prevZone={idx > 0 ? getZone(uncheckedItems[idx - 1]!) : null}
             />
           ))}
         </div>
@@ -1577,6 +1626,12 @@ interface ListItemRowProps {
   stores: Store[]
   onAssignStore: (storeId: string | null) => void
   preferredStoreId: string | null
+  // Shopping Zones v1 — adaptive vertical spacing. When the parent container
+  // uses gap-0 (single-store and multi-store bucket lists), the row renders
+  // its own margin-top: 0 at index 0, 4px within a zone, 12px on zone changes.
+  // Omitted (false) for the checked-items bucket, which keeps legacy gap-1.
+  adaptiveGap?: boolean
+  prevZone?: StorageZone | null
 }
 
 function ListItemRow({
@@ -1593,7 +1648,39 @@ function ListItemRow({
   stores,
   onAssignStore,
   preferredStoreId,
+  adaptiveGap = false,
+  prevZone = null,
 }: ListItemRowProps) {
+  // Zone is derived (defensive `?? 'other'`) once and reused for the stripe,
+  // the aria-label, and the adaptive margin.
+  const zone: StorageZone =
+    (item.storage_zone as StorageZone | undefined) ?? 'other'
+  const zoneLabel = ZONE_LABEL[zone]
+  const zoneColor = ZONE_COLOR[zone]
+
+  // Adaptive top margin: 0 for first row, 4px within a zone, 12px at zone
+  // boundaries. Only active when parent uses gap-0.
+  const marginTop = !adaptiveGap
+    ? undefined
+    : prevZone === null
+      ? 0
+      : prevZone === zone
+        ? 4
+        : 12
+
+  // Price source for the aria-label — mirror the fallback chain used for
+  // totals so the spoken label matches what the user sees. Single-store and
+  // multi-store diverge on which price is canonical; we use the same
+  // "first-available" fallback instead of branching on mode because the row
+  // itself has no knowledge of mode beyond `multiStoreMode`.
+  const ariaPrice =
+    (multiStoreMode
+      ? item.assigned_store_price ?? item.cheapest_price ?? item.estimated_price
+      : item.store_price ?? item.cheapest_price ?? item.estimated_price) ?? null
+  const ariaPriceText = ariaPrice
+    ? `$${parseFloat(ariaPrice).toFixed(2)}`
+    : 'price unavailable'
+  const rowAriaLabel = `${item.name}, ${zoneLabel} zone, ${ariaPriceText}`
   const [swiping, setSwiping] = useState(false)
   const [swipeX, setSwipeX] = useState(0)
   const [editingTitle, setEditingTitle] = useState(false)
@@ -1680,7 +1767,10 @@ function ListItemRow({
   const qtyLabel = item.quantity !== '1' ? item.quantity : null
 
   return (
-    <div className="relative overflow-hidden rounded-xl">
+    <div
+      className="relative overflow-hidden rounded-xl"
+      style={marginTop !== undefined ? { marginTop } : undefined}
+    >
       {/* Delete background — only mounted during an active swipe so it can't
           bleed through the rounded-xl clip behind the foreground row. */}
       {swiping && (
@@ -1691,21 +1781,33 @@ function ListItemRow({
         </div>
       )}
 
-      {/* Item content */}
+      {/* Item content.
+          Shopping Zones v1: 4px left border colored by the row's storage zone.
+          borderLeftColor via inline style — Tailwind 4 generates bg-zone-*
+          utilities from the @theme tokens, but border-l-zone-* would require
+          a safelist entry because Tailwind can't statically see the dynamic
+          zone string; inline style sidesteps that and keeps the border color
+          in lockstep with ZONE_COLOR in one place. */}
       <div
         className={[
-          'relative border rounded-xl px-3 py-3 flex items-center gap-3 transition-transform',
+          'relative border border-l-4 rounded-xl px-3 py-3 flex items-center gap-3 transition-transform',
           multiStoreMode && isSelected
             ? 'border-brand ring-2 ring-brand bg-brand-subtle'
             : 'border-neutral-200 bg-white',
         ].join(' ')}
-        style={{ transform: swiping ? `translateX(${swipeX}px)` : undefined }}
+        style={{
+          transform: swiping ? `translateX(${swipeX}px)` : undefined,
+          // Override the left edge only — top/right/bottom stay neutral-200
+          // (or brand when selected) so the zone stripe is the only chroma.
+          borderLeftColor: zoneColor,
+        }}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
         onClick={multiStoreMode ? onToggleSelected : undefined}
-        role={multiStoreMode ? 'button' : undefined}
+        role={multiStoreMode ? 'button' : 'group'}
         aria-pressed={multiStoreMode ? isSelected : undefined}
+        aria-label={rowAriaLabel}
       >
         {/* Left control — check-off circle (single-store) OR selection checkbox (multi-store) */}
         {multiStoreMode ? (

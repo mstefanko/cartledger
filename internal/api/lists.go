@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/locks"
+	"github.com/mstefanko/cartledger/internal/models"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -135,7 +137,11 @@ type listItemResponse struct {
 	// StoreHistoryCount is the number of distinct stores with any price history
 	// for this product/group. Zero when no history anywhere.
 	StoreHistoryCount int    `json:"store_history_count"`
-	CreatedAt         string `json:"created_at"`
+	// StorageZone classifies the item for shopping-list grouping: produce, cold,
+	// frozen, or other. Derived from the product's category (or the most-recent
+	// line_items.suggested_category fallback) via models.CategoryToZone.
+	StorageZone string `json:"storage_zone"`
+	CreatedAt   string `json:"created_at"`
 }
 
 // RegisterRoutes mounts shopping list endpoints onto the protected group.
@@ -269,7 +275,16 @@ func (h *ListHandler) Get(c echo.Context) error {
 		         WHERE pp.product_id = sli.product_id
 		         ORDER BY pp.receipt_date DESC LIMIT 1) AS estimated_price,
 		        sli.product_group_id, pg.name AS product_group_name,
-		        sli.assigned_store_id, ast.name AS assigned_store_name
+		        sli.assigned_store_id, ast.name AS assigned_store_name,
+		        COALESCE(
+		          NULLIF(p.category, ''),
+		          (SELECT li.suggested_category
+		           FROM line_items li
+		           WHERE li.product_id = sli.product_id
+		             AND li.suggested_category IS NOT NULL
+		             AND li.suggested_category != ''
+		           ORDER BY li.created_at DESC LIMIT 1)
+		        ) AS resolved_category
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
 		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
@@ -284,15 +299,17 @@ func (h *ListHandler) Get(c echo.Context) error {
 	defer rows.Close()
 
 	resp.Items = make([]listItemResponse, 0)
+	var firstUnknownZone string
 	for rows.Next() {
 		var item listItemResponse
 		var estimatedPrice *float64
 		var createdAt time.Time
+		var rawCategory sql.NullString
 		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
 			&item.SortOrder, &item.Notes, &createdAt, &estimatedPrice,
 			&item.ProductGroupID, &item.ProductGroupName,
-			&item.AssignedStoreID, &item.AssignedStoreName); err != nil {
+			&item.AssignedStoreID, &item.AssignedStoreName, &rawCategory); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		item.CreatedAt = createdAt.Format(time.RFC3339)
@@ -300,10 +317,18 @@ func (h *ListHandler) Get(c echo.Context) error {
 			s := fmt.Sprintf("%.2f", *estimatedPrice)
 			item.EstimatedPrice = &s
 		}
+		zone := models.CategoryToZone(rawCategory.String)
+		item.StorageZone = string(zone)
+		if firstUnknownZone == "" && rawCategory.String != "" && zone == models.ZoneOther {
+			firstUnknownZone = rawCategory.String
+		}
 		resp.Items = append(resp.Items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if firstUnknownZone != "" {
+		slog.Debug("shopping list zone: unknown category", "category", firstUnknownZone, "list_id", listID)
 	}
 
 	// Batch query: find cheapest store for all items with a product_id.

@@ -27,6 +27,13 @@
   --color-expensive: #e5484d;
   --color-expensive-subtle: rgba(229, 72, 77, 0.16);
 
+  /* Shopping zones — storage-category stripes on list-item rows.
+     Canonical hexes; keep in lockstep with web/src/lib/zones.ts ZONE_COLOR. */
+  --color-zone-produce: #10b981;
+  --color-zone-cold: #0891b2;
+  --color-zone-frozen: #4f46e5;
+  --color-zone-other: #9ca3af;
+
   /* Font families */
   --font-display: "IBM Plex Sans", Helvetica, Arial, sans-serif;
   --font-body: "Helvetica Neue", Helvetica, Arial, sans-serif;
