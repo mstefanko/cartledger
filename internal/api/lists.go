@@ -127,7 +127,15 @@ type listItemResponse struct {
 	StorePriceStore   *string `json:"store_price_store,omitempty"`
 	AssignedStoreID   *string `json:"assigned_store_id,omitempty"`
 	AssignedStoreName *string `json:"assigned_store_name,omitempty"`
-	CreatedAt         string  `json:"created_at"`
+	// AssignedStorePrice is the latest unit_price at the per-row assigned_store_id
+	// (not the list-level preferred_store_id). Nil when the assigned store has no
+	// price history for this product/group — used by the UI to show a neutral
+	// "unknown" badge instead of claiming "worse than cheapest".
+	AssignedStorePrice *string `json:"assigned_store_price,omitempty"`
+	// StoreHistoryCount is the number of distinct stores with any price history
+	// for this product/group. Zero when no history anywhere.
+	StoreHistoryCount int    `json:"store_history_count"`
+	CreatedAt         string `json:"created_at"`
 }
 
 // RegisterRoutes mounts shopping list endpoints onto the protected group.
@@ -369,6 +377,91 @@ func (h *ListHandler) Get(c echo.Context) error {
 		}
 	}
 
+	// Q1c: store-history count per product — distinct stores with any price row.
+	// SQLite does not support COUNT(DISTINCT …) OVER in all versions, so run a
+	// separate parameterized IN-query. Bounded by the number of distinct product_ids
+	// already computed above.
+	storeHistoryCountMap := map[string]int{}
+	if len(productIDs) > 0 {
+		placeholders := strings.Repeat("?,", len(productIDs))
+		placeholders = placeholders[:len(placeholders)-1]
+		q1c := fmt.Sprintf(`
+			SELECT pp.product_id, COUNT(DISTINCT pp.store_id)
+			FROM product_prices pp
+			WHERE pp.product_id IN (%s)
+			GROUP BY pp.product_id`, placeholders)
+		args1c := make([]interface{}, len(productIDs))
+		for i, id := range productIDs {
+			args1c[i] = id
+		}
+		rows1c, err := h.DB.QueryContext(c.Request().Context(), q1c, args1c...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch store history counts")
+		}
+		defer rows1c.Close()
+		for rows1c.Next() {
+			var productID string
+			var count int
+			if err := rows1c.Scan(&productID, &count); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan store history counts")
+			}
+			storeHistoryCountMap[productID] = count
+		}
+	}
+
+	// Q1d: price at each item's assigned_store_id (per-row, not list-preferred).
+	// Keyed on "productID|storeID" because multiple rows can assign different
+	// stores to the same product. Bounded by distinct (product_id, assigned_store_id)
+	// pairs on this list — matches the N+1 envelope the plan calls out.
+	assignedStorePriceMap := map[string]string{}
+	type assignedPair struct {
+		ProductID string
+		StoreID   string
+	}
+	assignedPairs := make([]assignedPair, 0)
+	assignedPairSet := make(map[string]bool)
+	for _, item := range resp.Items {
+		if item.ProductID == nil || item.AssignedStoreID == nil {
+			continue
+		}
+		key := *item.ProductID + "|" + *item.AssignedStoreID
+		if assignedPairSet[key] {
+			continue
+		}
+		assignedPairSet[key] = true
+		assignedPairs = append(assignedPairs, assignedPair{ProductID: *item.ProductID, StoreID: *item.AssignedStoreID})
+	}
+	if len(assignedPairs) > 0 {
+		// Emit (?,?) pairs. Uses the same "latest receipt_date per product+store"
+		// correlation as the existing storePriceMap query.
+		tuplePlaceholders := make([]string, len(assignedPairs))
+		args1d := make([]interface{}, 0, len(assignedPairs)*2)
+		for i, p := range assignedPairs {
+			tuplePlaceholders[i] = "(?, ?)"
+			args1d = append(args1d, p.ProductID, p.StoreID)
+		}
+		q1d := fmt.Sprintf(`
+			SELECT pp.product_id, pp.store_id, PRINTF('%%.2f', pp.unit_price)
+			FROM product_prices pp
+			WHERE (pp.product_id, pp.store_id) IN (VALUES %s)
+			  AND pp.receipt_date = (
+			      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+			      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+			  )`, strings.Join(tuplePlaceholders, ","))
+		rows1d, err := h.DB.QueryContext(c.Request().Context(), q1d, args1d...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch assigned store prices")
+		}
+		defer rows1d.Close()
+		for rows1d.Next() {
+			var productID, storeID, price string
+			if err := rows1d.Scan(&productID, &storeID, &price); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan assigned store prices")
+			}
+			assignedStorePriceMap[productID+"|"+storeID] = price
+		}
+	}
+
 	// Q1b: preferred store price for items with a product_id.
 	storePriceMap := map[string]string{}
 	if resp.PreferredStoreID != nil && len(productIDs) > 0 {
@@ -487,6 +580,90 @@ func (h *ListHandler) Get(c echo.Context) error {
 		}
 	}
 
+	// Q2c: store-history count per product_group — distinct stores across any
+	// product that belongs to the group.
+	groupStoreHistoryCountMap := map[string]int{}
+	if len(groupIDs) > 0 {
+		placeholders := strings.Repeat("?,", len(groupIDs))
+		placeholders = placeholders[:len(placeholders)-1]
+		q2c := fmt.Sprintf(`
+			SELECT p.product_group_id, COUNT(DISTINCT pp.store_id)
+			FROM product_prices pp
+			JOIN products p ON p.id = pp.product_id
+			WHERE p.product_group_id IN (%s)
+			GROUP BY p.product_group_id`, placeholders)
+		args2c := make([]interface{}, len(groupIDs))
+		for i, id := range groupIDs {
+			args2c[i] = id
+		}
+		rows2c, err := h.DB.QueryContext(c.Request().Context(), q2c, args2c...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch group store history counts")
+		}
+		defer rows2c.Close()
+		for rows2c.Next() {
+			var groupID string
+			var count int
+			if err := rows2c.Scan(&groupID, &count); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan group store history counts")
+			}
+			groupStoreHistoryCountMap[groupID] = count
+		}
+	}
+
+	// Q2d: price at each item's assigned_store_id for group-backed rows.
+	// Mirrors groupStorePriceMap (MIN(unit_price) across products in the group
+	// at that store, restricted to latest receipt_date per product+store), but
+	// keyed on the per-row assigned_store_id rather than the list-preferred one.
+	assignedGroupStorePriceMap := map[string]string{}
+	type assignedGroupPair struct {
+		GroupID string
+		StoreID string
+	}
+	assignedGroupPairs := make([]assignedGroupPair, 0)
+	assignedGroupPairSet := make(map[string]bool)
+	for _, item := range resp.Items {
+		if item.ProductGroupID == nil || item.AssignedStoreID == nil {
+			continue
+		}
+		key := *item.ProductGroupID + "|" + *item.AssignedStoreID
+		if assignedGroupPairSet[key] {
+			continue
+		}
+		assignedGroupPairSet[key] = true
+		assignedGroupPairs = append(assignedGroupPairs, assignedGroupPair{GroupID: *item.ProductGroupID, StoreID: *item.AssignedStoreID})
+	}
+	if len(assignedGroupPairs) > 0 {
+		tuplePlaceholders := make([]string, len(assignedGroupPairs))
+		args2d := make([]interface{}, 0, len(assignedGroupPairs)*2)
+		for i, pair := range assignedGroupPairs {
+			tuplePlaceholders[i] = "(?, ?)"
+			args2d = append(args2d, pair.GroupID, pair.StoreID)
+		}
+		q2d := fmt.Sprintf(`
+			SELECT p.product_group_id, pp.store_id, PRINTF('%%.2f', MIN(pp.unit_price))
+			FROM product_prices pp
+			JOIN products p ON p.id = pp.product_id
+			WHERE (p.product_group_id, pp.store_id) IN (VALUES %s)
+			  AND pp.receipt_date = (
+			      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+			      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+			  )
+			GROUP BY p.product_group_id, pp.store_id`, strings.Join(tuplePlaceholders, ","))
+		rows2d, err := h.DB.QueryContext(c.Request().Context(), q2d, args2d...)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch assigned group store prices")
+		}
+		defer rows2d.Close()
+		for rows2d.Next() {
+			var groupID, storeID, price string
+			if err := rows2d.Scan(&groupID, &storeID, &price); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan assigned group store prices")
+			}
+			assignedGroupStorePriceMap[groupID+"|"+storeID] = price
+		}
+	}
+
 	// Apply group price info to items, then store price info.
 	for i, item := range resp.Items {
 		if item.ProductGroupID != nil {
@@ -501,12 +678,30 @@ func (h *ListHandler) Get(c echo.Context) error {
 				resp.Items[i].StorePrice = &p
 				resp.Items[i].StorePriceStore = resp.PreferredStoreName
 			}
+			if count, ok := groupStoreHistoryCountMap[*item.ProductGroupID]; ok {
+				resp.Items[i].StoreHistoryCount = count
+			}
+			if item.AssignedStoreID != nil {
+				if price, ok := assignedGroupStorePriceMap[*item.ProductGroupID+"|"+*item.AssignedStoreID]; ok {
+					p := price
+					resp.Items[i].AssignedStorePrice = &p
+				}
+			}
 		}
 		if item.ProductID != nil {
 			if price, ok := storePriceMap[*item.ProductID]; ok {
 				p := price
 				resp.Items[i].StorePrice = &p
 				resp.Items[i].StorePriceStore = resp.PreferredStoreName
+			}
+			if count, ok := storeHistoryCountMap[*item.ProductID]; ok {
+				resp.Items[i].StoreHistoryCount = count
+			}
+			if item.AssignedStoreID != nil {
+				if price, ok := assignedStorePriceMap[*item.ProductID+"|"+*item.AssignedStoreID]; ok {
+					p := price
+					resp.Items[i].AssignedStorePrice = &p
+				}
 			}
 		}
 	}
