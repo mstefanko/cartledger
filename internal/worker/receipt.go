@@ -654,6 +654,15 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 
 		// If matched: create product_alias (if new) and product_prices entry.
 		if productID != nil && storeID != "" {
+			// Matcher backfill: if the assigned product has NULL brand/category
+			// and the LLM supplied a suggestion, fill those NULLs in. Load-bearing
+			// `AND brand IS NULL` / `AND category IS NULL` inside the helper
+			// protects user-set data from being clobbered. Errors are logged but
+			// never fatal — a failed backfill must not abort the line-item assign.
+			if err := matcher.BackfillProductMetadata(tx, *productID, item.SuggestedBrand, item.SuggestedCategory); err != nil {
+				slog.Warn("worker: matcher backfill failed", "receipt_id", job.ReceiptID, "product_id", *productID, "err", err)
+			}
+
 			normalized := matcher.Normalize(item.RawName)
 
 			// Create alias if it doesn't already exist.
