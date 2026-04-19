@@ -27,7 +27,7 @@ import { AddItemsModal } from '@/components/lists/AddItemsModal'
 import { StoreAssignDropdown } from '@/components/lists/StoreAssignDropdown'
 import { ListTotalsBar } from '@/components/lists/ListTotalsBar'
 import { BatchActionBar } from '@/components/lists/BatchActionBar'
-import { CircleCheck, CircleAlert } from 'lucide-react'
+import { CircleCheck, CircleAlert, Info } from 'lucide-react'
 import type {
   ListItemWithPrice,
   ShoppingListDetail,
@@ -36,6 +36,66 @@ import type {
   CreateListItemRequest,
   Store,
 } from '@/types'
+
+// Badge state machine for the best-price indicator on each list-item row.
+//
+// Backend now returns both `cheapest_price` / `cheapest_store` (lowest-known
+// price across ALL stores) and `assigned_store_price` (latest price at THIS
+// row's effective store, null when that store has no history). Combining the
+// two lets us distinguish "confirmed worse here" from "no data here, so we
+// can't compare." The four possible states map to distinct UI affordances —
+// see render sites below.
+//
+// Derivation (mirrors PLAN-best-price-neutral-state.md):
+//   !cheapest_store                              → no_data
+//   effectiveStoreName === cheapest_store        → best
+//   assigned_store_price != null                 → worse
+//   otherwise                                     → unknown
+//
+// Kept file-local per the plan ("no new utils/badgeState.ts, no new hook").
+type BadgeState =
+  | { kind: 'best'; storeName: string; price: string }
+  | { kind: 'worse'; otherStoreName: string; otherPrice: string }
+  | { kind: 'unknown'; otherStoreName: string; otherPrice: string }
+  | { kind: 'no_data' }
+
+function deriveBadgeState(
+  item: ListItemWithPrice,
+  effectiveStoreId: string | null,
+  stores: Store[],
+): BadgeState {
+  if (!item.cheapest_store || !item.cheapest_price) {
+    return { kind: 'no_data' }
+  }
+  const effectiveStore = effectiveStoreId
+    ? stores.find((s) => s.id === effectiveStoreId) ?? null
+    : null
+  const effectiveStoreName = effectiveStore
+    ? effectiveStore.nickname ?? effectiveStore.name
+    : null
+  if (
+    effectiveStoreName !== null &&
+    effectiveStoreName === item.cheapest_store
+  ) {
+    return {
+      kind: 'best',
+      storeName: item.cheapest_store,
+      price: item.cheapest_price,
+    }
+  }
+  if (item.assigned_store_price != null) {
+    return {
+      kind: 'worse',
+      otherStoreName: item.cheapest_store,
+      otherPrice: item.cheapest_price,
+    }
+  }
+  return {
+    kind: 'unknown',
+    otherStoreName: item.cheapest_store,
+    otherPrice: item.cheapest_price,
+  }
+}
 
 function ShoppingListPage() {
   const { id: listId } = useParams<{ id: string }>()
@@ -217,10 +277,29 @@ function ShoppingListPage() {
     return { uncheckedItems: unchecked, checkedItems: checked }
   }, [list])
 
-  // Estimated total for unchecked items — prefers store_price when a preferred store is set
+  // Estimated total for unchecked items.
+  //
+  // Price-source fallback chain (applied identically in per-store bucket
+  // subtotals below — keeping both paths in lockstep preserves the
+  // `estimatedTotal == sum(bucket.subtotal)` invariant called out at `:270`):
+  //
+  //   1. assigned_store_price — latest price at THIS row's effective store
+  //      (populated only when the assigned store has history for the product).
+  //   2. cheapest_price       — lowest price seen at any store. This is the
+  //      "best guess" when the assigned store has no history; it matches
+  //      what the gray Info badge surfaces to the user.
+  //   3. estimated_price      — last-seen-anywhere fallback.
+  //
+  // `store_price` is intentionally NOT in this chain. It is scoped to the
+  // list's `preferred_store_id`, not the per-row assigned store, and falling
+  // back to it would reintroduce the cross-store mis-attribution bug the
+  // plan targets (a ShoppingRite bucket could silently quote a Costco price).
   const estimatedTotal = useMemo(() => {
     return uncheckedItems.reduce((sum, item) => {
-      const price = item.store_price ?? item.estimated_price
+      const price =
+        item.assigned_store_price ??
+        item.cheapest_price ??
+        item.estimated_price
       if (price) return sum + parseFloat(price)
       return sum
     }, 0)
@@ -228,40 +307,45 @@ function ShoppingListPage() {
 
   // Potential savings + optimize-CTA signal.
   //
-  // canOptimize trips as soon as any item's effective store (toolbar
-  // preferred_store_id in single-store mode, assigned_store_id in multi-store
-  // mode) is not the cheapest known store for that item. This is independent
-  // of whether we can quote a dollar saving — the user still benefits from
-  // reassigning even when the current scoped store has no price on record.
+  // Both are now gated on `deriveBadgeState(...) === 'worse'` — i.e. the row
+  // has price history at the effective store AND a different store is
+  // cheaper. This is stricter than the old "effective store is not cheapest"
+  // check, which ALSO tripped on unknown-state rows (no history at the
+  // effective store). Unknown items shouldn't drive the "Save $X.XX by
+  // shopping at different stores" recommendation — we can't truthfully claim
+  // they're more expensive here. See PLAN-best-price-neutral-state.md, the
+  // "Downstream impacts" section.
   //
-  // potentialSavings is a dollars-and-cents estimate for items we can actually
-  // price-compare: sums (current - cheapest) for items with both store_price
-  // and cheapest_price. May be 0 even when canOptimize is true (e.g. scoped
-  // store has no price record → current price falls back to cheapest itself).
-  const { potentialSavings, canOptimize } = useMemo(() => {
+  // hasUnknownOnly = `canOpt` is false but at least one unchecked item is in
+  // unknown state; it drives ListTotalsBar's copy swap (below).
+  const { potentialSavings, canOptimize, hasUnknownOnly } = useMemo(() => {
     const storeList = storesQuery.data ?? []
     const preferredId = listQuery.data?.preferred_store_id ?? null
     let saved = 0
-    let canOpt = false
+    let worseCount = 0
+    let unknownCount = 0
     for (const item of uncheckedItems) {
-      if (!item.cheapest_price || !item.cheapest_store) continue
-      const cheapestStore = storeList.find(
-        (s) => (s.nickname ?? s.name) === item.cheapest_store,
-      )
-      if (!cheapestStore) continue
       const effectiveStoreId = multiStoreMode
         ? item.assigned_store_id
         : preferredId
-      if (effectiveStoreId && effectiveStoreId !== cheapestStore.id) {
-        canOpt = true
-      }
-      if (item.store_price) {
-        const current = parseFloat(item.store_price)
-        const cheapest = parseFloat(item.cheapest_price)
-        if (cheapest < current) saved += current - cheapest
+      const state = deriveBadgeState(item, effectiveStoreId, storeList)
+      if (state.kind === 'worse') {
+        worseCount += 1
+        // assigned_store_price is guaranteed non-null in 'worse' state.
+        if (item.assigned_store_price && item.cheapest_price) {
+          const current = parseFloat(item.assigned_store_price)
+          const cheapest = parseFloat(item.cheapest_price)
+          if (cheapest < current) saved += current - cheapest
+        }
+      } else if (state.kind === 'unknown') {
+        unknownCount += 1
       }
     }
-    return { potentialSavings: saved, canOptimize: canOpt }
+    return {
+      potentialSavings: saved,
+      canOptimize: worseCount > 0,
+      hasUnknownOnly: worseCount === 0 && unknownCount > 0,
+    }
   }, [uncheckedItems, storesQuery.data, listQuery.data, multiStoreMode])
 
   // Phase 4: group unchecked items by assigned_store_id for multi-store mode.
@@ -273,7 +357,13 @@ function ShoppingListPage() {
     if (!multiStoreMode) return []
     const buckets = new Map<
       string,
-      { storeId: string | null; storeName: string; items: ListItemWithPrice[]; subtotal: number }
+      {
+        storeId: string | null
+        storeName: string
+        items: ListItemWithPrice[]
+        subtotal: number
+        hasUnknown: boolean
+      }
     >()
     const UNASSIGNED_KEY = '__unassigned__'
     for (const item of uncheckedItems) {
@@ -290,12 +380,34 @@ function ShoppingListPage() {
         : 'Unassigned'
       let bucket = buckets.get(key)
       if (!bucket) {
-        bucket = { storeId: normalizedStoreId, storeName, items: [], subtotal: 0 }
+        bucket = {
+          storeId: normalizedStoreId,
+          storeName,
+          items: [],
+          subtotal: 0,
+          hasUnknown: false,
+        }
         buckets.set(key, bucket)
       }
       bucket.items.push(item)
-      const price = item.store_price ?? item.estimated_price
+      // Same fallback chain as estimatedTotal — sum-of-buckets invariant
+      // (`estimatedTotal == sum(bucket.subtotal)`) requires both sites pull
+      // from the same price source in the same order.
+      const price =
+        item.assigned_store_price ??
+        item.cheapest_price ??
+        item.estimated_price
       if (price) bucket.subtotal += parseFloat(price)
+      // "Unknown" here = the row has SOME price history (so it contributes
+      // to the subtotal via cheapest_price), but not at this bucket's
+      // assigned store. Mirrors `deriveBadgeState`'s unknown branch.
+      if (
+        item.cheapest_store &&
+        item.assigned_store_price == null &&
+        normalizedStoreId !== null
+      ) {
+        bucket.hasUnknown = true
+      }
     }
     const unassigned = buckets.get(UNASSIGNED_KEY)
     const assigned = Array.from(buckets.values())
@@ -1088,7 +1200,7 @@ function ShoppingListPage() {
                 </p>
                 {group.subtotal > 0 && (
                   <span className="text-small font-medium text-brand">
-                    Est. ${group.subtotal.toFixed(2)}
+                    {group.hasUnknown ? '~ ' : ''}Est. ${group.subtotal.toFixed(2)}
                   </span>
                 )}
               </div>
@@ -1341,6 +1453,7 @@ function ShoppingListPage() {
           grandTotal={estimatedTotal}
           potentialSavings={potentialSavings}
           canOptimize={canOptimize}
+          hasUnknownOnly={hasUnknownOnly}
           onOptimize={() => optimizePriceMutation.mutate()}
           optimizing={optimizePriceMutation.isPending}
         />
@@ -1677,38 +1790,63 @@ function ListItemRow({
               <span className="text-small text-neutral-400 shrink-0">{qtyLabel}</span>
             )}
           </div>
-          {/* Best-price indicator — always frames as "Best at <store>". Icon
-              reflects whether the store the row will be bought at (toolbar
-              "Shop at" in single-store, per-row dropdown in multi-store) is
-              the cheapest known option. Green check = yes; red alert = a
-              different store is cheaper. */}
-          {!item.checked && !isCleanView &&
-           item.cheapest_store && item.cheapest_price && (() => {
+          {/* Best-price indicator — four states; see `deriveBadgeState`.
+              Green ✓ = cheapest-known store IS this row's effective store.
+              Red ✕   = confirmed cheaper at another store (worse state).
+              Gray ⓘ  = can't make a comparison (unknown or no_data state). */}
+          {!item.checked && !isCleanView && (() => {
             const effectiveStoreId = multiStoreMode
               ? item.assigned_store_id
               : preferredStoreId
-            const effectiveStore = stores.find((s) => s.id === effectiveStoreId)
-            const effectiveStoreName = effectiveStore
-              ? effectiveStore.nickname ?? effectiveStore.name
-              : null
-            const isBestHere =
-              effectiveStoreName !== null &&
-              effectiveStoreName === item.cheapest_store
+            const state = deriveBadgeState(item, effectiveStoreId, stores)
+            const unitSuffix = item.unit ? `/${item.unit}` : ''
+            if (state.kind === 'best') {
+              return (
+                <p className="text-small mt-0.5 flex items-center gap-1 text-success-dark">
+                  <CircleCheck
+                    className="w-3.5 h-3.5 text-success-dark shrink-0"
+                    aria-hidden="true"
+                  />
+                  <span className="truncate">
+                    Best at {state.storeName}{unitSuffix} ${state.price}
+                  </span>
+                </p>
+              )
+            }
+            if (state.kind === 'worse') {
+              return (
+                <p className="text-small mt-0.5 flex items-center gap-1 text-neutral-600">
+                  <CircleAlert
+                    className="w-3.5 h-3.5 text-red-600 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <span className="truncate">
+                    Cheaper at {state.otherStoreName}{unitSuffix} ${state.otherPrice}
+                  </span>
+                </p>
+              )
+            }
+            if (state.kind === 'unknown') {
+              return (
+                <p className="text-small mt-0.5 flex items-center gap-1 text-neutral-500">
+                  <Info
+                    className="w-3.5 h-3.5 text-neutral-400 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <span className="truncate">
+                    Only seen at {state.otherStoreName}{unitSuffix} ${state.otherPrice}
+                  </span>
+                </p>
+              )
+            }
+            // no_data
             return (
-              <p
-                className={[
-                  'text-small mt-0.5 flex items-center gap-1',
-                  isBestHere ? 'text-success-dark' : 'text-neutral-600',
-                ].join(' ')}
-              >
-                {isBestHere ? (
-                  <CircleCheck className="w-3.5 h-3.5 text-success-dark shrink-0" aria-hidden="true" />
-                ) : (
-                  <CircleAlert className="w-3.5 h-3.5 text-red-600 shrink-0" aria-hidden="true" />
-                )}
-                <span className="truncate">
-                  Best at {item.cheapest_store}{item.unit ? `/${item.unit}` : ''} ${item.cheapest_price}
-                </span>
+              <p className="text-small mt-0.5 flex items-center gap-1 text-neutral-500">
+                <Info
+                  className="w-3.5 h-3.5 text-neutral-400 shrink-0"
+                  aria-hidden="true"
+                />
+                <span className="truncate">No price history yet</span>
               </p>
             )
           })()}

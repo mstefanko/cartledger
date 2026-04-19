@@ -477,6 +477,8 @@ export interface ListItemWithPrice {
   cheapest_product_id: string | null
   assigned_store_id: string | null
   assigned_store_name: string | null
+  assigned_store_price: string | null
+  store_history_count: number
 }
 
 export interface ShoppingListDetail {

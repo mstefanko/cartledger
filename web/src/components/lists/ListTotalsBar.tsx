@@ -6,6 +6,14 @@ interface ListTotalsBarProps {
   canOptimize?: boolean
   onOptimize?: () => void
   optimizing?: boolean
+  /**
+   * True when all non-best items are in the "unknown" badge state (zero
+   * confirmed-worse rows). In that case we hide the "Optimize price" CTA
+   * and swap the copy to a neutral notice — we can't honestly claim there
+   * are savings available if we have no prices at the selected store to
+   * compare against.
+   */
+  hasUnknownOnly?: boolean
 }
 
 /**
@@ -26,11 +34,20 @@ export function ListTotalsBar({
   canOptimize,
   onOptimize,
   optimizing,
+  hasUnknownOnly,
 }: ListTotalsBarProps) {
   if (hidden) return null
   const showSavingsCta = canOptimize && onOptimize
+  // Show the "no price history at selected store" notice only when there's
+  // nothing to optimize AND the reason is missing data, not a genuinely
+  // best-case list. Keeps the existing "Estimate is the best possible"
+  // line for the all-best case.
+  const showUnknownNotice = !showSavingsCta && hasUnknownOnly
   const showBestConfirmation =
-    !showSavingsCta && itemCount > 0 && potentialSavings !== undefined
+    !showSavingsCta &&
+    !showUnknownNotice &&
+    itemCount > 0 &&
+    potentialSavings !== undefined
   return (
     <div
       className="sticky bottom-0 left-0 right-0 z-30 bg-white border-t border-neutral-200 px-4 py-3 shadow-subtle"
@@ -62,6 +79,11 @@ export function ListTotalsBar({
               {optimizing ? 'Optimizing…' : 'Optimize price'}
             </button>
           </div>
+        )}
+        {showUnknownNotice && (
+          <span className="text-small text-neutral-500">
+            Some items have no price history at the selected store.
+          </span>
         )}
         {showBestConfirmation && (
           <span className="text-small text-neutral-500">
