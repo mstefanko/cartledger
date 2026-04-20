@@ -76,7 +76,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
 
   const unmatchedCountQuery = useQuery({
     queryKey: ['unmatched-count'],
-    queryFn: getUnmatchedCount,
+    queryFn: () => getUnmatchedCount(),
   })
 
   const unmatchedCount = unmatchedCountQuery.data?.count ?? 0

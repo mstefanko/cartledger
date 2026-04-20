@@ -21,12 +21,30 @@ export interface UnmatchedLineItem {
   possible_list_items?: PossibleListItemMatch[]
 }
 
-export function listUnmatchedLineItems(): Promise<UnmatchedLineItem[]> {
-  return get<UnmatchedLineItem[]>('/line-items/unmatched')
+export interface ImportBatchHeader {
+  id: string
+  source_type: string
+  filename: string
+  created_at: string
+  receipts_count: number
+  items_count: number
+  unmatched_count: number
 }
 
-export function getUnmatchedCount(): Promise<{ count: number }> {
-  return get<{ count: number }>('/line-items/unmatched/count')
+// batchId narrows the list/count to a single import batch. When omitted the
+// endpoint returns the household-wide unmatched set (unchanged from P7).
+export function listUnmatchedLineItems(batchId?: string): Promise<UnmatchedLineItem[]> {
+  const qs = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : ''
+  return get<UnmatchedLineItem[]>(`/line-items/unmatched${qs}`)
+}
+
+export function getUnmatchedCount(batchId?: string): Promise<{ count: number }> {
+  const qs = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : ''
+  return get<{ count: number }>(`/line-items/unmatched/count${qs}`)
+}
+
+export function getBatchHeader(batchId: string): Promise<ImportBatchHeader> {
+  return get<ImportBatchHeader>(`/import/batches/${encodeURIComponent(batchId)}`)
 }
 
 export const linkListItem = (

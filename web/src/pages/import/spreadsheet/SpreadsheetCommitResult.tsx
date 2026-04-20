@@ -41,7 +41,7 @@ function SpreadsheetCommitResult() {
             <Button variant="outlined" size="sm">View analytics</Button>
           </Link>
           {result.unmatched > 0 && (
-            <Link to="/review">
+            <Link to={`/review?batch=${encodeURIComponent(result.batch_id)}`}>
               <Button variant="subtle" size="sm">Review {result.unmatched} item{result.unmatched === 1 ? '' : 's'}</Button>
             </Link>
           )}

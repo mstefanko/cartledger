@@ -1,21 +1,59 @@
 import { useState, useRef, useEffect } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { listUnmatchedLineItems, linkListItem, type UnmatchedLineItem } from '@/api/review'
+import {
+  listUnmatchedLineItems,
+  linkListItem,
+  getBatchHeader,
+  type UnmatchedLineItem,
+  type ImportBatchHeader,
+} from '@/api/review'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 
 function ReviewPage() {
   const queryClient = useQueryClient()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // Batch-scoped review lane: /review?batch=<id>. Empty means the global
+  // lane (P1–P7 behavior, unchanged).
+  const batchId = searchParams.get('batch') ?? ''
 
   const { data: items = [], isLoading } = useQuery({
-    queryKey: ['unmatched-line-items'],
-    queryFn: listUnmatchedLineItems,
+    queryKey: ['unmatched-line-items', batchId],
+    queryFn: () => listUnmatchedLineItems(batchId || undefined),
   })
+
+  // Header query runs only when a batch is present. On error (e.g. 404 for a
+  // batch deleted in another tab), we still render the list — the header
+  // strip just collapses away.
+  const { data: batchHeader } = useQuery<ImportBatchHeader>({
+    queryKey: ['import-batch-header', batchId],
+    queryFn: () => getBatchHeader(batchId),
+    enabled: batchId !== '',
+    retry: false,
+  })
+
+  const clearBatch = () => {
+    const next = new URLSearchParams(searchParams)
+    next.delete('batch')
+    setSearchParams(next, { replace: true })
+  }
+
+  const onMatched = () => {
+    void queryClient.invalidateQueries({ queryKey: ['unmatched-line-items'] })
+    void queryClient.invalidateQueries({ queryKey: ['unmatched-count'] })
+    if (batchId) {
+      void queryClient.invalidateQueries({ queryKey: ['import-batch-header', batchId] })
+    }
+  }
 
   if (isLoading) {
     return (
       <div className="py-8">
+        {batchId && batchHeader && (
+          <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
+        )}
         <p className="text-body text-neutral-400">Loading…</p>
       </div>
     )
@@ -24,30 +62,109 @@ function ReviewPage() {
   if (items.length === 0) {
     return (
       <div className="py-8 max-w-2xl">
-        <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-2">
-          Review Queue
-        </h1>
-        <p className="text-body text-neutral-400">All caught up — no unmatched line items.</p>
+        {batchId && batchHeader ? (
+          <>
+            <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
+            <div className="mt-6 rounded-2xl bg-white shadow-subtle p-5">
+              <p className="font-display text-feature font-semibold text-neutral-900 mb-1">
+                Import fully reviewed
+              </p>
+              <p className="text-body text-neutral-500 mb-3">
+                Every line item in this import has been matched or linked.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Link to="/analytics" className="text-caption text-brand hover:underline">
+                  View analytics →
+                </Link>
+                <button
+                  onClick={clearBatch}
+                  className="text-caption text-brand hover:underline"
+                >
+                  Back to global review →
+                </button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-2">
+              Review Queue
+            </h1>
+            <p className="text-body text-neutral-400">All caught up — no unmatched line items.</p>
+          </>
+        )}
       </div>
     )
   }
 
   return (
     <div className="py-8 max-w-2xl">
-      <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-6">
-        Review Queue
-      </h1>
+      {batchId && batchHeader ? (
+        <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
+      ) : (
+        <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-6">
+          Review Queue
+        </h1>
+      )}
       <div className="space-y-4">
         {items.map((item) => (
           <ReviewCard
             key={item.id}
             item={item}
-            onMatched={() => {
-              void queryClient.invalidateQueries({ queryKey: ['unmatched-line-items'] })
-              void queryClient.invalidateQueries({ queryKey: ['unmatched-count'] })
-            }}
+            onMatched={onMatched}
           />
         ))}
+      </div>
+    </div>
+  )
+}
+
+interface BatchHeaderStripProps {
+  header: ImportBatchHeader
+  onDone: () => void
+}
+
+function BatchHeaderStrip({ header, onDone }: BatchHeaderStripProps) {
+  // Date rendering — fall back to the raw ISO string if Date() can't parse
+  // the server timestamp; don't let a formatter error blank the strip.
+  let dateDisplay = header.created_at
+  try {
+    const d = new Date(header.created_at)
+    if (!Number.isNaN(d.getTime())) {
+      dateDisplay = d.toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      })
+    }
+  } catch {
+    // keep raw value
+  }
+  const filename = header.filename || 'Untitled import'
+  const remaining = header.unmatched_count
+  const remainingLabel = `${remaining} item${remaining === 1 ? '' : 's'} remaining`
+
+  return (
+    <div className="mb-6 rounded-2xl border border-brand/20 bg-brand-subtle p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-small uppercase tracking-wide text-brand-dark/70">
+            Reviewing import
+          </div>
+          <div className="mt-1 truncate font-display text-feature font-semibold text-neutral-900">
+            {filename}
+          </div>
+          <div className="mt-1 text-caption text-neutral-500">
+            {dateDisplay} · {remainingLabel}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onDone}
+          className="shrink-0 rounded-xl bg-white px-3 py-1.5 text-caption font-medium text-brand-dark border border-brand-dark hover:bg-brand-subtle active:bg-brand-subtle"
+        >
+          Done
+        </button>
       </div>
     </div>
   )
@@ -88,6 +205,7 @@ function ReviewCard({ item, onMatched }: ReviewCardProps) {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['unmatched-line-items'] })
       void queryClient.invalidateQueries({ queryKey: ['unmatched-count'] })
+      void queryClient.invalidateQueries({ queryKey: ['import-batch-header'] })
     },
   })
 

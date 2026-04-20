@@ -2,9 +2,11 @@ package api
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -54,15 +56,84 @@ func (h *ReviewHandler) RegisterRoutes(protected *echo.Group) {
 	lineItems.GET("/unmatched", h.ListUnmatchedLineItems)
 	lineItems.GET("/unmatched/count", h.GetUnmatchedCount)
 	lineItems.POST("/:id/link-list-item", h.LinkListItem)
+
+	// Batch review header — lives under /import/batches/:id so the frontend
+	// can fetch a filename + counts for the persistent header strip when a
+	// user opens /review?batch=<id>. Kept on ReviewHandler (not the
+	// spreadsheet handler) because the data served is review-scoped and may
+	// later back non-spreadsheet batch sources.
+	protected.GET("/import/batches/:id", h.GetImportBatch)
+}
+
+// maxBatchIDLen bounds the accepted batch_id query param. Plan calls for a
+// "non-empty and < 64 chars" check (we don't parse as a strict UUID because
+// migration 021 stores ids as 32-char lowercase hex — `hex(randomblob(16))`
+// — and spreadsheet.Commit writes uuid.New().String() shaped like a normal
+// UUID with dashes). 64 is generous enough for either form while rejecting
+// pathological inputs.
+const maxBatchIDLen = 64
+
+// validateBatchID normalizes and bounds-checks a batch_id query param.
+// Returns (id, "") when acceptable, ("", reason) otherwise. The caller
+// turns a non-empty reason into a 400.
+func validateBatchID(raw string) (string, string) {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return "", "batch_id must not be empty"
+	}
+	if len(id) > maxBatchIDLen {
+		return "", "batch_id too long"
+	}
+	return id, ""
+}
+
+// verifyBatchOwnership returns the (filename, source_type, created_at,
+// receipts_count, items_count) tuple for a batch, but only when the batch
+// belongs to the caller's household. sql.ErrNoRows is surfaced verbatim so
+// the caller can 404 on either missing-or-cross-household (no existence
+// leak per plan §Auth).
+func (h *ReviewHandler) verifyBatchOwnership(c echo.Context, batchID, householdID string) (filename sql.NullString, sourceType string, createdAt time.Time, receipts int, items int, err error) {
+	err = h.DB.QueryRowContext(c.Request().Context(),
+		`SELECT filename, source_type, created_at, receipts_count, items_count
+		 FROM import_batches
+		 WHERE id = ? AND household_id = ?`,
+		batchID, householdID,
+	).Scan(&filename, &sourceType, &createdAt, &receipts, &items)
+	return
 }
 
 // ListUnmatchedLineItems returns all unmatched line items for the household.
 // GET /api/v1/line-items/unmatched
+// Optional query param ?batch_id=<id> narrows the list to a specific import
+// batch. The batch must belong to the caller's household; unknown or
+// cross-household batch ids return 404.
 func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 
-	rows, err := h.DB.QueryContext(ctx, `
+	// Optional batch filter. When present, validate shape, then verify
+	// ownership before letting it into the WHERE clause. Both checks MUST
+	// run before we execute the list query so a malformed or cross-household
+	// id can't leak row existence timing.
+	var batchID string
+	if raw := c.QueryParam("batch_id"); raw != "" {
+		id, reason := validateBatchID(raw)
+		if reason != "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": reason})
+		}
+		if _, _, _, _, _, err := h.verifyBatchOwnership(c, id, householdID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": "batch not found"})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		batchID = id
+	}
+
+	// Build query — the only change when a batch is supplied is an extra
+	// AND clause + bound arg. Row shape is unchanged so the frontend parser
+	// keeps working (plan §Constraints).
+	query := `
 		SELECT
 			li.id,
 			li.receipt_id,
@@ -78,10 +149,15 @@ func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 		JOIN receipts r ON r.id = li.receipt_id
 		LEFT JOIN stores s ON s.id = r.store_id
 		WHERE r.household_id = ?
-		  AND (li.product_id IS NULL OR li.matched = 'unmatched')
-		ORDER BY r.receipt_date DESC, li.id ASC`,
-		householdID,
-	)
+		  AND (li.product_id IS NULL OR li.matched = 'unmatched')`
+	args := []interface{}{householdID}
+	if batchID != "" {
+		query += ` AND li.import_batch_id = ?`
+		args = append(args, batchID)
+	}
+	query += ` ORDER BY r.receipt_date DESC, li.id ASC`
+
+	rows, err := h.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -161,23 +237,108 @@ func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 
 // GetUnmatchedCount returns the count of unmatched line items for the household.
 // GET /api/v1/line-items/unmatched/count
+// Optional query param ?batch_id=<id> narrows the count to a specific batch,
+// same validation rules as ListUnmatchedLineItems.
 func (h *ReviewHandler) GetUnmatchedCount(c echo.Context) error {
+	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 
-	var count int
-	err := h.DB.QueryRow(`
+	var batchID string
+	if raw := c.QueryParam("batch_id"); raw != "" {
+		id, reason := validateBatchID(raw)
+		if reason != "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": reason})
+		}
+		if _, _, _, _, _, err := h.verifyBatchOwnership(c, id, householdID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": "batch not found"})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		batchID = id
+	}
+
+	query := `
 		SELECT COUNT(*)
 		FROM line_items li
 		JOIN receipts r ON r.id = li.receipt_id
 		WHERE r.household_id = ?
-		  AND (li.product_id IS NULL OR li.matched = 'unmatched')`,
-		householdID,
-	).Scan(&count)
-	if err != nil {
+		  AND (li.product_id IS NULL OR li.matched = 'unmatched')`
+	args := []interface{}{householdID}
+	if batchID != "" {
+		query += ` AND li.import_batch_id = ?`
+		args = append(args, batchID)
+	}
+
+	var count int
+	if err := h.DB.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
 	return c.JSON(http.StatusOK, map[string]int{"count": count})
+}
+
+// importBatchHeaderResponse is the shape returned by GET /import/batches/:id.
+// Field names match the plan §Backend changes spec verbatim; `unmatched_count`
+// is recomputed on every call (not read from the denormalized snapshot on
+// import_batches) so it tracks what the user has cleared in the review lane.
+type importBatchHeaderResponse struct {
+	ID             string `json:"id"`
+	SourceType     string `json:"source_type"`
+	Filename       string `json:"filename"`
+	CreatedAt      string `json:"created_at"`
+	ReceiptsCount  int    `json:"receipts_count"`
+	ItemsCount     int    `json:"items_count"`
+	UnmatchedCount int    `json:"unmatched_count"`
+}
+
+// GetImportBatch handles GET /api/v1/import/batches/:id — the header strip
+// payload for the batch-scoped review lane. 404s on unknown-or-cross-household
+// (no existence leak). The denormalized `import_batches.unmatched_count` is
+// intentionally ignored in favor of a fresh COUNT(*): the snapshot is only
+// accurate at commit time, and we need a live view as users match items.
+func (h *ReviewHandler) GetImportBatch(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+
+	id, reason := validateBatchID(c.Param("id"))
+	if reason != "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": reason})
+	}
+
+	filename, sourceType, createdAt, receipts, items, err := h.verifyBatchOwnership(c, id, householdID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "batch not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var unmatched int
+	if err := h.DB.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM line_items li
+		JOIN receipts r ON r.id = li.receipt_id
+		WHERE r.household_id = ?
+		  AND li.import_batch_id = ?
+		  AND (li.product_id IS NULL OR li.matched = 'unmatched')`,
+		householdID, id,
+	).Scan(&unmatched); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	resp := importBatchHeaderResponse{
+		ID:             id,
+		SourceType:     sourceType,
+		CreatedAt:      createdAt.UTC().Format(time.RFC3339),
+		ReceiptsCount:  receipts,
+		ItemsCount:     items,
+		UnmatchedCount: unmatched,
+	}
+	if filename.Valid {
+		resp.Filename = filename.String
+	}
+	return c.JSON(http.StatusOK, resp)
 }
 
 // LinkListItem links a receipt line item to a shopping list item, checking it off.
