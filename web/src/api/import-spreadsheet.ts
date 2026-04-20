@@ -78,6 +78,36 @@ export interface UploadResponse {
   saved_mappings: SavedMapping[] | null
   fingerprint: string
   auto_applied_mapping_id: string | null
+  // Full config to apply verbatim when the server matched either a
+  // user-named mapping (chip-visible) OR the silent __last_used__ row for
+  // this household. Null means "no saved state matched — fall back to
+  // `suggested`."
+  auto_applied_config: SuggestedConfig | null
+}
+
+// Listed mapping entry for the upload-screen chip rail. Shape mirrors
+// internal/api/import_spreadsheet.go listMappingEntry.
+export interface ListedMapping {
+  id: string
+  name: string
+  source_type: string
+  source_fingerprint: string
+  last_used_at?: string
+}
+
+export interface ListMappingsResponse {
+  mappings: ListedMapping[]
+}
+
+// Detail response for GET /import/spreadsheet/mappings/:id — carries the
+// full config so the client can overwrite local state on chip click.
+export interface GetMappingResponse {
+  id: string
+  name: string
+  source_type: string
+  source_fingerprint: string
+  last_used_at?: string
+  config: SuggestedConfig
 }
 
 export interface GetSheetResponse {
@@ -264,6 +294,30 @@ export function useDeleteImport(
   return useMutation({
     mutationFn: async () =>
       del<void>(`/import/spreadsheet/${encodeURIComponent(importId)}`),
+  })
+}
+
+// List the household's saved mappings. Used on the upload screen to render
+// "Reuse" chips before a file has been picked. Excludes the __last_used__
+// sentinel (filtered server-side).
+export function useListMappings(
+  enabled: boolean = true,
+): UseQueryResult<ListMappingsResponse, Error> {
+  return useQuery({
+    queryKey: ['import-spreadsheet', 'mappings'],
+    queryFn: async () => get<ListMappingsResponse>('/import/spreadsheet/mappings'),
+    enabled,
+    staleTime: 60_000,
+  })
+}
+
+// Fetch a single saved mapping (config included) so the configure screen
+// can overwrite local state on chip click. Uses a mutation because it's a
+// one-shot trigger driven by a user action, not a subscription.
+export function useGetMapping(): UseMutationResult<GetMappingResponse, Error, string> {
+  return useMutation({
+    mutationFn: async (id: string) =>
+      get<GetMappingResponse>(`/import/spreadsheet/mappings/${encodeURIComponent(id)}`),
   })
 }
 

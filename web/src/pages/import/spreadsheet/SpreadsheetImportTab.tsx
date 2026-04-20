@@ -63,11 +63,18 @@ function SpreadsheetImportTab() {
   const previewMutation = usePreview(upload?.import_id ?? '')
   const commitMutation = useCommit(upload?.import_id ?? '')
 
-  // Handle upload result — seed config from suggested.
+  // Handle upload result — seed config from auto_applied_config when the
+  // server recognized this layout (named match OR silent __last_used__),
+  // falling back to the heuristic `suggested` config otherwise. This is
+  // the point at which Phase 7's "silent recall" happens for the
+  // __last_used__ path — auto_applied_mapping_id stays null but the
+  // committed config still overwrites the heuristic.
   useEffect(() => {
     if (uploadMutation.data && uploadMutation.data !== upload) {
-      setUpload(uploadMutation.data)
-      setConfig(configFromSuggested(uploadMutation.data.suggested))
+      const u = uploadMutation.data
+      setUpload(u)
+      const seed = u.auto_applied_config ?? u.suggested
+      setConfig(configFromSuggested(seed))
       setPreview(null)
     }
   }, [uploadMutation.data, upload])
@@ -192,6 +199,9 @@ function SpreadsheetImportTab() {
             const next = { ...prev, ...patch }
             return next
           })
+        }}
+        onConfigReplace={(next) => {
+          setConfig(next)
         }}
         onConfigChanged={(next) => {
           refetchPreview(next)

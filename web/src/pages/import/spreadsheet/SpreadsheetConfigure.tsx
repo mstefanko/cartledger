@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   PreviewResponse,
+  SavedMapping,
   UploadResponse,
 } from '@/api/import-spreadsheet'
+import { useGetMapping } from '@/api/import-spreadsheet'
 import type { ImportConfig } from './SpreadsheetImportTab'
 import SheetPicker from './panels/SheetPicker'
 import CsvOptionsPanel from './panels/CsvOptionsPanel'
@@ -20,6 +22,7 @@ interface SpreadsheetConfigureProps {
   upload: UploadResponse
   config: ImportConfig
   onConfigChange: (patch: Partial<ImportConfig>) => void
+  onConfigReplace: (next: ImportConfig) => void
   onConfigChanged: (next: ImportConfig) => void
   preview: PreviewResponse | null
   isPreviewLoading: boolean
@@ -33,6 +36,7 @@ function SpreadsheetConfigure({
   upload,
   config,
   onConfigChange,
+  onConfigReplace,
   onConfigChanged,
   preview,
   isPreviewLoading,
@@ -44,6 +48,8 @@ function SpreadsheetConfigure({
   // Debounced preview fetch — 300ms after last change.
   const firstRun = useRef(true)
   const [skipErrors, setSkipErrors] = useState(false)
+  const [appliedToast, setAppliedToast] = useState<string | null>(null)
+  const getMapping = useGetMapping()
   useEffect(() => {
     const id = setTimeout(() => {
       onConfigChanged(config)
@@ -70,6 +76,40 @@ function SpreadsheetConfigure({
   const storeMapped = config.mapping['store'] !== undefined && config.mapping['store'] >= 0
   const usingDefaultStore = !storeMapped
   const needsDefaultStore = usingDefaultStore
+
+  // Non-auto-applied chips. Only surface these when the server did NOT
+  // already auto-apply a named mapping (auto_applied_mapping_id === null).
+  // When auto-apply succeeded, the chip for that mapping is redundant.
+  const savedMappings: SavedMapping[] = upload.saved_mappings ?? []
+  const showChips = !upload.auto_applied_mapping_id && savedMappings.length > 0
+
+  // Auto-dismiss the "Applied X" toast after 3s.
+  useEffect(() => {
+    if (!appliedToast) return
+    const id = window.setTimeout(() => setAppliedToast(null), 3000)
+    return () => window.clearTimeout(id)
+  }, [appliedToast])
+
+  const applySavedMapping = (m: SavedMapping) => {
+    getMapping.mutate(m.id, {
+      onSuccess: (resp) => {
+        // Preserve UI-only fields on the existing config and overwrite the
+        // server-driven ones. importRevision is intentionally preserved so
+        // the preview debounce doesn't commit against a stale chain.
+        const next: ImportConfig = {
+          ...config,
+          sheet: resp.config.sheet || config.sheet,
+          mapping: { ...resp.config.mapping },
+          dateFormat: resp.config.date_format,
+          csvOptions: { ...resp.config.csv_options },
+          unitOptions: { ...resp.config.unit_options },
+          grouping: { ...resp.config.grouping },
+        }
+        onConfigReplace(next)
+        setAppliedToast(`Applied “${resp.name}”`)
+      },
+    })
+  }
 
   return (
     <div className="max-w-5xl">
@@ -124,6 +164,53 @@ function SpreadsheetConfigure({
           value={config.sinceDate}
           onChange={(sinceDate) => onConfigChange({ sinceDate })}
         />
+
+        {showChips && (
+          <div>
+            <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+              Apply a saved mapping
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              {savedMappings.map((m) => {
+                const pending = getMapping.isPending && getMapping.variables === m.id
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    disabled={getMapping.isPending}
+                    onClick={() => applySavedMapping(m)}
+                    className={[
+                      'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full',
+                      'border text-caption transition-colors cursor-pointer',
+                      'border-neutral-200 bg-white text-neutral-700',
+                      'hover:border-brand hover:bg-brand-subtle',
+                      'disabled:opacity-60 disabled:cursor-wait',
+                    ].join(' ')}
+                    title={
+                      m.last_used_at
+                        ? `Last used ${new Date(m.last_used_at).toLocaleDateString()}`
+                        : m.name
+                    }
+                  >
+                    <span className="truncate max-w-[220px]">
+                      {pending ? 'Applying…' : `Apply: ${m.name}`}
+                    </span>
+                  </button>
+                )
+              })}
+              {appliedToast && (
+                <span className="text-caption text-brand" role="status" aria-live="polite">
+                  {appliedToast}
+                </span>
+              )}
+              {getMapping.error && (
+                <span className="text-caption text-expensive" role="alert">
+                  Could not load that mapping.
+                </span>
+              )}
+            </div>
+          </div>
+        )}
 
         <FieldMappings
           sheet={activeSheet}

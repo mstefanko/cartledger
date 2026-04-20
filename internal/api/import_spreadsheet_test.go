@@ -716,6 +716,269 @@ func TestImportSpreadsheet_CommitSurfacesDuplicatesSkipped(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// Test 15: Upload after commit with save_mapping_as re-uses the same CSV
+// layout — response's auto_applied_mapping_id points at the named mapping
+// AND auto_applied_config is non-null with the committed config.
+// ----------------------------------------------------------------------------
+
+func TestImportSpreadsheet_UploadAutoAppliesNamedMapping(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	// First upload + commit with save_mapping_as.
+	importID, suggested := uploadCSV(t, f, f.HH1, cleanCSV)
+	body := previewBody(suggested)
+	body["save_mapping_as"] = "my grocery sheet"
+	req := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec, _ := doJSON(t, f.Echo, req); rec.Code != http.StatusOK {
+		t.Fatalf("commit: want 200 got %d", rec.Code)
+	}
+
+	// Look up the mapping id we just created so we can compare.
+	var savedID string
+	if err := f.DB.QueryRow(
+		"SELECT id FROM import_mappings WHERE household_id = ? AND name = ?",
+		f.HH1, "my grocery sheet",
+	).Scan(&savedID); err != nil {
+		t.Fatalf("lookup saved mapping id: %v", err)
+	}
+
+	// Re-upload the same CSV. Need to bypass the 1/min upload limiter by
+	// resetting the handler's limiter; cleanest path is a fresh fixture
+	// household — but the commit above already seeded on HH1, so we upload
+	// a second time on HH1. The limiter is per-household, so we drain it
+	// manually via a sleep-free hack: swap in a fresh limiter.
+	f.Handler.uploadLimiter = newHouseholdLimiter(f.Handler.uploadLimiter.r, 5)
+
+	req2 := buildUploadRequest(t, "grocery.csv", []byte(cleanCSV), f.HH1)
+	rec2, body2 := doJSON(t, f.Echo, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("re-upload: want 200 got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	autoID, _ := body2["auto_applied_mapping_id"].(string)
+	if autoID != savedID {
+		t.Errorf("auto_applied_mapping_id: want %q got %q", savedID, autoID)
+	}
+	autoCfg, _ := body2["auto_applied_config"].(map[string]any)
+	if autoCfg == nil {
+		t.Fatalf("auto_applied_config: want non-null, got nil")
+	}
+	// The saved config was written from the commit request's fields —
+	// sheet/mapping should round-trip.
+	if sheet, _ := autoCfg["sheet"].(string); sheet != suggested["sheet"] {
+		t.Errorf("auto_applied_config.sheet: want %v got %v", suggested["sheet"], sheet)
+	}
+	mapping, _ := autoCfg["mapping"].(map[string]any)
+	if mapping == nil {
+		t.Errorf("auto_applied_config.mapping: want non-nil")
+	}
+
+	// saved_mappings list should contain our named mapping but NOT __last_used__.
+	saved, _ := body2["saved_mappings"].([]any)
+	foundNamed := false
+	for _, m := range saved {
+		mm, _ := m.(map[string]any)
+		if mm["name"] == "__last_used__" {
+			t.Errorf("saved_mappings should not include __last_used__, got %v", mm)
+		}
+		if mm["name"] == "my grocery sheet" {
+			foundNamed = true
+		}
+	}
+	if !foundNamed {
+		t.Errorf("saved_mappings missing the named mapping: %v", saved)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Test 16: Upload after commit WITHOUT save_mapping_as — the __last_used__
+// row silently supplies auto_applied_config. auto_applied_mapping_id stays
+// null (no chip in UI), and __last_used__ is never in saved_mappings[].
+// ----------------------------------------------------------------------------
+
+func TestImportSpreadsheet_UploadAutoAppliesLastUsed(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	importID, suggested := uploadCSV(t, f, f.HH1, cleanCSV)
+	body := previewBody(suggested) // no save_mapping_as
+	req := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec, _ := doJSON(t, f.Echo, req); rec.Code != http.StatusOK {
+		t.Fatalf("commit: want 200 got %d", rec.Code)
+	}
+
+	// Bypass upload 1/min limiter.
+	f.Handler.uploadLimiter = newHouseholdLimiter(f.Handler.uploadLimiter.r, 5)
+
+	req2 := buildUploadRequest(t, "grocery.csv", []byte(cleanCSV), f.HH1)
+	rec2, body2 := doJSON(t, f.Echo, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("re-upload: want 200 got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	// Named mapping id must be null — only the sentinel exists.
+	if body2["auto_applied_mapping_id"] != nil {
+		t.Errorf("auto_applied_mapping_id: want null got %v", body2["auto_applied_mapping_id"])
+	}
+	// But the config should still be populated from __last_used__.
+	autoCfg, ok := body2["auto_applied_config"].(map[string]any)
+	if !ok || autoCfg == nil {
+		t.Fatalf("auto_applied_config: want non-null from __last_used__, body=%v", body2)
+	}
+	if sheet, _ := autoCfg["sheet"].(string); sheet != suggested["sheet"] {
+		t.Errorf("auto_applied_config.sheet: want %v got %v", suggested["sheet"], sheet)
+	}
+	// saved_mappings must NOT include the sentinel.
+	saved, _ := body2["saved_mappings"].([]any)
+	for _, m := range saved {
+		mm, _ := m.(map[string]any)
+		if mm["name"] == "__last_used__" {
+			t.Errorf("saved_mappings leaked __last_used__: %v", mm)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Test 17: GET /import/spreadsheet/mappings — household-scoped, hides the
+// __last_used__ sentinel.
+// ----------------------------------------------------------------------------
+
+func TestImportSpreadsheet_ListMappings(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	// Seed HH1 with a named mapping.
+	importID, suggested := uploadCSV(t, f, f.HH1, cleanCSV)
+	body := previewBody(suggested)
+	body["save_mapping_as"] = "hh1 mapping"
+	req := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec, _ := doJSON(t, f.Echo, req); rec.Code != http.StatusOK {
+		t.Fatalf("commit HH1: want 200 got %d", rec.Code)
+	}
+
+	// Seed HH2 with its own named mapping (to verify isolation).
+	f.Handler.uploadLimiter = newHouseholdLimiter(f.Handler.uploadLimiter.r, 5)
+	importID2, suggested2 := uploadCSV(t, f, f.HH2, cleanCSV)
+	body2 := previewBody(suggested2)
+	body2["save_mapping_as"] = "hh2 mapping"
+	req2 := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID2+"/commit",
+		bytes.NewReader(mustJSON(body2)))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Test-Household-ID", f.HH2)
+	if rec, _ := doJSON(t, f.Echo, req2); rec.Code != http.StatusOK {
+		t.Fatalf("commit HH2: want 200 got %d", rec.Code)
+	}
+
+	// HH1 asks for its list.
+	listReq := httptest.NewRequest(http.MethodGet, "/import/spreadsheet/mappings", nil)
+	listReq.Header.Set("X-Test-Household-ID", f.HH1)
+	rec, listBody := doJSON(t, f.Echo, listReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list HH1: want 200 got %d body=%s", rec.Code, rec.Body.String())
+	}
+	items, _ := listBody["mappings"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("list HH1: want exactly 1 mapping got %d (%v)", len(items), items)
+	}
+	first, _ := items[0].(map[string]any)
+	if first["name"] != "hh1 mapping" {
+		t.Errorf("list HH1: want name 'hh1 mapping' got %v", first["name"])
+	}
+	if first["source_fingerprint"] == nil || first["source_fingerprint"] == "" {
+		t.Errorf("list HH1: expected source_fingerprint, got %v", first["source_fingerprint"])
+	}
+	if first["source_type"] != "csv" {
+		t.Errorf("list HH1: want source_type csv got %v", first["source_type"])
+	}
+	// HH2's mapping must not appear here, and __last_used__ must never appear.
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m["name"] == "hh2 mapping" {
+			t.Errorf("list HH1: leaked HH2's mapping")
+		}
+		if m["name"] == "__last_used__" {
+			t.Errorf("list HH1: leaked __last_used__ sentinel")
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Test 18: GET /import/spreadsheet/mappings/:id — returns full config,
+// 404s on unknown id and on cross-household access.
+// ----------------------------------------------------------------------------
+
+func TestImportSpreadsheet_GetMapping(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	importID, suggested := uploadCSV(t, f, f.HH1, cleanCSV)
+	body := previewBody(suggested)
+	body["save_mapping_as"] = "hh1 named"
+	req := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec, _ := doJSON(t, f.Echo, req); rec.Code != http.StatusOK {
+		t.Fatalf("commit: want 200 got %d", rec.Code)
+	}
+
+	var savedID string
+	if err := f.DB.QueryRow(
+		"SELECT id FROM import_mappings WHERE household_id = ? AND name = ?",
+		f.HH1, "hh1 named",
+	).Scan(&savedID); err != nil {
+		t.Fatalf("lookup id: %v", err)
+	}
+
+	// HH1 happy path.
+	getReq := httptest.NewRequest(http.MethodGet, "/import/spreadsheet/mappings/"+savedID, nil)
+	getReq.Header.Set("X-Test-Household-ID", f.HH1)
+	rec, resp := doJSON(t, f.Echo, getReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get mapping HH1: want 200 got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if resp["name"] != "hh1 named" {
+		t.Errorf("get: want name 'hh1 named' got %v", resp["name"])
+	}
+	cfg, _ := resp["config"].(map[string]any)
+	if cfg == nil {
+		t.Fatalf("get: config missing: %v", resp)
+	}
+	if cfg["sheet"] != suggested["sheet"] {
+		t.Errorf("get.config.sheet: want %v got %v", suggested["sheet"], cfg["sheet"])
+	}
+	if _, ok := cfg["mapping"].(map[string]any); !ok {
+		t.Errorf("get.config.mapping: want object got %T", cfg["mapping"])
+	}
+
+	// HH2 sees 404 for HH1's id.
+	getReq2 := httptest.NewRequest(http.MethodGet, "/import/spreadsheet/mappings/"+savedID, nil)
+	getReq2.Header.Set("X-Test-Household-ID", f.HH2)
+	rec2 := httptest.NewRecorder()
+	f.Echo.ServeHTTP(rec2, getReq2)
+	if rec2.Code != http.StatusNotFound {
+		t.Errorf("get mapping HH2 cross-household: want 404 got %d", rec2.Code)
+	}
+
+	// Unknown id → 404.
+	getReq3 := httptest.NewRequest(http.MethodGet, "/import/spreadsheet/mappings/does-not-exist", nil)
+	getReq3.Header.Set("X-Test-Household-ID", f.HH1)
+	rec3 := httptest.NewRecorder()
+	f.Echo.ServeHTTP(rec3, getReq3)
+	if rec3.Code != http.StatusNotFound {
+		t.Errorf("get unknown id: want 404 got %d", rec3.Code)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // helpers: upload + previewBody compose a commonly-repeated test shape.
 // ----------------------------------------------------------------------------
 

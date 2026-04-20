@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import { Button } from '@/components/ui/Button'
+import { useListMappings, type ListedMapping } from '@/api/import-spreadsheet'
 
 interface SpreadsheetUploadProps {
   onUpload: (file: File) => void
@@ -11,7 +12,15 @@ const ACCEPTED_EXT = ['.csv', '.tsv', '.xlsx']
 
 function SpreadsheetUpload({ onUpload, isUploading, errorMessage }: SpreadsheetUploadProps) {
   const [dragActive, setDragActive] = useState(false)
+  const [hint, setHint] = useState<string | null>(null)
+  const [flashedId, setFlashedId] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const dropRef = useRef<HTMLLabelElement>(null)
+
+  // Ask the server for the household's saved mappings so we can show a
+  // "Reuse:" chip rail. Fail silently — the upload flow is usable without it.
+  const { data: mappingsData } = useListMappings()
+  const mappings: ListedMapping[] = mappingsData?.mappings ?? []
 
   const pickFile = useCallback((file: File | undefined) => {
     if (!file) return
@@ -23,10 +32,61 @@ function SpreadsheetUpload({ onUpload, isUploading, errorMessage }: SpreadsheetU
     onUpload(file)
   }, [onUpload])
 
+  const handleChipClick = useCallback((m: ListedMapping) => {
+    // The chip is informational until a file is picked — actual auto-apply
+    // is driven by the server's fingerprint match on upload. Flash the chip
+    // and scroll the drop-zone into focus so the user knows what to do next.
+    setFlashedId(m.id)
+    setHint(`Upload a file — “${m.name}” will be auto-applied if the layout matches.`)
+    dropRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    // Clear the highlight after ~1.6s so it doesn't linger.
+    window.setTimeout(() => setFlashedId((id) => (id === m.id ? null : id)), 1600)
+  }, [])
+
   return (
     <div className="max-w-3xl">
       <div className="bg-white rounded-2xl shadow-subtle p-8">
+        {mappings.length > 0 && (
+          <div className="mb-6">
+            <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+              Reuse a saved mapping
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {mappings.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => handleChipClick(m)}
+                  className={[
+                    'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full',
+                    'border text-caption transition-all cursor-pointer',
+                    flashedId === m.id
+                      ? 'border-brand bg-brand-subtle text-brand-dark scale-105'
+                      : 'border-neutral-200 bg-white text-neutral-700 hover:border-brand hover:bg-brand-subtle',
+                  ].join(' ')}
+                  title={
+                    m.last_used_at
+                      ? `Last used ${new Date(m.last_used_at).toLocaleDateString()}`
+                      : m.name
+                  }
+                >
+                  <span className="truncate max-w-[220px]">{m.name}</span>
+                  <span className="text-neutral-400 uppercase text-[10px] tracking-wide">
+                    {m.source_type}
+                  </span>
+                </button>
+              ))}
+            </div>
+            {hint && (
+              <p className="mt-2 text-caption text-neutral-500" role="status" aria-live="polite">
+                {hint}
+              </p>
+            )}
+          </div>
+        )}
+
         <label
+          ref={dropRef}
           htmlFor="spreadsheet-file-input"
           onDragOver={(e) => {
             e.preventDefault()

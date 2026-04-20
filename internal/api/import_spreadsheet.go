@@ -109,6 +109,8 @@ func (h *ImportSpreadsheetHandler) RegisterRoutes(protected *echo.Group) {
 		middleware.BodyLimit("10M"),
 		h.uploadRateLimit(),
 	)
+	g.GET("/mappings", h.ListMappings)
+	g.GET("/mappings/:id", h.GetMapping)
 	g.GET("/:import_id/sheet/:sheet_name", h.GetSheet)
 	g.POST("/:import_id/transform", h.Transform)
 	g.POST("/:import_id/preview", h.Preview, h.previewRateLimit())
@@ -261,6 +263,12 @@ type uploadResponse struct {
 	SavedMappings        []savedMappingResponse `json:"saved_mappings"`
 	Fingerprint          string                 `json:"fingerprint"`
 	AutoAppliedMappingID *string                `json:"auto_applied_mapping_id"`
+	// AutoAppliedConfig carries the full saved config to apply on the client,
+	// populated when either a named fingerprint match OR the implicit
+	// __last_used__ row for this household matches the uploaded sheet's
+	// fingerprint. Nil when no saved state matches — caller falls back to
+	// the heuristic `suggested` config.
+	AutoAppliedConfig *suggestedConfig `json:"auto_applied_config"`
 }
 
 // Upload handles POST /api/v1/import/spreadsheet/upload.
@@ -363,8 +371,10 @@ func (h *ImportSpreadsheetHandler) Upload(c echo.Context) error {
 	// Fingerprint: sha256(sheet_name || normalized_headers || column_count).
 	fingerprint := computeFingerprint(firstName, first.Headers)
 
-	// Saved-mapping auto-apply: look up household's mappings.
-	savedMappings, autoApplyID := h.lookupSavedMappings(c.Request().Context(), householdID, fingerprint)
+	// Saved-mapping auto-apply: look up household's mappings. Returns the
+	// visible saved list, an optional named-match id, and an optional full
+	// config (from either the named match or the silent __last_used__ row).
+	savedMappings, autoApplyID, autoConfig := h.lookupSavedMappings(c.Request().Context(), householdID, fingerprint)
 
 	now := h.now()
 	s := &spreadsheet.Staging{
@@ -393,6 +403,7 @@ func (h *ImportSpreadsheetHandler) Upload(c echo.Context) error {
 		SavedMappings:        savedMappings,
 		Fingerprint:          fingerprint,
 		AutoAppliedMappingID: autoApplyID,
+		AutoAppliedConfig:    autoConfig,
 	}
 	return c.JSON(http.StatusOK, resp)
 }
@@ -560,12 +571,17 @@ func computeFingerprint(sheetName string, headers []string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// lookupSavedMappings returns the household's saved mappings (in last-used
-// order) plus the mapping id of an auto-applied fingerprint match (or nil).
-// Errors here are non-fatal — log and return empty.
-func (h *ImportSpreadsheetHandler) lookupSavedMappings(ctx interface{}, householdID, fingerprint string) ([]savedMappingResponse, *string) {
+// lookupSavedMappings returns:
+//   - the household's visible saved mappings (user-named, last-used order),
+//   - the id of a named fingerprint match to auto-apply (or nil),
+//   - the full config to apply (from the named match if present, else from
+//     the silent __last_used__ row when its fingerprint matches, else nil).
+//
+// Errors here are non-fatal — log and return empty. A malformed config_json
+// on any row is logged and treated as no match; we never 500 the upload.
+func (h *ImportSpreadsheetHandler) lookupSavedMappings(ctx interface{}, householdID, fingerprint string) ([]savedMappingResponse, *string, *suggestedConfig) {
 	rows, err := h.DB.Query(
-		`SELECT id, name, source_fingerprint, last_used_at
+		`SELECT id, name, source_fingerprint, config_json, last_used_at
 		 FROM import_mappings
 		 WHERE household_id = ?
 		 ORDER BY COALESCE(last_used_at, created_at) DESC
@@ -574,26 +590,38 @@ func (h *ImportSpreadsheetHandler) lookupSavedMappings(ctx interface{}, househol
 	)
 	if err != nil {
 		slog.Warn("spreadsheet upload: list mappings failed", "err", err)
-		return nil, nil
+		return nil, nil, nil
 	}
 	defer rows.Close()
 
 	var out []savedMappingResponse
 	var autoApply *string
+	var autoConfig *suggestedConfig
+	// Keep the __last_used__ row's config+fingerprint aside — we only
+	// surface it if no named row matched the current fingerprint.
+	var lastUsedFP string
+	var lastUsedConfigJSON string
+	haveLastUsed := false
+
 	for rows.Next() {
 		var (
 			id, name string
 			fp       sql.NullString
+			cj       sql.NullString
 			lu       sql.NullTime
 		)
-		if err := rows.Scan(&id, &name, &fp, &lu); err != nil {
+		if err := rows.Scan(&id, &name, &fp, &cj, &lu); err != nil {
 			continue
 		}
-		// Skip the implicit per-household "last used" mapping from the
-		// user-facing list — it's restored on re-upload via
-		// LIMIT 25 + last_used_at order, but the UI should not render it
-		// as a named profile.
 		if name == lastUsedMappingName {
+			// Stash for fallback; do NOT include in user-visible list.
+			if fp.Valid {
+				lastUsedFP = fp.String
+			}
+			if cj.Valid {
+				lastUsedConfigJSON = cj.String
+			}
+			haveLastUsed = true
 			continue
 		}
 		m := savedMappingResponse{ID: id, Name: name}
@@ -601,12 +629,42 @@ func (h *ImportSpreadsheetHandler) lookupSavedMappings(ctx interface{}, househol
 			m.LastUsedAt = lu.Time.UTC().Format(time.RFC3339)
 		}
 		out = append(out, m)
+		// First named fingerprint match wins.
 		if autoApply == nil && fp.Valid && fp.String == fingerprint {
 			idCopy := id
 			autoApply = &idCopy
+			if cj.Valid {
+				if cfg, ok := decodeSavedConfig(cj.String); ok {
+					autoConfig = cfg
+				} else {
+					slog.Warn("spreadsheet upload: saved mapping has malformed config_json", "mapping_id", id)
+				}
+			}
 		}
 	}
-	return out, autoApply
+
+	// Fallback: no named match, but the implicit last-used row has the same
+	// fingerprint → silently apply its config without chip-displaying it.
+	if autoConfig == nil && haveLastUsed && lastUsedFP != "" && lastUsedFP == fingerprint && lastUsedConfigJSON != "" {
+		if cfg, ok := decodeSavedConfig(lastUsedConfigJSON); ok {
+			autoConfig = cfg
+		} else {
+			slog.Warn("spreadsheet upload: __last_used__ row has malformed config_json", "household_id", householdID)
+		}
+	}
+	return out, autoApply, autoConfig
+}
+
+// decodeSavedConfig unmarshals a stored config_json blob into a
+// suggestedConfig. The Commit handler writes config_json without a
+// `confidence` field — that's fine; the zero value is acceptable. Returns
+// ok=false on any JSON error so callers can log and skip.
+func decodeSavedConfig(raw string) (*suggestedConfig, bool) {
+	var cfg suggestedConfig
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return nil, false
+	}
+	return &cfg, true
 }
 
 // lastUsedMappingName is the sentinel name used for the per-household
@@ -1312,6 +1370,147 @@ func (h *ImportSpreadsheetHandler) upsertMapping(householdID, name, sourceType, 
 		return err
 	}
 	return tx.Commit()
+}
+
+// ---------------------------------------------------------------------------
+// List / get saved mappings.
+// ---------------------------------------------------------------------------
+
+// listMappingEntry is the row shape for GET /import/spreadsheet/mappings.
+// SourceFingerprint is included so the upload screen can pre-compute which
+// chip (if any) will auto-apply; LastUsedAt uses RFC3339 for the frontend's
+// Date constructor.
+type listMappingEntry struct {
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	SourceType        string `json:"source_type"`
+	SourceFingerprint string `json:"source_fingerprint"`
+	LastUsedAt        string `json:"last_used_at,omitempty"`
+}
+
+type listMappingsResponse struct {
+	Mappings []listMappingEntry `json:"mappings"`
+}
+
+// ListMappings handles GET /api/v1/import/spreadsheet/mappings.
+//
+// Returns the household's user-named saved mappings, ordered by most-recent
+// use. The implicit __last_used__ sentinel row is filtered out — it's for
+// silent auto-apply on re-upload, never user-visible.
+func (h *ImportSpreadsheetHandler) ListMappings(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	if householdID == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	rows, err := h.DB.Query(
+		`SELECT id, name, source_type, source_fingerprint, last_used_at
+		 FROM import_mappings
+		 WHERE household_id = ?
+		 ORDER BY COALESCE(last_used_at, created_at) DESC
+		 LIMIT 50`,
+		householdID,
+	)
+	if err != nil {
+		slog.Warn("spreadsheet list mappings: query failed", "err", err)
+		return c.JSON(http.StatusOK, listMappingsResponse{Mappings: []listMappingEntry{}})
+	}
+	defer rows.Close()
+
+	out := []listMappingEntry{}
+	for rows.Next() {
+		var (
+			id, name, sourceType string
+			fp                   sql.NullString
+			lu                   sql.NullTime
+		)
+		if err := rows.Scan(&id, &name, &sourceType, &fp, &lu); err != nil {
+			continue
+		}
+		if name == lastUsedMappingName {
+			continue
+		}
+		entry := listMappingEntry{ID: id, Name: name, SourceType: sourceType}
+		if fp.Valid {
+			entry.SourceFingerprint = fp.String
+		}
+		if lu.Valid {
+			entry.LastUsedAt = lu.Time.UTC().Format(time.RFC3339)
+		}
+		out = append(out, entry)
+	}
+	return c.JSON(http.StatusOK, listMappingsResponse{Mappings: out})
+}
+
+// getMappingResponse is the body of GET /mappings/:id — includes the full
+// config so the client can overwrite local state on chip click.
+type getMappingResponse struct {
+	ID                string          `json:"id"`
+	Name              string          `json:"name"`
+	SourceType        string          `json:"source_type"`
+	SourceFingerprint string          `json:"source_fingerprint"`
+	LastUsedAt        string          `json:"last_used_at,omitempty"`
+	Config            suggestedConfig `json:"config"`
+}
+
+// GetMapping handles GET /api/v1/import/spreadsheet/mappings/:id.
+//
+// Household-scoped: returns 404 when the id does not exist OR belongs to
+// another household. Malformed stored JSON also surfaces as 404 — the row
+// is effectively unusable from the client's perspective.
+func (h *ImportSpreadsheetHandler) GetMapping(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	if householdID == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	id := c.Param("id")
+	if id == "" {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+
+	var (
+		name, sourceType, configJSON string
+		fp                            sql.NullString
+		lu                            sql.NullTime
+	)
+	err := h.DB.QueryRow(
+		`SELECT name, source_type, source_fingerprint, config_json, last_used_at
+		 FROM import_mappings
+		 WHERE id = ? AND household_id = ?`,
+		id, householdID,
+	).Scan(&name, &sourceType, &fp, &configJSON, &lu)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	if err != nil {
+		slog.Warn("spreadsheet get mapping: query failed", "err", err, "id", id)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "query failed"})
+	}
+	// Hide the implicit __last_used__ row even when accessed by id — it's
+	// not a user-facing resource.
+	if name == lastUsedMappingName {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+
+	cfg, ok := decodeSavedConfig(configJSON)
+	if !ok {
+		slog.Warn("spreadsheet get mapping: malformed config_json", "id", id)
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+
+	resp := getMappingResponse{
+		ID:         id,
+		Name:       name,
+		SourceType: sourceType,
+		Config:     *cfg,
+	}
+	if fp.Valid {
+		resp.SourceFingerprint = fp.String
+	}
+	if lu.Valid {
+		resp.LastUsedAt = lu.Time.UTC().Format(time.RFC3339)
+	}
+	return c.JSON(http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------
