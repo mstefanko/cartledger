@@ -85,6 +85,11 @@ type Config struct {
 	// the runner prunes oldest-first down to this count. Env:
 	// BACKUP_RETAIN_COUNT. Default 5; validated positive in Load.
 	BackupRetainCount int
+	// ImportSpreadsheetEnabled gates the CSV/XLSX spreadsheet import HTTP
+	// surface. When false, the routes are NOT registered (Echo returns its
+	// default 404). Default true. Env: IMPORT_SPREADSHEET_ENABLED.
+	// See PLAN-spreadsheet-import.md §Rollout.
+	ImportSpreadsheetEnabled bool
 }
 
 // defaultDevAllowedOrigins is the default ALLOWED_ORIGINS set used in non-
@@ -180,6 +185,7 @@ func Load() (*Config, error) {
 		ImageRetentionDays:          int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
 		ImageRetentionSweepInterval: getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
 		BackupRetainCount:           int(getEnvInt64("BACKUP_RETAIN_COUNT", 5)),
+		ImportSpreadsheetEnabled:    getEnvBool("IMPORT_SPREADSHEET_ENABLED", true),
 	}
 
 	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty

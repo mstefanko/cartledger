@@ -20,6 +20,8 @@ import (
 	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
+	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/spreadsheet"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
 	"github.com/mstefanko/cartledger/web"
@@ -31,7 +33,7 @@ import (
 // that stand up a router with pre-populated users); the Setup handler then
 // rejects every call with 401, which matches the user-facing behavior of
 // "setup already completed".
-func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore) (*echo.Echo, *RateLimiter) {
+func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore, matchEngine spreadsheet.MatchEngine) (*echo.Echo, *RateLimiter) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -213,6 +215,23 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	importHandler := &ImportHandler{DB: database, Cfg: cfg, Integrations: integrationHandler.Store}
 	importHandler.RegisterRoutes(protected)
+
+	// Spreadsheet import routes gate behind IMPORT_SPREADSHEET_ENABLED.
+	// When the flag is false we simply don't register — Echo returns 404 by
+	// default, which matches plan §Rollout ("Disabling the flag hides the
+	// tab and returns 404 on the routes").
+	if cfg.ImportSpreadsheetEnabled {
+		me := matchEngine
+		if me == nil {
+			// Fallback for old call sites that don't yet pass a match
+			// engine — construct one from the DB. The real serve.go path
+			// passes the same engine the worker uses so imports and scans
+			// share stats/aliases.
+			me = matcher.NewEngine(database)
+		}
+		spreadsheetHandler := NewImportSpreadsheetHandler(database, cfg, me)
+		spreadsheetHandler.RegisterRoutes(protected)
+	}
 
 	conversionHandler := &ConversionHandler{DB: database, Cfg: cfg}
 	conversionHandler.RegisterRoutes(protected)

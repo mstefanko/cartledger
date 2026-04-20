@@ -12,13 +12,26 @@ import (
 // (on disk), every sheet's ParsedSheet (already parsed once at upload), the
 // transform chain, and a few bookkeeping timestamps. Staging is serialized
 // to staging.json alongside the raw file under one directory per import_id.
+//
+// HouseholdID scopes the staging session so an import_id created by one
+// household cannot be read or mutated by another — enforced at the HTTP
+// layer (see internal/api/import_spreadsheet.go). SourceFilename preserves
+// the uploaded file's original name for the eventual import_batches row.
+// SourceType ("csv" | "xlsx") is cached at upload so every subsequent call
+// knows whether to treat the sheet list as single-entry (CSV) or multi.
+// Fingerprint is sha256(sheet_name || normalized_headers || column_count)
+// from the first non-empty sheet, used by saved-mapping auto-apply.
 type Staging struct {
-	ImportID     string                  `json:"import_id"`
-	RawPath      string                  `json:"raw_path"`
-	Parsed       map[string]*ParsedSheet `json:"parsed"`
-	Chain        TransformChain          `json:"chain"`
-	CreatedAt    time.Time               `json:"created_at"`
-	LastActiveAt time.Time               `json:"last_active_at"`
+	ImportID       string                  `json:"import_id"`
+	HouseholdID    string                  `json:"household_id"`
+	RawPath        string                  `json:"raw_path"`
+	SourceFilename string                  `json:"source_filename"`
+	SourceType     string                  `json:"source_type"`
+	Fingerprint    string                  `json:"fingerprint"`
+	Parsed         map[string]*ParsedSheet `json:"parsed"`
+	Chain          TransformChain          `json:"chain"`
+	CreatedAt      time.Time               `json:"created_at"`
+	LastActiveAt   time.Time               `json:"last_active_at"`
 }
 
 // ApplyTransforms returns a new ParsedSheet with the chain's transforms

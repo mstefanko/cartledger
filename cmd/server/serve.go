@@ -215,7 +215,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up Echo with router, middleware, and all routes.
-	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore)
+	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore, matchEngine)
 	defer rateLimiter.Close()
 
 	// Graceful shutdown via signal.NotifyContext.
