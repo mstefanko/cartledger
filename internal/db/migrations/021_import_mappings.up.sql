@@ -46,10 +46,12 @@ CREATE TABLE not_duplicate_pairs (
 -- backfills all existing rows atomically.
 ALTER TABLE receipts ADD COLUMN source TEXT NOT NULL DEFAULT 'scan' CHECK (source IN ('scan','manual','import'));
 
--- Nullable FKs with no CASCADE: deleting a batch should not cascade-delete receipts
--- or line items (users may want to keep imported data after deleting the batch record).
-ALTER TABLE receipts ADD COLUMN import_batch_id TEXT REFERENCES import_batches(id);
-ALTER TABLE line_items ADD COLUMN import_batch_id TEXT REFERENCES import_batches(id);
+-- Nullable FKs with ON DELETE SET NULL: deleting an import_batches row must
+-- preserve the imported receipts/line_items (users may want to purge the batch
+-- record without losing the data it brought in). SET NULL gives that behavior;
+-- the default NO ACTION would block deletion once anything references the batch.
+ALTER TABLE receipts ADD COLUMN import_batch_id TEXT REFERENCES import_batches(id) ON DELETE SET NULL;
+ALTER TABLE line_items ADD COLUMN import_batch_id TEXT REFERENCES import_batches(id) ON DELETE SET NULL;
 
 CREATE INDEX idx_receipts_import_batch ON receipts(import_batch_id) WHERE import_batch_id IS NOT NULL;
 CREATE INDEX idx_line_items_import_batch ON line_items(import_batch_id) WHERE import_batch_id IS NOT NULL;

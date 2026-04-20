@@ -29,6 +29,12 @@ import (
 // packPattern detects multi-pack indicators like "12PK", "24 CT", "6 COUNT", "8 PACK".
 var packPattern = regexp.MustCompile(`(?i)\d+\s*(PK|CT|COUNT|PACK)\b`)
 
+// backfillMinConfidence is the minimum item-level LLM confidence required
+// before a suggested_brand / suggested_category can promote into a product's
+// canonical brand/category via BackfillProductMetadata. Below this, the
+// suggestion is too weak to write into user-visible data.
+const backfillMinConfidence = 0.5
+
 // ReceiptJob represents a receipt processing job submitted to the worker pool.
 type ReceiptJob struct {
 	ReceiptID   string
@@ -659,8 +665,12 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			// `AND brand IS NULL` / `AND category IS NULL` inside the helper
 			// protects user-set data from being clobbered. Errors are logged but
 			// never fatal — a failed backfill must not abort the line-item assign.
-			if err := matcher.BackfillProductMetadata(tx, *productID, item.SuggestedBrand, item.SuggestedCategory); err != nil {
-				slog.Warn("worker: matcher backfill failed", "receipt_id", job.ReceiptID, "product_id", *productID, "err", err)
+			// Gated on item.Confidence >= backfillMinConfidence so a weak LLM guess
+			// can't permanently populate canonical product metadata.
+			if item.Confidence >= backfillMinConfidence {
+				if err := matcher.BackfillProductMetadata(tx, *productID, item.SuggestedBrand, item.SuggestedCategory); err != nil {
+					slog.Warn("worker: matcher backfill failed", "receipt_id", job.ReceiptID, "product_id", *productID, "err", err)
+				}
 			}
 
 			normalized := matcher.Normalize(item.RawName)
