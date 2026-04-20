@@ -93,9 +93,12 @@ function SpreadsheetConfigure({
   const applySavedMapping = (m: SavedMapping) => {
     getMapping.mutate(m.id, {
       onSuccess: (resp) => {
-        // Preserve UI-only fields on the existing config and overwrite the
-        // server-driven ones. importRevision is intentionally preserved so
-        // the preview debounce doesn't commit against a stale chain.
+        // Replacing the mapping reshapes which rows land in which groups,
+        // so any prior skipRowIndices (index-based) or groupOverrides
+        // (group-id-based, and group ids are assigned positionally in
+        // GroupRows) refer to rows/groups that no longer exist under the
+        // new config. Reset them. importRevision is preserved so the
+        // server's stale-chain guard still matches.
         const next: ImportConfig = {
           ...config,
           sheet: resp.config.sheet || config.sheet,
@@ -104,6 +107,9 @@ function SpreadsheetConfigure({
           csvOptions: { ...resp.config.csv_options },
           unitOptions: { ...resp.config.unit_options },
           grouping: { ...resp.config.grouping },
+          skipRowIndices: [],
+          groupOverrides: {},
+          sinceDate: '',
         }
         onConfigReplace(next)
         setAppliedToast(`Applied “${resp.name}”`)

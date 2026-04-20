@@ -44,20 +44,33 @@ function ReviewPage() {
   const { data: dupesData } = useDuplicateCandidates({})
   const dupesCount = dupesData?.count ?? 0
 
-  const { data: items = [], isLoading } = useQuery({
+  const {
+    data: items = [],
+    isLoading,
+    isError: itemsError,
+  } = useQuery({
     queryKey: ['unmatched-line-items', batchId],
     queryFn: () => listUnmatchedLineItems(batchId || undefined),
+    retry: false,
   })
 
-  // Header query runs only when a batch is present. On error (e.g. 404 for a
-  // batch deleted in another tab), we still render the list — the header
-  // strip just collapses away.
-  const { data: batchHeader } = useQuery<ImportBatchHeader>({
+  // Header query runs only when a batch is present. An invalid or deleted
+  // batch yields 404 from the server; we surface that as an explicit error
+  // state instead of silently rendering "All caught up".
+  const {
+    data: batchHeader,
+    isError: batchHeaderError,
+  } = useQuery<ImportBatchHeader>({
     queryKey: ['import-batch-header', batchId],
     queryFn: () => getBatchHeader(batchId),
     enabled: batchId !== '',
     retry: false,
   })
+
+  // Invalid-batch state: we have a ?batch= param but either the header or
+  // the list came back in error. Don't fall through to the empty list —
+  // the user needs to know the link is stale.
+  const invalidBatch = batchId !== '' && (batchHeaderError || itemsError)
 
   const clearBatch = () => {
     const next = new URLSearchParams(searchParams)
@@ -101,6 +114,31 @@ function ReviewPage() {
         {header}
         {tabBar}
         <DuplicatePairsList />
+      </div>
+    )
+  }
+
+  if (invalidBatch) {
+    return (
+      <div className="py-8 max-w-2xl">
+        <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-4">
+          Review Queue
+        </h1>
+        {tabBar}
+        <div className="mt-6 rounded-2xl bg-white shadow-subtle p-5">
+          <p className="font-display text-feature font-semibold text-neutral-900 mb-1">
+            That import link isn’t available
+          </p>
+          <p className="text-body text-neutral-500 mb-3">
+            This batch may have been deleted or the link is out of date.
+          </p>
+          <button
+            onClick={clearBatch}
+            className="text-caption text-brand hover:underline"
+          >
+            Back to global review →
+          </button>
+        </div>
       </div>
     )
   }
