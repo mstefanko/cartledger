@@ -126,6 +126,19 @@ func matchByFuzzy(db *sql.DB, normalized string, storeID string, householdID str
 	}
 }
 
+// Similarity computes a normalized similarity score between 0 and 1 for two
+// strings using Levenshtein distance over the longer string's length.
+//
+// This is the exported wrapper around calculateSimilarity; both strings are
+// normalized first via Normalize so callers get the same comparison the
+// live matcher uses (lowercase, punctuation-stripped, whitespace-collapsed).
+//
+// Used by the duplicate-candidates endpoint to surface product pairs in the
+// 0.6–0.85 band without re-implementing the scoring logic.
+func Similarity(a, b string) float64 {
+	return calculateSimilarity(Normalize(a), Normalize(b))
+}
+
 // calculateSimilarity computes a similarity score between 0 and 1 based on
 // the Levenshtein distance relative to the longer string's length.
 func calculateSimilarity(a, b string) float64 {

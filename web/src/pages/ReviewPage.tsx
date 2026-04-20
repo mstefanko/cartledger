@@ -10,14 +10,39 @@ import {
 } from '@/api/review'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
+import { useDuplicateCandidates } from '@/api/products-duplicates'
+import DuplicatePairsList from '@/pages/review/DuplicatePairsList'
+
+type ReviewTab = 'items' | 'dupes'
 
 function ReviewPage() {
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
 
   // Batch-scoped review lane: /review?batch=<id>. Empty means the global
-  // lane (P1–P7 behavior, unchanged).
+  // lane (P1–P7 behavior, unchanged). Only applies to the "items" tab —
+  // duplicate candidates are catalog-wide, so the batch filter is
+  // deliberately ignored when the dupes tab is active.
   const batchId = searchParams.get('batch') ?? ''
+  const tabParam = searchParams.get('tab')
+  const activeTab: ReviewTab = tabParam === 'dupes' ? 'dupes' : 'items'
+
+  const setActiveTab = (next: ReviewTab) => {
+    const params = new URLSearchParams(searchParams)
+    if (next === 'items') {
+      params.delete('tab')
+    } else {
+      params.set('tab', next)
+    }
+    setSearchParams(params, { replace: true })
+  }
+
+  // Dupes count pill. Fetched lazily — only once the user first views the
+  // tab or we need the count for the header pill. We keep it enabled on
+  // mount so the pill is accurate; the react-query cache means this is a
+  // single request per session unless mutations invalidate it.
+  const { data: dupesData } = useDuplicateCandidates({})
+  const dupesCount = dupesData?.count ?? 0
 
   const { data: items = [], isLoading } = useQuery({
     queryKey: ['unmatched-line-items', batchId],
@@ -48,12 +73,43 @@ function ReviewPage() {
     }
   }
 
+  // Chrome (batch strip + tab bar) stays identical whether the items tab is
+  // loading, empty, or populated. Inner body swaps based on activeTab.
+  const tabBar = (
+    <ReviewTabBar
+      activeTab={activeTab}
+      onSelect={setActiveTab}
+      itemsCount={items.length}
+      dupesCount={dupesCount}
+    />
+  )
+
+  const header =
+    batchId && batchHeader && activeTab === 'items' ? (
+      <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
+    ) : (
+      <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-4">
+        Review Queue
+      </h1>
+    )
+
+  // Dupes tab ignores batch filter entirely (catalog-wide catalogue cleanup
+  // doesn't slice by import).
+  if (activeTab === 'dupes') {
+    return (
+      <div className="py-8 max-w-3xl">
+        {header}
+        {tabBar}
+        <DuplicatePairsList />
+      </div>
+    )
+  }
+
   if (isLoading) {
     return (
       <div className="py-8">
-        {batchId && batchHeader && (
-          <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
-        )}
+        {header}
+        {tabBar}
         <p className="text-body text-neutral-400">Loading…</p>
       </div>
     )
@@ -62,36 +118,30 @@ function ReviewPage() {
   if (items.length === 0) {
     return (
       <div className="py-8 max-w-2xl">
+        {header}
+        {tabBar}
         {batchId && batchHeader ? (
-          <>
-            <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
-            <div className="mt-6 rounded-2xl bg-white shadow-subtle p-5">
-              <p className="font-display text-feature font-semibold text-neutral-900 mb-1">
-                Import fully reviewed
-              </p>
-              <p className="text-body text-neutral-500 mb-3">
-                Every line item in this import has been matched or linked.
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <Link to="/analytics" className="text-caption text-brand hover:underline">
-                  View analytics →
-                </Link>
-                <button
-                  onClick={clearBatch}
-                  className="text-caption text-brand hover:underline"
-                >
-                  Back to global review →
-                </button>
-              </div>
+          <div className="mt-6 rounded-2xl bg-white shadow-subtle p-5">
+            <p className="font-display text-feature font-semibold text-neutral-900 mb-1">
+              Import fully reviewed
+            </p>
+            <p className="text-body text-neutral-500 mb-3">
+              Every line item in this import has been matched or linked.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Link to="/analytics" className="text-caption text-brand hover:underline">
+                View analytics →
+              </Link>
+              <button
+                onClick={clearBatch}
+                className="text-caption text-brand hover:underline"
+              >
+                Back to global review →
+              </button>
             </div>
-          </>
+          </div>
         ) : (
-          <>
-            <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-2">
-              Review Queue
-            </h1>
-            <p className="text-body text-neutral-400">All caught up — no unmatched line items.</p>
-          </>
+          <p className="text-body text-neutral-400">All caught up — no unmatched line items.</p>
         )}
       </div>
     )
@@ -99,13 +149,8 @@ function ReviewPage() {
 
   return (
     <div className="py-8 max-w-2xl">
-      {batchId && batchHeader ? (
-        <BatchHeaderStrip header={batchHeader} onDone={clearBatch} />
-      ) : (
-        <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-6">
-          Review Queue
-        </h1>
-      )}
+      {header}
+      {tabBar}
       <div className="space-y-4">
         {items.map((item) => (
           <ReviewCard
@@ -115,6 +160,47 @@ function ReviewPage() {
           />
         ))}
       </div>
+    </div>
+  )
+}
+
+interface ReviewTabBarProps {
+  activeTab: ReviewTab
+  onSelect: (t: ReviewTab) => void
+  itemsCount: number
+  dupesCount: number
+}
+
+// Tab bar styled to match the app's rounded-pill visual language (see
+// ImportPage). Only two lanes: line items (default) and duplicate products.
+function ReviewTabBar({ activeTab, onSelect, itemsCount, dupesCount }: ReviewTabBarProps) {
+  const tabs: { key: ReviewTab; label: string; count: number }[] = [
+    { key: 'items', label: 'Line items', count: itemsCount },
+    { key: 'dupes', label: 'Duplicate products', count: dupesCount },
+  ]
+  return (
+    <div role="tablist" className="mb-6 flex gap-1 rounded-xl bg-neutral-50 p-1 w-fit">
+      {tabs.map((t) => {
+        const isActive = t.key === activeTab
+        return (
+          <button
+            key={t.key}
+            role="tab"
+            aria-selected={isActive}
+            type="button"
+            onClick={() => onSelect(t.key)}
+            className={[
+              'rounded-lg px-3 py-1.5 text-caption font-medium transition-colors',
+              isActive
+                ? 'bg-white text-neutral-900 shadow-subtle'
+                : 'text-neutral-500 hover:text-neutral-900',
+            ].join(' ')}
+          >
+            {t.label}
+            <span className="ml-1.5 text-neutral-400">({t.count})</span>
+          </button>
+        )
+      })}
     </div>
   )
 }

@@ -108,8 +108,11 @@ func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
 // RegisterRoutes mounts product endpoints onto the protected group.
 func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products := protected.Group("/products")
-	products.POST("/merge", h.Merge)           // Must be before /:id to avoid "merge" matching as an ID.
-	products.POST("/bulk-group", h.BulkGroup) // Must be before /:id.
+	products.POST("/merge", h.Merge)                                     // Must be before /:id to avoid "merge" matching as an ID.
+	products.POST("/bulk-group", h.BulkGroup)                            // Must be before /:id.
+	products.GET("/duplicate-candidates", h.DuplicateCandidates)         // Must be before /:id.
+	products.POST("/not-duplicate-pairs", h.MarkNotDuplicate)            // Must be before /:id.
+	products.DELETE("/not-duplicate-pairs", h.UnmarkNotDuplicate)        // Must be before /:id.
 	products.GET("", h.List)
 	products.POST("", h.Create)
 	products.PUT("/:id", h.Update)
