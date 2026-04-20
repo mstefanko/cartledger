@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   getMealieStatus,
@@ -12,11 +12,68 @@ import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
 import type { ImportedRecipe, ImportedShoppingList } from '@/types'
+import SpreadsheetImportTab from './import/spreadsheet/SpreadsheetImportTab'
 
-type Tab = 'recipes' | 'lists'
+type TopTab = 'spreadsheet' | 'mealie'
+
+const TOP_TAB_LABELS: Record<TopTab, string> = {
+  spreadsheet: 'Spreadsheet',
+  mealie: 'Mealie',
+}
 
 function ImportPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('recipes')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const raw = searchParams.get('tab')
+  const activeTopTab: TopTab = raw === 'mealie' ? 'mealie' : 'spreadsheet'
+
+  function setTopTab(t: TopTab) {
+    setSearchParams({ tab: t })
+  }
+
+  return (
+    <div className="py-8">
+      <div className="max-w-5xl">
+        <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-2">
+          Import
+        </h1>
+        <p className="text-body text-neutral-500 mb-6">
+          Bring receipts and recipes into CartLedger.
+        </p>
+
+        {/* Top tab bar */}
+        <div className="flex gap-1 border-b border-neutral-200 mb-6">
+          {(Object.keys(TOP_TAB_LABELS) as TopTab[]).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setTopTab(tab)}
+              className={[
+                'px-4 py-2.5 text-caption font-medium whitespace-nowrap transition-colors -mb-px border-b-2 cursor-pointer',
+                activeTopTab === tab
+                  ? 'border-brand text-brand'
+                  : 'border-transparent text-neutral-500 hover:text-neutral-900',
+              ].join(' ')}
+            >
+              {TOP_TAB_LABELS[tab]}
+            </button>
+          ))}
+        </div>
+
+        {activeTopTab === 'spreadsheet' && <SpreadsheetImportTab />}
+        {activeTopTab === 'mealie' && <MealieTab />}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Mealie tab (pre-existing content, relocated — unchanged behavior).
+// ---------------------------------------------------------------------------
+
+type MealieSubTab = 'recipes' | 'lists'
+
+function MealieTab() {
+  const [activeTab, setActiveTab] = useState<MealieSubTab>('recipes')
   const [importResult, setImportResult] = useState<ImportedRecipe | null>(null)
   const [listResult, setListResult] = useState<ImportedShoppingList | null>(null)
 
@@ -29,15 +86,7 @@ function ImportPage() {
   const isConnected = status?.configured && status?.connected
 
   return (
-    <div className="py-8 max-w-4xl">
-      <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight mb-2">
-        Mealie Import
-      </h1>
-      <p className="text-body text-neutral-500 mb-6">
-        Import recipes and shopping lists from your Mealie instance.
-      </p>
-
-      {/* Connection Status */}
+    <div className="max-w-4xl">
       <ConnectionStatus status={status} isLoading={statusQuery.isLoading} />
 
       {!isConnected && !statusQuery.isLoading && (
@@ -57,8 +106,7 @@ function ImportPage() {
 
       {isConnected && (
         <>
-          {/* Tab Navigation */}
-          <div className="flex gap-1 mb-6 bg-neutral-50 rounded-xl p-1 w-fit">
+          <div className="flex gap-1 mt-6 mb-6 bg-neutral-50 rounded-xl p-1 w-fit">
             <button
               type="button"
               onClick={() => setActiveTab('recipes')}
@@ -85,16 +133,11 @@ function ImportPage() {
             </button>
           </div>
 
-          {activeTab === 'recipes' && (
-            <RecipesTab onImported={setImportResult} />
-          )}
-          {activeTab === 'lists' && (
-            <ListsTab onImported={setListResult} />
-          )}
+          {activeTab === 'recipes' && <RecipesTab onImported={setImportResult} />}
+          {activeTab === 'lists' && <ListsTab onImported={setListResult} />}
         </>
       )}
 
-      {/* Recipe Import Result Modal */}
       <Modal
         open={!!importResult}
         onClose={() => setImportResult(null)}
@@ -108,7 +151,6 @@ function ImportPage() {
         {importResult && <RecipeImportResult result={importResult} />}
       </Modal>
 
-      {/* List Import Result Modal */}
       <Modal
         open={!!listResult}
         onClose={() => setListResult(null)}
@@ -330,7 +372,6 @@ function RecipeImportResult({ result }: { result: ImportedRecipe }) {
 
   return (
     <div className="space-y-4">
-      {/* Total Cost */}
       {result.total_cost && (
         <div className="bg-brand-subtle rounded-xl p-4 flex items-center justify-between">
           <span className="text-body-medium font-medium text-neutral-900">Total Recipe Cost</span>
@@ -340,7 +381,6 @@ function RecipeImportResult({ result }: { result: ImportedRecipe }) {
         </div>
       )}
 
-      {/* Matched Ingredients */}
       {matched.length > 0 && (
         <div>
           <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide mb-2">
@@ -373,7 +413,6 @@ function RecipeImportResult({ result }: { result: ImportedRecipe }) {
         </div>
       )}
 
-      {/* Unmatched Ingredients */}
       {unmatched.length > 0 && (
         <div>
           <p className="text-small font-semibold text-neutral-400 uppercase tracking-wide mb-2">

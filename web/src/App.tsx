@@ -14,12 +14,12 @@ import RulesPage from '@/pages/RulesPage'
 import ListsIndexPage from '@/pages/ListsIndexPage'
 import ShoppingListPage from '@/pages/ShoppingListPage'
 import ImportPage from '@/pages/ImportPage'
+import SpreadsheetCommitResult from '@/pages/import/spreadsheet/SpreadsheetCommitResult'
 import SettingsPage from '@/pages/SettingsPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import StoreViewPage from '@/pages/StoreViewPage'
 import ProductGroupPage from '@/pages/ProductGroupPage'
 import ReviewPage from '@/pages/ReviewPage'
-import { useHasIntegrations } from '@/hooks/useHasIntegrations'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -39,26 +39,6 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
-  }
-
-  return <>{children}</>
-}
-
-function RequireIntegration({ children }: { children: ReactNode }) {
-  const { hasAny, isLoading } = useHasIntegrations()
-
-  // Render a loading state until the integrations query resolves. Without
-  // this gate, a fresh mount would briefly see hasAny=false and flash-redirect.
-  if (isLoading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-body text-neutral-400">Loading...</p>
-      </div>
-    )
-  }
-
-  if (!hasAny) {
-    return <Navigate to="/settings?tab=integrations" replace />
   }
 
   return <>{children}</>
@@ -137,14 +117,8 @@ function AppRoutes() {
         <Route path="rules" element={<RulesPage />} />
         <Route path="receipts" element={<ReceiptsPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />
-        <Route
-          path="import"
-          element={
-            <RequireIntegration>
-              <ImportPage />
-            </RequireIntegration>
-          }
-        />
+        <Route path="import" element={<ImportPage />} />
+        <Route path="import/spreadsheet/result" element={<SpreadsheetCommitResult />} />
         <Route path="conversions" element={<Navigate to="/settings?tab=conversions" replace />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="scan" element={<ScanPage />} />
