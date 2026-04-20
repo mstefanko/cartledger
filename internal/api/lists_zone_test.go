@@ -1,7 +1,15 @@
 package api
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/labstack/echo/v4"
+
+	"github.com/mstefanko/cartledger/internal/auth"
 )
 
 // TestGet_StorageZone_FallbackChain verifies that GET /api/v1/lists/:id
@@ -90,5 +98,135 @@ func TestGet_StorageZone_FallbackChain(t *testing.T) {
 		if item.StorageZone != tc.want {
 			t.Errorf("%s: StorageZone=%q, want %q", tc.name, item.StorageZone, tc.want)
 		}
+	}
+}
+
+// TestBulkAddItems_PopulatesStorageZone verifies that POST
+// /api/v1/lists/:id/items/bulk returns a bulkAddItemsResponse whose embedded
+// list.items each carry a populated StorageZone (not empty) — the frontend's
+// ListItemWithPrice TS contract requires one of
+// 'produce' | 'cold' | 'frozen' | 'other'. Covers three branches:
+//
+//	(a) product_id linked to a product with category='Produce' -> "produce"
+//	(b) product_id linked to a product with NULL category     -> "other"
+//	(c) user-typed item with product_id = nil                 -> "other"
+func TestBulkAddItems_PopulatesStorageZone(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "Weekly")
+
+	prodA := seedProduct(t, h, hh, "Apples")
+	if _, err := h.DB.Exec("UPDATE products SET category = 'Produce' WHERE id = ?", prodA); err != nil {
+		t.Fatalf("set category: %v", err)
+	}
+	prodB := seedProduct(t, h, hh, "Mystery")
+	// prodB keeps NULL category.
+
+	body := `{"items":[
+		{"name":"Apples","product_id":"` + prodA + `"},
+		{"name":"Mystery","product_id":"` + prodB + `"},
+		{"name":"HandTyped"}
+	]}`
+
+	rec := callBulkAdd(t, h, hh, listID, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp bulkAddItemsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.List.Items) != 3 {
+		t.Fatalf("list.items count: got %d want 3", len(resp.List.Items))
+	}
+
+	wants := map[string]string{
+		"Apples":    "produce",
+		"Mystery":   "other",
+		"HandTyped": "other",
+	}
+	for _, item := range resp.List.Items {
+		if item.StorageZone == "" {
+			t.Errorf("%s: StorageZone empty — violates ListItemWithPrice contract", item.Name)
+			continue
+		}
+		if want, ok := wants[item.Name]; ok && item.StorageZone != want {
+			t.Errorf("%s: StorageZone=%q, want %q", item.Name, item.StorageZone, want)
+		}
+	}
+}
+
+// TestAddItem_PopulatesStorageZone verifies that POST /api/v1/lists/:id/items
+// returns a listItemResponse with StorageZone populated (not empty) — the
+// frontend's ListItemWithPrice TS contract requires one of
+// 'produce' | 'cold' | 'frozen' | 'other'. Covers three branches:
+//
+//	(a) product_id linked to a product with category='Produce' -> "produce"
+//	(b) product_id linked to a product with NULL category     -> "other"
+//	(c) user-typed item with product_id = nil                 -> "other"
+//
+// Also covers the whitespace-only category bypass: when products.category
+// is '   ' (spaces only), the resolver must fall through to line_items and
+// ultimately land on "other" rather than returning empty string.
+func TestAddItem_PopulatesStorageZone(t *testing.T) {
+	h, cleanup := newTestListHandler(t)
+	defer cleanup()
+
+	hh := seedHousehold(t, h, "HH1")
+	listID := seedList(t, h, hh, "L")
+
+	// (a) Product with category='Produce'.
+	prodA := seedProduct(t, h, hh, "Apples")
+	if _, err := h.DB.Exec("UPDATE products SET category = 'Produce' WHERE id = ?", prodA); err != nil {
+		t.Fatalf("set category: %v", err)
+	}
+	// (b) Product with whitespace-only category — must not force empty zone.
+	prodB := seedProduct(t, h, hh, "Mystery")
+	if _, err := h.DB.Exec("UPDATE products SET category = '   ' WHERE id = ?", prodB); err != nil {
+		t.Fatalf("set whitespace category: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		body      string
+		wantZone  string
+	}{
+		{"linked produce", `{"name":"Apples","product_id":"` + prodA + `"}`, "produce"},
+		{"whitespace category", `{"name":"Mystery","product_id":"` + prodB + `"}`, "other"},
+		{"user-typed", `{"name":"HandTyped"}`, "other"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := echo.New()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/lists/"+listID+"/items", strings.NewReader(tc.body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := e.NewContext(req, rec)
+			c.Set(auth.ContextKeyHouseholdID, hh)
+			c.SetParamNames("id")
+			c.SetParamValues(listID)
+
+			if err := h.AddItem(c); err != nil {
+				t.Fatalf("AddItem err: %v", err)
+			}
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+			}
+
+			var item listItemResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if item.StorageZone == "" {
+				t.Fatalf("StorageZone is empty — violates ListItemWithPrice contract")
+			}
+			if item.StorageZone != tc.wantZone {
+				t.Errorf("StorageZone=%q, want %q", item.StorageZone, tc.wantZone)
+			}
+		})
 	}
 }

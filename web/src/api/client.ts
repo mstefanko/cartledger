@@ -42,8 +42,15 @@ export class ApiClientError extends Error {
 async function handleResponse<T>(response: Response): Promise<T> {
   if (response.status === 401) {
     // Cookie expired / missing. Send the user back to /login; the server has
-    // already cleared (or never set) our cookie.
-    window.location.href = '/login'
+    // already cleared (or never set) our cookie. Skip the redirect when the
+    // user is already on a public route — otherwise useAuth's bootstrap
+    // /profile probe hard-reloads /login on every mount, looping forever.
+    const path = window.location.pathname
+    const onPublic =
+      path === '/login' || path === '/setup' || path.startsWith('/join/')
+    if (!onPublic) {
+      window.location.href = '/login'
+    }
     throw new ApiClientError(401, 'Unauthorized')
   }
 

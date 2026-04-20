@@ -24,8 +24,10 @@ createRoot(root).render(
   </StrictMode>,
 )
 
-// Register service worker for PWA
-if ('serviceWorker' in navigator) {
+// Register service worker for PWA (prod only — in dev the `__BUILD_VERSION__`
+// placeholder in sw.js is never stamped, so the install path fires on every
+// page-load and reload-loops the app).
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker
       .register('/sw.js', { updateViaCache: 'none' })
@@ -41,5 +43,11 @@ if ('serviceWorker' in navigator) {
     if (refreshing) return
     refreshing = true
     window.location.reload()
+  })
+} else if ('serviceWorker' in navigator) {
+  // Dev: unregister any leftover SW from a prior prod-mode session, otherwise
+  // the cached SW keeps reload-looping.
+  navigator.serviceWorker.getRegistrations().then((regs) => {
+    regs.forEach((r) => r.unregister())
   })
 }

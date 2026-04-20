@@ -277,12 +277,12 @@ func (h *ListHandler) Get(c echo.Context) error {
 		        sli.product_group_id, pg.name AS product_group_name,
 		        sli.assigned_store_id, ast.name AS assigned_store_name,
 		        COALESCE(
-		          NULLIF(p.category, ''),
+		          NULLIF(TRIM(p.category), ''),
 		          (SELECT li.suggested_category
 		           FROM line_items li
 		           WHERE li.product_id = sli.product_id
 		             AND li.suggested_category IS NOT NULL
-		             AND li.suggested_category != ''
+		             AND TRIM(li.suggested_category) != ''
 		           ORDER BY li.created_at DESC LIMIT 1)
 		        ) AS resolved_category
 		 FROM shopping_list_items sli
@@ -924,6 +924,10 @@ func insertListItem(ctx context.Context, tx DBTX, householdID, listID string, re
 		return listItemResponse{}, fmt.Errorf("insert shopping_list_item: %w", err)
 	}
 
+	// Resolve storage zone for the response so it matches the GET shape.
+	// User-typed items (product_id=nil) always resolve to "other".
+	zone := resolveStorageZone(ctx, tx, req.ProductID)
+
 	return listItemResponse{
 		ID:              id,
 		ListID:          listID,
@@ -935,8 +939,35 @@ func insertListItem(ctx context.Context, tx DBTX, householdID, listID string, re
 		Checked:         false,
 		Notes:           req.Notes,
 		AssignedStoreID: assignedStoreID,
+		StorageZone:     string(zone),
 		CreatedAt:       now.Format(time.RFC3339),
 	}, nil
+}
+
+// resolveStorageZone looks up the storage zone for a single product_id.
+// Mirrors the resolver chain used in GET /lists/:id (products.category →
+// most recent line_items.suggested_category → "other"). Returns ZoneOther
+// when productID is nil/empty or when the lookup fails — the caller never
+// needs to handle an error.
+func resolveStorageZone(ctx context.Context, db DBTX, productID *string) models.StorageZone {
+	if productID == nil || *productID == "" {
+		return models.ZoneOther
+	}
+	var raw sql.NullString
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(
+		  NULLIF(TRIM(p.category), ''),
+		  (SELECT li.suggested_category FROM line_items li
+		   WHERE li.product_id = ?
+		     AND li.suggested_category IS NOT NULL
+		     AND TRIM(li.suggested_category) != ''
+		   ORDER BY li.created_at DESC LIMIT 1)
+		)
+		FROM products p WHERE p.id = ?`, *productID, *productID).Scan(&raw)
+	if err != nil {
+		return models.ZoneOther
+	}
+	return models.CategoryToZone(raw.String)
 }
 
 // AddItem adds an item to a shopping list.
@@ -1225,7 +1256,16 @@ func (h *ListHandler) loadListDetail(ctx context.Context, householdID, listID st
 		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
 		        sli.sort_order, sli.notes, sli.created_at,
 		        sli.product_group_id, pg.name AS product_group_name,
-		        sli.assigned_store_id, ast.name AS assigned_store_name
+		        sli.assigned_store_id, ast.name AS assigned_store_name,
+		        COALESCE(
+		          NULLIF(TRIM(p.category), ''),
+		          (SELECT li.suggested_category
+		           FROM line_items li
+		           WHERE li.product_id = sli.product_id
+		             AND li.suggested_category IS NOT NULL
+		             AND TRIM(li.suggested_category) != ''
+		           ORDER BY li.created_at DESC LIMIT 1)
+		        ) AS resolved_category
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
 		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
@@ -1243,14 +1283,17 @@ func (h *ListHandler) loadListDetail(ctx context.Context, householdID, listID st
 	for rows.Next() {
 		var item listItemResponse
 		var createdAt time.Time
+		var rawCategory sql.NullString
 		if err := rows.Scan(&item.ID, &item.ListID, &item.ProductID, &item.ProductName,
 			&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
 			&item.SortOrder, &item.Notes, &createdAt,
 			&item.ProductGroupID, &item.ProductGroupName,
-			&item.AssignedStoreID, &item.AssignedStoreName); err != nil {
+			&item.AssignedStoreID, &item.AssignedStoreName, &rawCategory); err != nil {
 			return resp, err
 		}
 		item.CreatedAt = createdAt.Format(time.RFC3339)
+		zone := models.CategoryToZone(rawCategory.String)
+		item.StorageZone = string(zone)
 		resp.Items = append(resp.Items, item)
 	}
 	return resp, rows.Err()
@@ -1384,12 +1427,21 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 	// Read back the updated item for response and broadcast.
 	var item listItemResponse
 	var createdAt time.Time
+	var rawCategory sql.NullString
 	err = h.DB.QueryRow(
 		`SELECT sli.id, sli.list_id, sli.product_id, p.name,
 		        sli.name, sli.quantity, sli.unit, sli.checked, sli.checked_by,
 		        sli.sort_order, sli.notes, sli.created_at,
 		        sli.product_group_id, pg.name AS product_group_name,
-		        sli.assigned_store_id, ast.name AS assigned_store_name
+		        sli.assigned_store_id, ast.name AS assigned_store_name,
+		        COALESCE(
+		          NULLIF(TRIM(p.category), ''),
+		          (SELECT li.suggested_category FROM line_items li
+		           WHERE li.product_id = sli.product_id
+		             AND li.suggested_category IS NOT NULL
+		             AND TRIM(li.suggested_category) != ''
+		           ORDER BY li.created_at DESC LIMIT 1)
+		        ) AS resolved_category
 		 FROM shopping_list_items sli
 		 LEFT JOIN products p ON sli.product_id = p.id
 		 LEFT JOIN product_groups pg ON sli.product_group_id = pg.id
@@ -1400,11 +1452,12 @@ func (h *ListHandler) UpdateItem(c echo.Context) error {
 		&item.Name, &item.Quantity, &item.Unit, &item.Checked, &item.CheckedBy,
 		&item.SortOrder, &item.Notes, &createdAt,
 		&item.ProductGroupID, &item.ProductGroupName,
-		&item.AssignedStoreID, &item.AssignedStoreName)
+		&item.AssignedStoreID, &item.AssignedStoreName, &rawCategory)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	item.CreatedAt = createdAt.Format(time.RFC3339)
+	item.StorageZone = string(models.CategoryToZone(rawCategory.String))
 
 	// Broadcast appropriate WebSocket event.
 	if isCheckUpdate {
