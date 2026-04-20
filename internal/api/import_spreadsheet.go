@@ -320,7 +320,14 @@ func (h *ImportSpreadsheetHandler) Upload(c echo.Context) error {
 	var sheetOrder []string
 	switch sourceType {
 	case "csv":
-		ps, err := spreadsheet.ParseCSV(rf, spreadsheet.DefaultCSVOptions())
+		// TSV uploads share the CSV parser but need the tab delimiter —
+		// otherwise the whole row becomes a single quoted column and the
+		// suggested mapping / preview are nonsense.
+		csvOpts := spreadsheet.DefaultCSVOptions()
+		if ext == "tsv" {
+			csvOpts.Delimiter = '\t'
+		}
+		ps, err := spreadsheet.ParseCSV(rf, csvOpts)
 		if err != nil {
 			_ = os.RemoveAll(dir)
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("parse csv: %v", err)})
@@ -351,7 +358,7 @@ func (h *ImportSpreadsheetHandler) Upload(c echo.Context) error {
 	// Build suggested config from the first non-empty sheet.
 	firstName := sheetOrder[0]
 	first := parsed[firstName]
-	suggested := h.buildSuggested(firstName, first, sourceType)
+	suggested := h.buildSuggested(firstName, first, sourceType, ext)
 
 	// Fingerprint: sha256(sheet_name || normalized_headers || column_count).
 	fingerprint := computeFingerprint(firstName, first.Headers)
@@ -476,7 +483,7 @@ func buildSheetsResponse(parsed map[string]*spreadsheet.ParsedSheet, order []str
 // both Upload and GetSheet (the latter when the user switches sheets mid-
 // session). Confidence is a rough heuristic: mapped role count / 9 (total
 // roles except Ignore), capped at 1.0.
-func (h *ImportSpreadsheetHandler) buildSuggested(name string, ps *spreadsheet.ParsedSheet, sourceType string) suggestedConfig {
+func (h *ImportSpreadsheetHandler) buildSuggested(name string, ps *spreadsheet.ParsedSheet, sourceType, ext string) suggestedConfig {
 	mapping := spreadsheet.SuggestMapping(ps)
 
 	// Infer date format from the mapped Date column's samples.
@@ -495,7 +502,7 @@ func (h *ImportSpreadsheetHandler) buildSuggested(name string, ps *spreadsheet.P
 	df := spreadsheet.DetectDateFormat(dateSamples)
 
 	csvOpts := spreadsheet.DefaultCSVOptions()
-	if sourceType == "csv" && strings.HasSuffix(strings.ToLower(ps.Name), ".tsv") {
+	if sourceType == "csv" && ext == "tsv" {
 		csvOpts.Delimiter = '\t'
 	}
 
@@ -631,9 +638,12 @@ func (h *ImportSpreadsheetHandler) GetSheet(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "sheet not found"})
 	}
 
+	// Recover the original extension from the uploaded filename so TSV
+	// suggestions carry the right delimiter.
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(s.SourceFilename), "."))
 	resp := getSheetResponse{
 		Sheet:     buildSheetsResponse(s.Parsed, []string{sheetName})[0],
-		Suggested: h.buildSuggested(sheetName, ps, s.SourceType),
+		Suggested: h.buildSuggested(sheetName, ps, s.SourceType, ext),
 	}
 	return c.JSON(http.StatusOK, resp)
 }
@@ -1056,10 +1066,18 @@ type commitRequest struct {
 }
 
 type commitResponse struct {
-	BatchID          string `json:"batch_id"`
-	ReceiptsCreated  int    `json:"receipts_created"`
-	LineItemsCreated int    `json:"line_items_created"`
-	Unmatched        int    `json:"unmatched"`
+	BatchID           string              `json:"batch_id"`
+	ReceiptsCreated   int                 `json:"receipts_created"`
+	LineItemsCreated  int                 `json:"line_items_created"`
+	Unmatched         int                 `json:"unmatched"`
+	DuplicatesSkipped int                 `json:"duplicates_skipped"`
+	Errors            []commitErrorDetail `json:"errors,omitempty"`
+}
+
+type commitErrorDetail struct {
+	GroupID string `json:"group_id"`
+	Message string `json:"message"`
+	Fatal   bool   `json:"fatal"`
 }
 
 // Commit handles POST /:import_id/commit.
@@ -1089,6 +1107,20 @@ func (h *ImportSpreadsheetHandler) Commit(c echo.Context) error {
 	ps, ok := s.Parsed[req.Sheet]
 	if !ok {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "sheet not found"})
+	}
+
+	// Guard against committing a transform chain the client never previewed.
+	// The client echoes the revision it saw in preview; if transforms have
+	// landed since (e.g. a second tab, a racing AI-normalize), refuse the
+	// commit and let the caller refetch. A stale client with revision 0 vs
+	// a chain that has advanced is the exact case we must reject, so the
+	// check compares values directly without special-casing 0.
+	if req.ImportRevision != s.Chain.Revision {
+		return c.JSON(http.StatusConflict, map[string]any{
+			"error":                   "transform chain has changed; refresh preview before committing",
+			"current_import_revision": s.Chain.Revision,
+			"client_import_revision":  req.ImportRevision,
+		})
 	}
 
 	// Replay transforms + per-request skips the same way preview does —
@@ -1223,11 +1255,17 @@ func (h *ImportSpreadsheetHandler) Commit(c echo.Context) error {
 		slog.Warn("spreadsheet commit: save last-used failed", "err", err)
 	}
 
+	errs := make([]commitErrorDetail, 0, len(result.Errors))
+	for _, e := range result.Errors {
+		errs = append(errs, commitErrorDetail{GroupID: e.GroupID, Message: e.Message, Fatal: e.Fatal})
+	}
 	return c.JSON(http.StatusOK, commitResponse{
-		BatchID:          result.BatchID,
-		ReceiptsCreated:  result.ReceiptsCreated,
-		LineItemsCreated: result.LineItemsCreated,
-		Unmatched:        result.UnmatchedLineItems,
+		BatchID:           result.BatchID,
+		ReceiptsCreated:   result.ReceiptsCreated,
+		LineItemsCreated:  result.LineItemsCreated,
+		Unmatched:         result.UnmatchedLineItems,
+		DuplicatesSkipped: result.DuplicatesSkipped,
+		Errors:            errs,
 	})
 }
 

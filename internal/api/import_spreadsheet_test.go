@@ -589,6 +589,133 @@ func TestImportSpreadsheet_FeatureFlagOff(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// Test 12: TSV upload is parsed with the tab delimiter (regression — used
+// to default to comma, collapsing every row into a single column).
+// ----------------------------------------------------------------------------
+
+const cleanTSV = "Date\tStore\tItem\tQty\tUnit\tUnit Price\tTotal\n" +
+	"2026-03-12\tWhole Foods\tOrganic whole milk\t1\tgal\t4.99\t4.99\n" +
+	"2026-03-12\tWhole Foods\tBananas\t2.3\tlb\t0.59\t1.36\n" +
+	"2026-03-13\tCostco\tEggs 18ct\t1\tea\t6.99\t6.99\n"
+
+func TestImportSpreadsheet_UploadTSVUsesTabDelimiter(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	req := buildUploadRequest(t, "grocery.tsv", []byte(cleanTSV), f.HH1)
+	rec, body := doJSON(t, f.Echo, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tsv upload: want 200 got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	sheets, _ := body["sheets"].([]any)
+	first, _ := sheets[0].(map[string]any)
+	headers, _ := first["headers"].([]any)
+	if len(headers) != 7 {
+		t.Fatalf("tsv upload parsed with wrong delimiter: want 7 header cols got %d (headers=%v)", len(headers), headers)
+	}
+	if headers[0] != "Date" || headers[2] != "Item" {
+		t.Errorf("tsv upload headers scrambled: %v", headers)
+	}
+
+	sug, _ := body["suggested"].(map[string]any)
+	csvOpts, _ := sug["csv_options"].(map[string]any)
+	// JSON encodes rune as its numeric code; '\t' == 9.
+	if d, _ := csvOpts["delimiter"].(float64); int(d) != int('\t') {
+		t.Errorf("tsv upload: suggested csv_options.delimiter = %v, want tab (9)", csvOpts["delimiter"])
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Test 13: Commit with a stale import_revision returns 409 so the client
+// can refresh preview before overwriting data it never saw.
+// ----------------------------------------------------------------------------
+
+func TestImportSpreadsheet_CommitRejectsStaleRevision(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	importID, suggested := uploadCSV(t, f, f.HH1, cleanCSV)
+
+	// Land a transform so the staging chain revision advances to 1.
+	txBody := map[string]any{"kind": "skip_row", "row_indices": []int{1}}
+	txReq := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/transform",
+		bytes.NewReader(mustJSON(txBody)))
+	txReq.Header.Set("Content-Type", "application/json")
+	txReq.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec, _ := doJSON(t, f.Echo, txReq); rec.Code != http.StatusOK {
+		t.Fatalf("transform: want 200 got %d", rec.Code)
+	}
+
+	// Commit echoes the OLD revision 0 — server must reject.
+	commitBody := previewBody(suggested)
+	commitBody["import_revision"] = 0
+	req := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(commitBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-Household-ID", f.HH1)
+	rec, body := doJSON(t, f.Echo, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stale commit: want 409 got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if cur, _ := body["current_import_revision"].(float64); int(cur) != 1 {
+		t.Errorf("stale commit: want current_import_revision=1 got %v", body["current_import_revision"])
+	}
+
+	// Fresh revision succeeds.
+	commitBody["import_revision"] = 1
+	req2 := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(commitBody)))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec2, _ := doJSON(t, f.Echo, req2); rec2.Code != http.StatusOK {
+		t.Fatalf("fresh commit: want 200 got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Test 14: Commit response surfaces duplicates_skipped (and the errors
+// field exists in the schema even when empty) so clients can report
+// partial-import outcomes.
+// ----------------------------------------------------------------------------
+
+func TestImportSpreadsheet_CommitSurfacesDuplicatesSkipped(t *testing.T) {
+	f, cleanup := newImportFixture(t)
+	defer cleanup()
+
+	// One upload, two commits on the same import_id — avoids the 1/min
+	// upload rate limiter and still exercises the duplicate-detection path
+	// because the first commit persists receipts that the second commit's
+	// CheckDuplicates will see.
+	importID, suggested := uploadCSV(t, f, f.HH1, cleanCSV)
+	body1 := previewBody(suggested)
+	req1 := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(body1)))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-Test-Household-ID", f.HH1)
+	if rec, _ := doJSON(t, f.Echo, req1); rec.Code != http.StatusOK {
+		t.Fatalf("first commit: want 200 got %d", rec.Code)
+	}
+
+	body2 := previewBody(suggested)
+	req2 := httptest.NewRequest(http.MethodPost, "/import/spreadsheet/"+importID+"/commit",
+		bytes.NewReader(mustJSON(body2)))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Test-Household-ID", f.HH1)
+	rec, body := doJSON(t, f.Echo, req2)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dup commit: want 200 got %d body=%s", rec.Code, rec.Body.String())
+	}
+	ds, _ := body["duplicates_skipped"].(float64)
+	if int(ds) < 2 {
+		t.Errorf("dup commit: want duplicates_skipped>=2 got %v (body=%v)", ds, body)
+	}
+	if rc, _ := body["receipts_created"].(float64); int(rc) != 0 {
+		t.Errorf("dup commit: want receipts_created=0 got %v", rc)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // helpers: upload + previewBody compose a commonly-repeated test shape.
 // ----------------------------------------------------------------------------
 

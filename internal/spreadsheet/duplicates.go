@@ -77,12 +77,17 @@ func CheckDuplicates(ctx context.Context, db *sql.DB, householdID string, groups
 		args = append(args, d)
 	}
 
+	// NOTE: receipt_date is DATE in schema but modernc.org/sqlite serializes
+	// time.Time via Go's default String() → "2026-03-12 00:00:00 +0000 UTC".
+	// A raw text IN-compare would never match "2026-03-12". substr(…,1,10)
+	// extracts the YYYY-MM-DD prefix so this works for both the scan worker
+	// (time.Time write) and future writes that use a clean date string.
 	query := fmt.Sprintf(
 		`SELECT r.id, r.receipt_date, r.total, s.name
 		 FROM receipts r
 		 LEFT JOIN stores s ON s.id = r.store_id
 		 WHERE r.household_id = ?
-		   AND r.receipt_date IN (%s)`,
+		   AND substr(r.receipt_date, 1, 10) IN (%s)`,
 		placeholders,
 	)
 
