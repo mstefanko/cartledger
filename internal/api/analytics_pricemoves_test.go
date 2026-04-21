@@ -1,0 +1,386 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/labstack/echo/v4"
+
+	"github.com/mstefanko/cartledger/internal/auth"
+)
+
+// callPriceMoves invokes GET /analytics/price-moves with a fixed household id.
+func callPriceMoves(t *testing.T, ah *AnalyticsHandler, householdID string) priceMovesResponse {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/analytics/price-moves", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set(auth.ContextKeyHouseholdID, householdID)
+	if err := ah.PriceMoves(c); err != nil {
+		t.Fatalf("PriceMoves error: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp priceMovesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return resp
+}
+
+// newPMHousehold creates a household + store and returns (householdID, storeID).
+func newPMHousehold(t *testing.T, ah *AnalyticsHandler, name string) (string, string) {
+	t.Helper()
+	d := ah.DB
+	var householdID string
+	if err := d.QueryRow("INSERT INTO households (name) VALUES (?) RETURNING id", name).Scan(&householdID); err != nil {
+		t.Fatalf("insert household: %v", err)
+	}
+	var storeID string
+	if err := d.QueryRow(
+		"INSERT INTO stores (household_id, name) VALUES (?, 'PMStore') RETURNING id", householdID,
+	).Scan(&storeID); err != nil {
+		t.Fatalf("insert store: %v", err)
+	}
+	return householdID, storeID
+}
+
+// insertPMProduct creates a product for price-moves tests.
+func insertPMProduct(t *testing.T, ah *AnalyticsHandler, householdID, name string) string {
+	t.Helper()
+	var productID string
+	if err := ah.DB.QueryRow(
+		"INSERT INTO products (household_id, name) VALUES (?, ?) RETURNING id",
+		householdID, name,
+	).Scan(&productID); err != nil {
+		t.Fatalf("insert product %q: %v", name, err)
+	}
+	return productID
+}
+
+// insertPMPrice inserts a product_prices row at a specific date offset with a
+// normalized_price value, using unit "each" by default.
+func insertPMPrice(t *testing.T, ah *AnalyticsHandler, householdID, storeID, productID, daysOffset, normalizedPrice, unit string) {
+	t.Helper()
+	d := ah.DB
+
+	var receiptID string
+	if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+		t.Fatalf("gen receipt id: %v", err)
+	}
+	var receiptDate string
+	if err := d.QueryRow("SELECT date('now', ?)", daysOffset).Scan(&receiptDate); err != nil {
+		t.Fatalf("compute date: %v", err)
+	}
+	if _, err := d.Exec(
+		"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
+		receiptID, householdID, storeID, receiptDate,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price)
+		 VALUES (?, ?, ?, ?, '1', ?, ?, ?)`,
+		productID, storeID, receiptID, receiptDate, unit, normalizedPrice, normalizedPrice,
+	); err != nil {
+		t.Fatalf("insert product_prices: %v", err)
+	}
+}
+
+// findPMItem returns the priceMoveItem matching productID from a slice, or nil.
+func findPMItem(items []priceMoveItem, productID string) *priceMoveItem {
+	for i := range items {
+		if items[i].ProductID == productID {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+// Case 1: price went up — 2 recent @ $2.00, 2 prior @ $1.00 → up list, pct_change=100.
+func TestPriceMoves_PriceUp(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM1")
+	productID := insertPMProduct(t, ah, householdID, "Butter")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "1.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	it := findPMItem(resp.Up, productID)
+	if it == nil {
+		t.Fatalf("expected product in Up list; Up=%v Down=%v", resp.Up, resp.Down)
+	}
+	if it.PctChange != 100.00 {
+		t.Errorf("pct_change: expected 100.00, got %f", it.PctChange)
+	}
+	if findPMItem(resp.Down, productID) != nil {
+		t.Error("product should not appear in Down list")
+	}
+}
+
+// Case 2: price went down — 2 recent @ $1.00, 2 prior @ $2.00 → down list, pct_change=-50.
+func TestPriceMoves_PriceDown(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM2")
+	productID := insertPMProduct(t, ah, householdID, "Cheese")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "2.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	it := findPMItem(resp.Down, productID)
+	if it == nil {
+		t.Fatalf("expected product in Down list; Up=%v Down=%v", resp.Up, resp.Down)
+	}
+	if it.PctChange != -50.00 {
+		t.Errorf("pct_change: expected -50.00, got %f", it.PctChange)
+	}
+	if findPMItem(resp.Up, productID) != nil {
+		t.Error("product should not appear in Up list")
+	}
+}
+
+// Case 3: no change — 2 recent @ $1.50, 2 prior @ $1.50 → excluded (pct_change=0).
+func TestPriceMoves_NoChange(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM3")
+	productID := insertPMProduct(t, ah, householdID, "Eggs")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "1.50", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "1.50", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.50", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "1.50", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("zero-change product should be excluded from both lists")
+	}
+}
+
+// Case 4: missing recent — 0 recent, 3 prior → excluded by HAVING.
+func TestPriceMoves_MissingRecent(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM4")
+	productID := insertPMProduct(t, ah, householdID, "Olive Oil")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "5.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "5.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-60 days", "5.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("no-recent product should be excluded")
+	}
+}
+
+// Case 5: missing prior — 3 recent, 0 prior → excluded by HAVING.
+func TestPriceMoves_MissingPrior(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM5")
+	productID := insertPMProduct(t, ah, householdID, "Bread")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "3.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "3.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-15 days", "3.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("no-prior product should be excluded")
+	}
+}
+
+// Case 6: prior avg = 0 — prior @ $0.00 → excluded by avg_prior > 0 guard.
+func TestPriceMoves_PriorAvgZero(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM6")
+	productID := insertPMProduct(t, ah, householdID, "Sample")
+
+	// normalized_price = 0 is filtered by WHERE normalized_price > 0, so
+	// insert a prior-window row with normalized_price NULL to force prior
+	// observation count = 0 (effectively, no valid prior data).
+	d := ah.DB
+	var receiptID string
+	if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+		t.Fatalf("gen id: %v", err)
+	}
+	var receiptDate string
+	if err := d.QueryRow("SELECT date('now', '-45 days')").Scan(&receiptDate); err != nil {
+		t.Fatalf("compute date: %v", err)
+	}
+	if _, err := d.Exec(
+		"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
+		receiptID, householdID, storeID, receiptDate,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	// Insert prior row with NULL normalized_price — WHERE clause excludes it.
+	if _, err := d.Exec(
+		`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price)
+		 VALUES (?, ?, ?, ?, '1', 'each', '0.00', NULL)`,
+		productID, storeID, receiptID, receiptDate,
+	); err != nil {
+		t.Fatalf("insert product_prices: %v", err)
+	}
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "3.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("product with null/zero prior should be excluded")
+	}
+}
+
+// Case 7: NULL normalized_price rows are excluded by WHERE clause.
+func TestPriceMoves_NullNormalizedPrice(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM7")
+	productID := insertPMProduct(t, ah, householdID, "Milk")
+
+	// Insert rows with NULL normalized_price — all should be skipped.
+	d := ah.DB
+	for _, off := range []string{"-5 days", "-40 days"} {
+		var receiptID string
+		if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+			t.Fatalf("gen id: %v", err)
+		}
+		var receiptDate string
+		if err := d.QueryRow("SELECT date('now', ?)", off).Scan(&receiptDate); err != nil {
+			t.Fatalf("compute date: %v", err)
+		}
+		if _, err := d.Exec(
+			"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
+			receiptID, householdID, storeID, receiptDate,
+		); err != nil {
+			t.Fatalf("insert receipt: %v", err)
+		}
+		if _, err := d.Exec(
+			`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price)
+			 VALUES (?, ?, ?, ?, '1', 'each', '2.00', NULL)`,
+			productID, storeID, receiptID, receiptDate,
+		); err != nil {
+			t.Fatalf("insert product_prices: %v", err)
+		}
+	}
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("null normalized_price rows should be excluded")
+	}
+}
+
+// Case 8: unit mismatch — recent unit='lb', prior unit='each' → excluded.
+func TestPriceMoves_UnitMismatch(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM8")
+	productID := insertPMProduct(t, ah, householdID, "Flour")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "lb")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("unit-mismatch product should be excluded")
+	}
+}
+
+// Case 9: unit consistent (all 'each') with valid normalized_price → INCLUDED.
+func TestPriceMoves_UnitConsistentIncluded(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM9")
+	productID := insertPMProduct(t, ah, householdID, "Yogurt")
+
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "3.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "2.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	it := findPMItem(resp.Up, productID)
+	if it == nil {
+		t.Fatalf("expected product in Up list; Up=%v Down=%v", resp.Up, resp.Down)
+	}
+	if it.PctChange != 50.00 {
+		t.Errorf("pct_change: expected 50.00, got %f", it.PctChange)
+	}
+}
+
+// Case 10: top-5 cap — 8 products all going up → only top 5 by |pct_change| returned.
+func TestPriceMoves_Top5Cap(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM10")
+
+	// Create 8 products with increasing % changes (10%, 20%, 30%, ..., 80%).
+	type entry struct {
+		id        string
+		pctChange float64
+	}
+	entries := make([]entry, 8)
+	for i := 0; i < 8; i++ {
+		pct := float64((i + 1) * 10)
+		recentPrice := 1.0 + pct/100.0 // e.g. for 10%: prior=1.00, recent=1.10
+		priorPrice := 1.0
+		productID := insertPMProduct(t, ah, householdID, "Product"+string(rune('A'+i)))
+		insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", formatFloatStr(recentPrice), "each")
+		insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", formatFloatStr(priorPrice), "each")
+		entries[i] = entry{id: productID, pctChange: pct}
+	}
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if len(resp.Up) != 5 {
+		t.Fatalf("expected 5 items in Up list, got %d", len(resp.Up))
+	}
+	// Verify the top 5 have the highest |pct_change| (i.e. 80%, 70%, 60%, 50%, 40%).
+	expectedTop5Pcts := []float64{80, 70, 60, 50, 40}
+	for i, expected := range expectedTop5Pcts {
+		if resp.Up[i].PctChange != expected {
+			t.Errorf("Up[%d].pct_change: expected %.2f, got %.2f", i, expected, resp.Up[i].PctChange)
+		}
+	}
+	// Items with 10% and 20% change should NOT appear.
+	if len(resp.Up) > 5 {
+		t.Errorf("should not have more than 5 items in Up list")
+	}
+}
+
+// formatFloatStr formats a float with 2 decimal places for SQL insertion.
+func formatFloatStr(f float64) string {
+	return fmt.Sprintf("%.2f", f)
+}

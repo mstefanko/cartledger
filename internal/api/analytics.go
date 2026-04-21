@@ -35,6 +35,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/category-breakdown", h.CategoryBreakdown)
 	analytics.GET("/savings", h.Savings)
 	analytics.GET("/staples", h.Staples)
+	analytics.GET("/price-moves", h.PriceMoves)
 }
 
 // --- Response types ---
@@ -1253,6 +1254,140 @@ FROM (
 ) ranked
 WHERE rn <= 8
 ORDER BY product_id, receipt_date ASC`
+
+// --- Price Moves types ---
+
+// priceMoveItem describes one product whose unit price has shifted between the
+// 0-30 day window (recent) and the 31-90 day window (prior).
+type priceMoveItem struct {
+	ProductID          string  `json:"product_id"`
+	Name               string  `json:"name"`
+	Avg030D            float64 `json:"avg_0_30d"`
+	Avg3090D           float64 `json:"avg_30_90d"`
+	PctChange          float64 `json:"pct_change"`
+	Unit               string  `json:"unit"`
+	ObservationsRecent int     `json:"observations_recent"`
+	ObservationsPrior  int     `json:"observations_prior"`
+}
+
+// priceMovesResponse is the JSON envelope returned by /analytics/price-moves.
+type priceMovesResponse struct {
+	Up   []priceMoveItem `json:"up"`
+	Down []priceMoveItem `json:"down"`
+}
+
+// qPriceMoves is the SQL for computing average unit price per product in two
+// rolling windows.  Date literals are embedded; only householdID is
+// parameterised.
+const qPriceMoves = `
+SELECT
+    p.id            AS product_id,
+    p.name,
+    pp.unit,
+    AVG(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) AS avg_030d,
+    AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) AS avg_3090d,
+    ROUND(
+        (AVG(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) -
+         AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END)) /
+        AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) * 100
+    , 2) AS pct_change,
+    COUNT(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN 1 END) AS observations_recent,
+    COUNT(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN 1 END) AS observations_prior
+FROM product_prices pp
+JOIN receipts r ON r.id = pp.receipt_id
+JOIN products p  ON p.id = pp.product_id
+WHERE
+    r.household_id = ?
+    AND pp.receipt_date >= DATE('now', '-90 days')
+    AND pp.receipt_date <  DATE('now', '+1 day')
+    AND pp.normalized_price IS NOT NULL
+    AND CAST(pp.normalized_price AS REAL) > 0
+GROUP BY p.id, p.name, pp.unit
+HAVING
+    COUNT(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN 1 END) >= 1
+    AND COUNT(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN 1 END) >= 1
+    AND AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) > 0
+    AND COUNT(DISTINCT CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN pp.unit END) = 1
+    AND COUNT(DISTINCT CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN pp.unit END) = 1
+    AND MAX(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN pp.unit END)
+        = MAX(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN pp.unit END)
+ORDER BY observations_recent DESC, p.id ASC`
+
+// PriceMoves returns products whose average unit price has moved materially
+// between the last 30 days (recent) and the prior 30-90 day window.
+// Results are split into "up" and "down" groups, each sorted by |pct_change|
+// descending and capped at 5 items.
+// GET /api/v1/analytics/price-moves
+func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+
+	rows, err := h.DB.QueryContext(ctx, qPriceMoves, householdID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	defer rows.Close()
+
+	all := make([]priceMoveItem, 0)
+	for rows.Next() {
+		var item priceMoveItem
+		if err := rows.Scan(
+			&item.ProductID,
+			&item.Name,
+			&item.Unit,
+			&item.Avg030D,
+			&item.Avg3090D,
+			&item.PctChange,
+			&item.ObservationsRecent,
+			&item.ObservationsPrior,
+		); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+		// Round money fields to 2 decimal places at the Go layer.
+		item.Avg030D = math.Round(item.Avg030D*100) / 100
+		item.Avg3090D = math.Round(item.Avg3090D*100) / 100
+		item.PctChange = math.Round(item.PctChange*100) / 100
+		all = append(all, item)
+	}
+	if err := rows.Err(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	up := make([]priceMoveItem, 0, 5)
+	down := make([]priceMoveItem, 0, 5)
+
+	for _, item := range all {
+		if item.PctChange > 0 {
+			up = append(up, item)
+		} else if item.PctChange < 0 {
+			down = append(down, item)
+		}
+		// pct_change == 0 is excluded (no meaningful move)
+	}
+
+	// Sort each group by |pct_change| DESC (tiebreaker is already observations_recent DESC, p.id ASC from SQL).
+	sortByAbsPct := func(s []priceMoveItem) {
+		for i := 0; i < len(s); i++ {
+			for j := i + 1; j < len(s); j++ {
+				if math.Abs(s[j].PctChange) > math.Abs(s[i].PctChange) {
+					s[i], s[j] = s[j], s[i]
+				}
+			}
+		}
+	}
+	sortByAbsPct(up)
+	sortByAbsPct(down)
+
+	// Cap at top 5.
+	if len(up) > 5 {
+		up = up[:5]
+	}
+	if len(down) > 5 {
+		down = down[:5]
+	}
+
+	return c.JSON(http.StatusOK, priceMovesResponse{Up: up, Down: down})
+}
 
 // Staples returns household staple products — items purchased on >=2 distinct
 // calendar dates with an average inter-purchase cadence <=60 days (date-based,

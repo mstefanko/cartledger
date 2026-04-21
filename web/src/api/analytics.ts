@@ -12,6 +12,7 @@ import type {
   CategoryBreakdown,
   Savings,
   Staple,
+  PriceMoves,
 } from '@/types'
 
 export async function getOverview(): Promise<AnalyticsOverview> {
@@ -71,4 +72,8 @@ export async function getSavings(): Promise<Savings> {
 export async function getStaples(): Promise<Staple[]> {
   const resp = await get<Staple[]>('/analytics/staples')
   return resp ?? []
+}
+
+export async function getPriceMoves(): Promise<PriceMoves> {
+  return get<PriceMoves>('/analytics/price-moves')
 }

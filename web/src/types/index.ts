@@ -807,6 +807,24 @@ export interface Savings {
   year_to_date: number
 }
 
+// --- Price Moves Types ---
+
+export interface PriceMove {
+  product_id: string
+  name: string
+  avg_0_30d: number
+  avg_30_90d: number
+  pct_change: number
+  unit: string
+  observations_recent: number
+  observations_prior: number
+}
+
+export interface PriceMoves {
+  up: PriceMove[]
+  down: PriceMove[]
+}
+
 // --- Staples Types ---
 
 export interface Staple {
