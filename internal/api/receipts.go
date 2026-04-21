@@ -277,6 +277,23 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 	if len(req.Items) == 0 {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "at least one item is required"})
 	}
+	// Validate receipt-level optional decimal fields.
+	if req.Subtotal != nil && *req.Subtotal != "" {
+		if _, err := decimal.NewFromString(*req.Subtotal); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "subtotal must be a decimal"})
+		}
+	}
+	if req.Tax != nil && *req.Tax != "" {
+		if _, err := decimal.NewFromString(*req.Tax); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "tax must be a decimal"})
+		}
+	}
+	if req.Total != nil && *req.Total != "" {
+		if _, err := decimal.NewFromString(*req.Total); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "total must be a decimal"})
+		}
+	}
+
 	for i, it := range req.Items {
 		if strings.TrimSpace(it.RawName) == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{
@@ -287,6 +304,20 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{
 				"error": fmt.Sprintf("items[%d].total_price must be a decimal", i),
 			})
+		}
+		if it.Quantity != nil && *it.Quantity != "" {
+			if _, err := decimal.NewFromString(*it.Quantity); err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("items[%d].quantity must be a decimal", i),
+				})
+			}
+		}
+		if it.UnitPrice != nil && *it.UnitPrice != "" {
+			if _, err := decimal.NewFromString(*it.UnitPrice); err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("items[%d].unit_price must be a decimal", i),
+				})
+			}
 		}
 	}
 
@@ -301,6 +332,25 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "store not found"})
 		} else if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db error validating store"})
+		}
+	}
+
+	// Validate each item's product_id belongs to this household if provided.
+	for i, it := range req.Items {
+		if it.ProductID != nil && *it.ProductID != "" {
+			var exists int
+			err := h.DB.QueryRow(
+				`SELECT 1 FROM products WHERE id = ? AND household_id = ?`,
+				*it.ProductID, householdID,
+			).Scan(&exists)
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.JSON(http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("items[%d].product_id not found", i),
+				})
+			} else if err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{
+					"error": "db error validating product"})
+			}
 		}
 	}
 
