@@ -979,6 +979,12 @@ ORDER BY amount DESC`
 
 // CategoryBreakdown returns category spending for the last 30 days vs prior 30 days.
 // GET /api/v1/analytics/category-breakdown
+//
+// Buckets are derived from line_items (not product_prices, so unmatched items are
+// never silently dropped):
+//   - real category name — matched item with a non-empty products.category
+//   - "Uncategorized"   — matched item whose products.category is NULL or ""
+//   - "Unmatched"       — line_items.product_id IS NULL (no product match at all)
 func (h *AnalyticsHandler) CategoryBreakdown(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 
