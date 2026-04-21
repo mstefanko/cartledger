@@ -44,6 +44,24 @@ type updateLineItemRequest struct {
 	Price     *string `json:"price"`
 }
 
+type manualLineItemRequest struct {
+	RawName    string  `json:"raw_name"`
+	ProductID  *string `json:"product_id"`  // optional: user picked from autocomplete
+	Quantity   *string `json:"quantity"`    // decimal string; defaults to "1"
+	Unit       *string `json:"unit"`
+	UnitPrice  *string `json:"unit_price"`
+	TotalPrice string  `json:"total_price"` // required
+}
+
+type manualReceiptRequest struct {
+	StoreID     *string                 `json:"store_id"`
+	ReceiptDate string                  `json:"receipt_date"` // "2006-01-02"
+	Subtotal    *string                 `json:"subtotal"`
+	Tax         *string                 `json:"tax"`
+	Total       *string                 `json:"total"`
+	Items       []manualLineItemRequest `json:"items"`
+}
+
 type receiptListItem struct {
 	ID           string  `json:"id"`
 	StoreName    *string `json:"store_name"`
@@ -113,6 +131,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts := protected.Group("/receipts")
 	// Cap multipart upload size before it is read into memory / disk.
 	receipts.POST("/scan", h.Scan, middleware.BodyLimit(uploadBodyLimit))
+	receipts.POST("/manual", h.CreateManual)
 	receipts.GET("", h.List)
 	receipts.GET("/:id", h.Get)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
@@ -236,6 +255,140 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 		"id":     receiptID,
 		"status": "pending",
 	})
+}
+
+// CreateManual handles manually-entered receipts (no image, no LLM).
+// POST /api/v1/receipts/manual
+func (h *ReceiptHandler) CreateManual(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	userID := auth.UserIDFrom(c)
+
+	var req manualReceiptRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+	}
+
+	if strings.TrimSpace(req.ReceiptDate) == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "receipt_date is required"})
+	}
+	if _, err := time.Parse("2006-01-02", req.ReceiptDate); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "receipt_date must be YYYY-MM-DD"})
+	}
+	if len(req.Items) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "at least one item is required"})
+	}
+	for i, it := range req.Items {
+		if strings.TrimSpace(it.RawName) == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("items[%d].raw_name is required", i),
+			})
+		}
+		if _, err := decimal.NewFromString(it.TotalPrice); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("items[%d].total_price must be a decimal", i),
+			})
+		}
+	}
+
+	// Validate store belongs to household if provided.
+	if req.StoreID != nil && *req.StoreID != "" {
+		var exists int
+		err := h.DB.QueryRow(
+			`SELECT 1 FROM stores WHERE id = ? AND household_id = ?`,
+			*req.StoreID, householdID,
+		).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "store not found"})
+		} else if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db error validating store"})
+		}
+	}
+
+	receiptID := uuid.New().String()
+	now := time.Now().UTC()
+
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to begin tx"})
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(c.Request().Context(), `
+		INSERT INTO receipts
+		    (id, household_id, store_id, scanned_by, receipt_date,
+		     subtotal, tax, total, status, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'matched', 'manual', ?)`,
+		receiptID, householdID, req.StoreID, userID, req.ReceiptDate,
+		req.Subtotal, req.Tax, req.Total, now,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert receipt"})
+	}
+
+	engine := matcher.NewEngine(h.DB)
+
+	for i, it := range req.Items {
+		itemID := uuid.New().String()
+		lineNum := i + 1
+
+		var productID *string
+		matched := "unmatched"
+		var confidence *float64
+		var suggestedProductID *string
+
+		if it.ProductID != nil && *it.ProductID != "" {
+			productID = it.ProductID
+			matched = "manual"
+		} else {
+			storeIDArg := ""
+			if req.StoreID != nil {
+				storeIDArg = *req.StoreID
+			}
+			result := engine.MatchWithSuggestion(it.RawName, "", storeIDArg, householdID)
+			switch result.Method {
+			case "rule", "alias", "fuzzy":
+				if result.ProductID != "" {
+					pid := result.ProductID
+					productID = &pid
+					matched = result.Method
+					conf := result.Confidence
+					confidence = &conf
+				}
+			case "suggested", "cross_store_match":
+				if result.ProductID != "" {
+					sid := result.ProductID
+					suggestedProductID = &sid
+				}
+			}
+		}
+
+		quantity := "1"
+		if it.Quantity != nil && *it.Quantity != "" {
+			quantity = *it.Quantity
+		}
+
+		_, err = tx.ExecContext(c.Request().Context(), `
+			INSERT INTO line_items
+			    (id, receipt_id, product_id, raw_name, quantity, unit,
+			     unit_price, total_price, matched, confidence, line_number,
+			     suggested_product_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			itemID, receiptID, productID, it.RawName, quantity, it.Unit,
+			it.UnitPrice, it.TotalPrice, matched, confidence, lineNum,
+			suggestedProductID, now,
+		)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": fmt.Sprintf("failed to insert item %d: %v", i, err),
+			})
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	return c.JSON(http.StatusCreated, map[string]string{"id": receiptID})
 }
 
 // Reprocess re-enqueues a failed (or still-pending) receipt so the worker
