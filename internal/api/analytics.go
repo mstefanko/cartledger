@@ -1254,11 +1254,11 @@ FROM (
 WHERE rn <= 8
 ORDER BY product_id, receipt_date ASC`
 
-// Staples returns household staple products — items with distinct_dates >= 2
-// and an average inter-purchase cadence <= 60 days. Each row carries spend
-// projections (weekly/monthly/yearly) when household history is at least
-// 60 days and the latest receipt is within 45 days; otherwise projections
-// are null.
+// Staples returns household staple products — items purchased on >=2 distinct
+// calendar dates with an average inter-purchase cadence <=60 days (date-based,
+// not unit-rate like BuyAgain). Spend projections (weekly/monthly/yearly) are
+// gated on >=60d household history + last receipt within 45 days; otherwise null.
+// Each product's sparkline carries at most 8 price points.
 // GET /api/v1/analytics/staples
 func (h *AnalyticsHandler) Staples(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
