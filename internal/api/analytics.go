@@ -1576,6 +1576,11 @@ func median(sorted []float64) float64 {
 
 // Inflation returns a Laspeyres-style personal inflation index comparing the
 // household's staple basket at current prices vs 3-month and 6-month prior windows.
+// Basket weights are fixed at current-period median quantities (Laspeyres fixed-weight
+// approach), so price changes drive the index, not quantity shifts. Symmetric exclusion
+// means a product only enters a comparison if it has observed prices in both windows of
+// the pair. The index is suppressed (both deltas nil) when history < 90/180 days or
+// basket overlap falls below 50%.
 // GET /api/v1/analytics/inflation
 func (h *AnalyticsHandler) Inflation(c echo.Context) error {
 	ctx := c.Request().Context()
