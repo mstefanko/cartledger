@@ -72,3 +72,27 @@ export async function reprocessReceipt(
     `/receipts/${encodeURIComponent(receiptId)}/reprocess`,
   )
 }
+
+export interface ManualLineItemInput {
+  raw_name: string
+  product_id?: string
+  quantity?: string
+  unit?: string
+  unit_price?: string
+  total_price: string
+}
+
+export interface CreateManualReceiptRequest {
+  store_id?: string
+  receipt_date: string
+  subtotal?: string
+  tax?: string
+  total?: string
+  items: ManualLineItemInput[]
+}
+
+export async function createManualReceipt(
+  data: CreateManualReceiptRequest,
+): Promise<{ id: string }> {
+  return post<{ id: string }>('/receipts/manual', data)
+}

@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth, AuthProvider } from '@/hooks/useAuth'
 import { AppLayout } from '@/components/layout/AppLayout'
 import LoginPage from '@/pages/LoginPage'
+import ManualReceiptPage from '@/pages/ManualReceiptPage'
 import SetupPage from '@/pages/SetupPage'
 import JoinPage from '@/pages/JoinPage'
 import DashboardPage from '@/pages/DashboardPage'
@@ -116,6 +117,7 @@ function AppRoutes() {
         <Route path="lists/:id" element={<ShoppingListPage />} />
         <Route path="rules" element={<RulesPage />} />
         <Route path="receipts" element={<ReceiptsPage />} />
+        <Route path="receipts/new" element={<ManualReceiptPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />
         <Route path="import" element={<ImportPage />} />
         <Route path="import/spreadsheet/result" element={<SpreadsheetCommitResult />} />
