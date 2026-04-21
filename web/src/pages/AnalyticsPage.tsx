@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { getTrips, getProductsWithTrends, getRhythm } from '@/api/analytics'
+import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown } from '@/api/analytics'
 import { TripCostChart } from '@/components/analytics/TripCostChart'
 import { ShoppingRhythmStrip } from '@/components/analytics/ShoppingRhythmStrip'
+import { CategoryBreakdown } from '@/components/analytics/CategoryBreakdown'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { Badge } from '@/components/ui/Badge'
 
@@ -23,6 +24,11 @@ function AnalyticsPage() {
   const { data: rhythm, isLoading: rhythmLoading } = useQuery({
     queryKey: ['analytics', 'rhythm'],
     queryFn: getRhythm,
+  })
+
+  const { data: categoryBreakdown, isLoading: categoryLoading } = useQuery({
+    queryKey: ['analytics', 'category-breakdown'],
+    queryFn: getCategoryBreakdown,
   })
 
   const filteredProducts = productsWithTrends?.filter((p) =>
@@ -62,6 +68,22 @@ function AnalyticsPage() {
           ) : (
             <TripCostChart trips={trips ?? []} />
           )}
+        </div>
+      </div>
+
+      {/* Category Spending Breakdown */}
+      <div className="mt-8">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">
+          Spending by Category
+        </h2>
+        <div className="bg-white rounded-2xl border border-neutral-200 p-4">
+          {categoryLoading ? (
+            <div className="h-48 flex items-center justify-center text-body text-neutral-400">
+              Loading categories...
+            </div>
+          ) : categoryBreakdown ? (
+            <CategoryBreakdown data={categoryBreakdown} />
+          ) : null}
         </div>
       </div>
 

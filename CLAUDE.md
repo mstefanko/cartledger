@@ -68,6 +68,11 @@ go test ./...     # Run Go tests (no frontend tests)
 - **Error handling** — return `fmt.Errorf("context: %w", err)`, Echo handlers return `echo.NewHTTPError`
 - **Frontend API calls** — in `web/src/api/`, consumed via TanStack Query hooks
 
+## Analytics conventions
+
+- Date windows for analytics endpoints are computed in Go (`time.Now().AddDate(...)`), never via SQLite `date('now',...)`.
+- Rolling-30-day convention: `/analytics/rhythm` (and similar time-window endpoints) uses `[now-60d, now-30d)` as the prior window and `[now-30d, now)` as the current window for period-over-period comparisons.
+
 ## Gotchas
 
 - `web/dist/` is gitignored — frontend is built separately, not embedded in Go binary

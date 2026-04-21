@@ -9,6 +9,7 @@ import type {
   Deal,
   BuyAgainItem,
   Rhythm,
+  CategoryBreakdown,
 } from '@/types'
 
 export async function getOverview(): Promise<AnalyticsOverview> {
@@ -56,3 +57,7 @@ export const fetchProductTrend = (productId: string) =>
 
 export const fetchGroupTrend = (groupId: string) =>
   get<ProductTrendResponse>(`/analytics/product-groups/${encodeURIComponent(groupId)}/trend`)
+
+export async function getCategoryBreakdown(): Promise<CategoryBreakdown> {
+  return get<CategoryBreakdown>('/analytics/category-breakdown')
+}
