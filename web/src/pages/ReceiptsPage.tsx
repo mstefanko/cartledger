@@ -101,9 +101,14 @@ function ReceiptsPage() {
         <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
           Receipts
         </h1>
-        <NavLink to="/scan">
-          <Button size="sm">Scan Receipt</Button>
-        </NavLink>
+        <div className="flex items-center gap-2">
+          <NavLink to="/receipts/new">
+            <Button size="sm" variant="outlined">New receipt</Button>
+          </NavLink>
+          <NavLink to="/scan">
+            <Button size="sm">Scan Receipt</Button>
+          </NavLink>
+        </div>
       </div>
 
       {retryError && (
