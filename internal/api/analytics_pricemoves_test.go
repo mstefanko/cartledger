@@ -102,7 +102,7 @@ func findPMItem(items []priceMoveItem, productID string) *priceMoveItem {
 	return nil
 }
 
-// Case 1: price went up — 2 recent @ $2.00, 2 prior @ $1.00 → up list, pct_change=100.
+// Case 1: price went up — 3 recent @ $2.00, 3 prior @ $1.00 → up list, pct_change=100.
 func TestPriceMoves_PriceUp(t *testing.T) {
 	ah, cleanup := newAnalyticsHandler(t)
 	defer cleanup()
@@ -112,8 +112,10 @@ func TestPriceMoves_PriceUp(t *testing.T) {
 
 	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-15 days", "2.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-60 days", "1.00", "each")
 
 	resp := callPriceMoves(t, ah, householdID)
 
@@ -129,7 +131,7 @@ func TestPriceMoves_PriceUp(t *testing.T) {
 	}
 }
 
-// Case 2: price went down — 2 recent @ $1.00, 2 prior @ $2.00 → down list, pct_change=-50.
+// Case 2: price went down — 3 recent @ $1.00, 3 prior @ $2.00 → down list, pct_change=-50.
 func TestPriceMoves_PriceDown(t *testing.T) {
 	ah, cleanup := newAnalyticsHandler(t)
 	defer cleanup()
@@ -139,8 +141,10 @@ func TestPriceMoves_PriceDown(t *testing.T) {
 
 	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "1.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-15 days", "1.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "2.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-60 days", "2.00", "each")
 
 	resp := callPriceMoves(t, ah, householdID)
 
@@ -156,7 +160,7 @@ func TestPriceMoves_PriceDown(t *testing.T) {
 	}
 }
 
-// Case 3: no change — 2 recent @ $1.50, 2 prior @ $1.50 → excluded (pct_change=0).
+// Case 3: no change — 3 recent @ $1.50, 3 prior @ $1.50 → excluded (pct_change=0).
 func TestPriceMoves_NoChange(t *testing.T) {
 	ah, cleanup := newAnalyticsHandler(t)
 	defer cleanup()
@@ -166,8 +170,10 @@ func TestPriceMoves_NoChange(t *testing.T) {
 
 	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "1.50", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "1.50", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-15 days", "1.50", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.50", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "1.50", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-60 days", "1.50", "each")
 
 	resp := callPriceMoves(t, ah, householdID)
 
@@ -308,7 +314,11 @@ func TestPriceMoves_UnitMismatch(t *testing.T) {
 	productID := insertPMProduct(t, ah, householdID, "Flour")
 
 	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "lb")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "2.00", "lb")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-15 days", "2.00", "lb")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-60 days", "1.00", "each")
 
 	resp := callPriceMoves(t, ah, householdID)
 
@@ -326,7 +336,11 @@ func TestPriceMoves_UnitConsistentIncluded(t *testing.T) {
 	productID := insertPMProduct(t, ah, householdID, "Yogurt")
 
 	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "3.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-10 days", "3.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-15 days", "3.00", "each")
 	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-50 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-60 days", "2.00", "each")
 
 	resp := callPriceMoves(t, ah, householdID)
 
@@ -357,8 +371,13 @@ func TestPriceMoves_Top5Cap(t *testing.T) {
 		recentPrice := 1.0 + pct/100.0 // e.g. for 10%: prior=1.00, recent=1.10
 		priorPrice := 1.0
 		productID := insertPMProduct(t, ah, householdID, "Product"+string(rune('A'+i)))
+		// 3 recent rows on distinct dates, 3 prior rows on distinct dates
 		insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", formatFloatStr(recentPrice), "each")
+		insertPMPrice(t, ah, householdID, storeID, productID, "-6 days", formatFloatStr(recentPrice), "each")
+		insertPMPrice(t, ah, householdID, storeID, productID, "-7 days", formatFloatStr(recentPrice), "each")
 		insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", formatFloatStr(priorPrice), "each")
+		insertPMPrice(t, ah, householdID, storeID, productID, "-41 days", formatFloatStr(priorPrice), "each")
+		insertPMPrice(t, ah, householdID, storeID, productID, "-42 days", formatFloatStr(priorPrice), "each")
 		entries[i] = entry{id: productID, pctChange: pct}
 	}
 
@@ -383,4 +402,105 @@ func TestPriceMoves_Top5Cap(t *testing.T) {
 // formatFloatStr formats a float with 2 decimal places for SQL insertion.
 func formatFloatStr(f float64) string {
 	return fmt.Sprintf("%.2f", f)
+}
+
+// TestPriceMoves_ErrorStatusExcluded — receipt with status='error' should be excluded
+// even when it has 3+ product_prices rows with consistent unit and normalized_price.
+func TestPriceMoves_ErrorStatusExcluded(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PMErr")
+	productID := insertPMProduct(t, ah, householdID, "ErrorProduct")
+
+	d := ah.DB
+	// Insert 6 receipts with status='error', 3 recent and 3 prior, each on distinct dates.
+	type rowSpec struct {
+		offset string
+		price  string
+	}
+	specs := []rowSpec{
+		{"-5 days", "2.00"}, {"-6 days", "2.00"}, {"-7 days", "2.00"},
+		{"-40 days", "1.00"}, {"-41 days", "1.00"}, {"-42 days", "1.00"},
+	}
+	for _, s := range specs {
+		var receiptID string
+		if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+			t.Fatalf("gen receipt id: %v", err)
+		}
+		var receiptDate string
+		if err := d.QueryRow("SELECT date('now', ?)", s.offset).Scan(&receiptDate); err != nil {
+			t.Fatalf("compute date: %v", err)
+		}
+		if _, err := d.Exec(
+			"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'error')",
+			receiptID, householdID, storeID, receiptDate,
+		); err != nil {
+			t.Fatalf("insert receipt: %v", err)
+		}
+		if _, err := d.Exec(
+			`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price)
+			 VALUES (?, ?, ?, ?, '1', 'each', ?, ?)`,
+			productID, storeID, receiptID, receiptDate, s.price, s.price,
+		); err != nil {
+			t.Fatalf("insert product_prices: %v", err)
+		}
+	}
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("product from error-status receipts should be excluded from both lists")
+	}
+}
+
+// TestPriceMoves_NonProductExcluded — product with is_non_product=1 should be excluded
+// even with 3+ rows across both windows.
+func TestPriceMoves_NonProductExcluded(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PMNonProd")
+	// Insert a product with is_non_product=1.
+	var productID string
+	if err := ah.DB.QueryRow(
+		"INSERT INTO products (household_id, name, is_non_product) VALUES (?, 'Tax', 1) RETURNING id",
+		householdID,
+	).Scan(&productID); err != nil {
+		t.Fatalf("insert non-product: %v", err)
+	}
+
+	// 3 recent and 3 prior rows on distinct dates.
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-6 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-7 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-42 days", "1.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("is_non_product=1 product should be excluded from both lists")
+	}
+}
+
+// TestPriceMoves_TwoDistinctDatesExcluded — product with only 2 distinct receipt dates
+// (both in the 90-day window) should be excluded by the HAVING >= 3 distinct dates guard.
+func TestPriceMoves_TwoDistinctDatesExcluded(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PM2Dates")
+	productID := insertPMProduct(t, ah, householdID, "TwoDates")
+
+	// Only 2 distinct dates: one recent, one prior.
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("product with only 2 distinct receipt dates should be excluded")
+	}
 }

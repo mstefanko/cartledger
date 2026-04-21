@@ -1277,46 +1277,55 @@ type priceMovesResponse struct {
 }
 
 // qPriceMoves is the SQL for computing average unit price per product in two
-// rolling windows.  Date literals are embedded; only householdID is
-// parameterised.
+// rolling windows. All date boundaries are passed as ? parameters — plan
+// Invariant: date windows are computed in Go (time.Now().UTC()), never via
+// SQLite DATE('now', ...). WHERE adds r.status IN ('pending','matched','reviewed')
+// and p.is_non_product = 0 per plan Invariants 3 and 5. HAVING requires
+// COUNT(DISTINCT DATE(receipt_date)) >= 3 for a meaningful price trajectory.
+// Parameter order: cutoff30 (x7 SELECT), householdID, cutoff90, today,
+// cutoff30 (x7 HAVING).
 const qPriceMoves = `
 SELECT
     p.id            AS product_id,
     p.name,
     pp.unit,
-    AVG(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) AS avg_030d,
-    AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) AS avg_3090d,
+    AVG(CASE WHEN pp.receipt_date >= ? THEN CAST(pp.normalized_price AS REAL) END) AS avg_030d,
+    AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END) AS avg_3090d,
     ROUND(
-        (AVG(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) -
-         AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END)) /
-        AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) * 100
+        (AVG(CASE WHEN pp.receipt_date >= ? THEN CAST(pp.normalized_price AS REAL) END) -
+         AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END)) /
+        AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END) * 100
     , 2) AS pct_change,
-    COUNT(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN 1 END) AS observations_recent,
-    COUNT(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN 1 END) AS observations_prior
+    COUNT(CASE WHEN pp.receipt_date >= ? THEN 1 END) AS observations_recent,
+    COUNT(CASE WHEN pp.receipt_date <  ? THEN 1 END) AS observations_prior
 FROM product_prices pp
 JOIN receipts r ON r.id = pp.receipt_id
 JOIN products p  ON p.id = pp.product_id
 WHERE
     r.household_id = ?
-    AND pp.receipt_date >= DATE('now', '-90 days')
-    AND pp.receipt_date <  DATE('now', '+1 day')
+    AND pp.receipt_date >= ?
+    AND pp.receipt_date <  ?
     AND pp.normalized_price IS NOT NULL
     AND CAST(pp.normalized_price AS REAL) > 0
+    AND r.status IN ('pending', 'matched', 'reviewed')
+    AND p.is_non_product = 0
 GROUP BY p.id, p.name, pp.unit
 HAVING
-    COUNT(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN 1 END) >= 1
-    AND COUNT(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN 1 END) >= 1
-    AND AVG(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN CAST(pp.normalized_price AS REAL) END) > 0
-    AND COUNT(DISTINCT CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN pp.unit END) = 1
-    AND COUNT(DISTINCT CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN pp.unit END) = 1
-    AND MAX(CASE WHEN pp.receipt_date >= DATE('now', '-30 days') THEN pp.unit END)
-        = MAX(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN pp.unit END)
+    COUNT(DISTINCT DATE(pp.receipt_date)) >= 3
+    AND COUNT(CASE WHEN pp.receipt_date >= ? THEN 1 END) >= 1
+    AND COUNT(CASE WHEN pp.receipt_date <  ? THEN 1 END) >= 1
+    AND AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END) > 0
+    AND COUNT(DISTINCT CASE WHEN pp.receipt_date >= ? THEN pp.unit END) = 1
+    AND COUNT(DISTINCT CASE WHEN pp.receipt_date <  ? THEN pp.unit END) = 1
+    AND MAX(CASE WHEN pp.receipt_date >= ? THEN pp.unit END)
+        = MAX(CASE WHEN pp.receipt_date <  ? THEN pp.unit END)
 ORDER BY observations_recent DESC, p.id ASC`
 
 // PriceMoves returns products whose normalized unit price has shifted by >=10%
 // between the last 30 days (recent window) and the 31–90 day window (prior).
 // Only products whose unit is identical across both windows are compared, ensuring
 // apples-to-apples price comparison (e.g. "$/lb" vs "$/ea" are never mixed).
+// Requires >=3 distinct dates in the 90-day window for signal confidence.
 // Results are split into "up" and "down" slices, each sorted by |pct_change|
 // descending and capped at 5 items per direction.
 // GET /api/v1/analytics/price-moves
@@ -1324,7 +1333,16 @@ func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 
-	rows, err := h.DB.QueryContext(ctx, qPriceMoves, householdID)
+	now := time.Now().UTC()
+	today := now.AddDate(0, 0, 1).Format("2006-01-02")
+	cutoff30 := now.AddDate(0, 0, -30).Format("2006-01-02")
+	cutoff90 := now.AddDate(0, 0, -90).Format("2006-01-02")
+
+	rows, err := h.DB.QueryContext(ctx, qPriceMoves,
+		cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30,
+		householdID, cutoff90, today,
+		cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30,
+	)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 	}
