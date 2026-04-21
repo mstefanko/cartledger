@@ -11,6 +11,7 @@ import type {
   Rhythm,
   CategoryBreakdown,
   Savings,
+  Staple,
 } from '@/types'
 
 export async function getOverview(): Promise<AnalyticsOverview> {
@@ -65,4 +66,9 @@ export async function getCategoryBreakdown(): Promise<CategoryBreakdown> {
 
 export async function getSavings(): Promise<Savings> {
   return get<Savings>('/analytics/savings')
+}
+
+export async function getStaples(): Promise<Staple[]> {
+  const resp = await get<Staple[]>('/analytics/staples')
+  return resp ?? []
 }

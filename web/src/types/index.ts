@@ -806,3 +806,19 @@ export interface Savings {
   last_30d: number
   year_to_date: number
 }
+
+// --- Staples Types ---
+
+export interface Staple {
+  product_id: string
+  name: string
+  category: string
+  times_bought: number
+  cadence_days: number
+  total_spent: number
+  avg_price: number
+  weekly_spend: number | null
+  monthly_spend: number | null
+  yearly_projection: number | null
+  sparkline_points: number[]
+}

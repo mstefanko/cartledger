@@ -34,6 +34,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/product-groups/:id/trend", h.GroupTrend)
 	analytics.GET("/category-breakdown", h.CategoryBreakdown)
 	analytics.GET("/savings", h.Savings)
+	analytics.GET("/staples", h.Staples)
 }
 
 // --- Response types ---
@@ -1153,3 +1154,196 @@ WHERE r.household_id = ?
   AND r.status IN ('pending', 'matched', 'reviewed')
   AND r.receipt_date >= ?
   AND r.receipt_date < ?`
+
+// --- Staples types ---
+
+// stapleItem is a single product row in the /analytics/staples response.
+// Projection fields (weekly/monthly/yearly) are nullable to signal "not
+// enough history" or "stale data" — handler sets them to nil when the
+// household-wide span is under 60 days or the latest receipt is older
+// than 45 days.
+type stapleItem struct {
+	ProductID        string    `json:"product_id"`
+	Name             string    `json:"name"`
+	Category         string    `json:"category"`
+	TimesBought      int       `json:"times_bought"`
+	CadenceDays      float64   `json:"cadence_days"`
+	TotalSpent       float64   `json:"total_spent"`
+	AvgPrice         float64   `json:"avg_price"`
+	WeeklySpend      *float64  `json:"weekly_spend"`
+	MonthlySpend     *float64  `json:"monthly_spend"`
+	YearlyProjection *float64  `json:"yearly_projection"`
+	SparklinePoints  []float64 `json:"sparkline_points"`
+}
+
+// qStaplesList is the main staples CTE. Rules:
+//   - times_bought uses COUNT(DISTINCT pp.receipt_id) — invariant 2 (a single
+//     product split across multiple line items on one receipt counts once).
+//   - distinct_dates uses COUNT(DISTINCT date(pp.receipt_date)) — invariant 1
+//     (guards against same-day re-scans inflating the denominator).
+//   - Cadence must be <=60d (calendar-event cadence; Staples does NOT use
+//     Buy-Again's AVG(days_gap)/AVG(quantity) unit-rate formula).
+//   - total_spent = SUM(unit_price * quantity) — avoids NULL normalized_price
+//     on spreadsheet imports.
+//   - Sort: times_bought DESC, total_spent DESC, product_id ASC (deterministic
+//     tiebreak so tests and pagination are stable).
+//
+// Placeholder: householdID.
+const qStaplesList = `
+WITH per_product AS (
+  SELECT
+    pp.product_id,
+    COUNT(DISTINCT pp.receipt_id)                                        AS times_bought,
+    COUNT(DISTINCT date(pp.receipt_date))                                AS distinct_dates,
+    julianday(MAX(pp.receipt_date)) - julianday(MIN(pp.receipt_date))    AS span_days,
+    SUM(CAST(pp.unit_price AS REAL) * CAST(pp.quantity AS REAL))         AS total_spent
+  FROM product_prices pp
+  JOIN products p ON p.id = pp.product_id
+  JOIN receipts r ON r.id = pp.receipt_id
+  WHERE p.household_id = ?
+    AND p.is_non_product = 0
+    AND r.status IN ('pending', 'matched', 'reviewed')
+  GROUP BY pp.product_id
+  HAVING distinct_dates >= 2
+     AND (span_days / (distinct_dates - 1)) <= 60
+)
+SELECT
+  pp.product_id,
+  p.name,
+  COALESCE(p.category, '')                           AS category,
+  pp.times_bought,
+  CAST(pp.span_days AS REAL) / (pp.distinct_dates - 1) AS cadence_days,
+  pp.total_spent,
+  pp.span_days
+FROM per_product pp
+JOIN products p ON p.id = pp.product_id
+ORDER BY pp.times_bought DESC, pp.total_spent DESC, pp.product_id ASC`
+
+// qStaplesSpan returns the household-wide receipt span and staleness in a
+// single scalar query. Placeholders: today (YYYY-MM-DD), householdID.
+const qStaplesSpan = `
+SELECT
+  COALESCE(julianday(MAX(r.receipt_date)) - julianday(MIN(r.receipt_date)), 0)   AS household_span_days,
+  COALESCE(julianday(?) - julianday(MAX(r.receipt_date)), 999999)                AS days_since_last_receipt
+FROM receipts r
+WHERE r.household_id = ?
+  AND r.status IN ('pending', 'matched', 'reviewed')`
+
+// qStaplesSparkline batches sparkline points for every household product.
+// We drop the per_product filter from SQL (it would require dynamic placeholder
+// juggling) and instead filter in Go via a product_id -> staple map.
+// Placeholder: householdID. Returns ASC-by-date rows of the last 8 purchases
+// per product.
+const qStaplesSparkline = `
+SELECT product_id, unit_price, receipt_date
+FROM (
+  SELECT pp.product_id,
+         CAST(pp.unit_price AS REAL) AS unit_price,
+         pp.receipt_date,
+         ROW_NUMBER() OVER (
+           PARTITION BY pp.product_id
+           ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC
+         ) AS rn
+  FROM product_prices pp
+  JOIN products p ON p.id = pp.product_id
+  JOIN receipts r ON r.id = pp.receipt_id
+  WHERE p.household_id = ?
+    AND p.is_non_product = 0
+    AND r.status IN ('pending', 'matched', 'reviewed')
+) ranked
+WHERE rn <= 8
+ORDER BY product_id, receipt_date ASC`
+
+// Staples returns household staple products — items with distinct_dates >= 2
+// and an average inter-purchase cadence <= 60 days. Each row carries spend
+// projections (weekly/monthly/yearly) when household history is at least
+// 60 days and the latest receipt is within 45 days; otherwise projections
+// are null.
+// GET /api/v1/analytics/staples
+func (h *AnalyticsHandler) Staples(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	// Single UTC "now" reused across all queries and projections.
+	now := time.Now().UTC()
+	today := now.Format("2006-01-02")
+
+	// --- SQL-B: household span + staleness ---
+	var householdSpanDays, daysSinceLast float64
+	if err := h.DB.QueryRow(qStaplesSpan, today, householdID).Scan(&householdSpanDays, &daysSinceLast); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	projectionsValid := householdSpanDays >= 60 && daysSinceLast < 45
+
+	// --- SQL-A: main staples list ---
+	rows, err := h.DB.Query(qStaplesList, householdID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	defer rows.Close()
+
+	staples := make([]stapleItem, 0)
+	idx := make(map[string]int) // product_id -> index in staples
+
+	for rows.Next() {
+		var it stapleItem
+		var spanDays float64
+		if err := rows.Scan(&it.ProductID, &it.Name, &it.Category,
+			&it.TimesBought, &it.CadenceDays, &it.TotalSpent, &spanDays); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+
+		// Rounding at JSON boundary.
+		it.CadenceDays = math.Round(it.CadenceDays*10) / 10
+		it.TotalSpent = math.Round(it.TotalSpent*100) / 100
+		if it.TimesBought > 0 {
+			it.AvgPrice = math.Round((it.TotalSpent/float64(it.TimesBought))*100) / 100
+		}
+
+		// Per-product projection gate: also require spanDays > 0 to avoid
+		// divide-by-zero (a product with all purchases on the same day would
+		// already be excluded by distinct_dates >= 2, but belt-and-suspenders).
+		if projectionsValid && spanDays > 0 {
+			weekly := it.TotalSpent / (spanDays / 7.0)
+			monthly := weekly * 4.345
+			yearly := monthly * 12
+			w := math.Round(weekly*100) / 100
+			m := math.Round(monthly*100) / 100
+			y := math.Round(yearly*100) / 100
+			it.WeeklySpend = &w
+			it.MonthlySpend = &m
+			it.YearlyProjection = &y
+		}
+
+		it.SparklinePoints = make([]float64, 0, 8)
+		idx[it.ProductID] = len(staples)
+		staples = append(staples, it)
+	}
+	if err := rows.Err(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	// --- SQL-C: sparkline batch (only groups products that made the list) ---
+	if len(staples) > 0 {
+		sparkRows, err := h.DB.Query(qStaplesSparkline, householdID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+		defer sparkRows.Close()
+		for sparkRows.Next() {
+			var productID string
+			var unitPrice float64
+			var receiptDate time.Time
+			if err := sparkRows.Scan(&productID, &unitPrice, &receiptDate); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+			}
+			if i, ok := idx[productID]; ok {
+				staples[i].SparklinePoints = append(staples[i].SparklinePoints, math.Round(unitPrice*100)/100)
+			}
+		}
+		if err := sparkRows.Err(); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+	}
+
+	return c.JSON(http.StatusOK, staples)
+}

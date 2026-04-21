@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown, getSavings } from '@/api/analytics'
+import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown, getSavings, getStaples } from '@/api/analytics'
 import { TripCostChart } from '@/components/analytics/TripCostChart'
 import { ShoppingRhythmStrip } from '@/components/analytics/ShoppingRhythmStrip'
 import { CategoryBreakdown } from '@/components/analytics/CategoryBreakdown'
 import SavingsCard from '@/components/analytics/SavingsCard'
+import { StaplesTable } from '@/components/analytics/StaplesTable'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { Badge } from '@/components/ui/Badge'
 
@@ -35,6 +36,11 @@ function AnalyticsPage() {
   const { data: savings, isLoading: savingsLoading } = useQuery({
     queryKey: ['analytics', 'savings'],
     queryFn: getSavings,
+  })
+
+  const { data: staples, isLoading: staplesLoading } = useQuery({
+    queryKey: ['analytics', 'staples'],
+    queryFn: getStaples,
   })
 
   const filteredProducts = productsWithTrends?.filter((p) =>
@@ -73,6 +79,20 @@ function AnalyticsPage() {
         ) : savings ? (
           <SavingsCard data={savings} />
         ) : null}
+      </div>
+
+      {/* Staples */}
+      <div className="mt-8">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">
+          Staples
+        </h2>
+        {staplesLoading ? (
+          <div className="h-32 flex items-center justify-center text-body text-neutral-400 bg-white rounded-2xl border border-neutral-200">
+            Loading staples...
+          </div>
+        ) : (
+          <StaplesTable staples={staples ?? []} />
+        )}
       </div>
 
       {/* Trip Cost Chart */}
