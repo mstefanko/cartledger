@@ -30,6 +30,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/trips", h.Trips)
 	analytics.GET("/deals", h.Deals)
 	analytics.GET("/buy-again", h.BuyAgain)
+	analytics.GET("/rhythm", h.Rhythm)
 	analytics.GET("/product-groups/:id/trend", h.GroupTrend)
 }
 
@@ -42,6 +43,25 @@ type overviewResponse struct {
 	TripCount      int     `json:"trip_count"`
 	AvgTripCost    float64 `json:"avg_trip_cost"`
 	UniqueProducts int     `json:"unique_products_purchased"`
+}
+
+type rhythmTrips struct {
+	Current  int      `json:"current"`
+	Prior    int      `json:"prior"`
+	DeltaPct *float64 `json:"delta_pct"`
+}
+
+type rhythmBasket struct {
+	Current float64 `json:"current"`
+	Prior   float64 `json:"prior"`
+}
+
+type rhythmResponse struct {
+	Trips           rhythmTrips  `json:"trips"`
+	AvgBasket       rhythmBasket `json:"avg_basket"`
+	AvgItemsPerTrip float64      `json:"avg_items_per_trip"`
+	MostShoppedDOW  *string      `json:"most_shopped_dow"`
+	HistoryDays     int          `json:"history_days"`
 }
 
 type pricePoint struct {
@@ -780,4 +800,142 @@ func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, items)
+}
+
+// Rhythm returns shopping cadence stats for the authenticated household.
+// GET /api/v1/analytics/rhythm
+func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	// All date boundaries computed in Go; never use SQLite date('now',...).
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	cur := now.AddDate(0, 0, -30).Format("2006-01-02")
+	prev := now.AddDate(0, 0, -60).Format("2006-01-02")
+
+	var resp rhythmResponse
+
+	// --- trips current window ---
+	const qTrips = `
+		SELECT COUNT(*)
+		FROM receipts r
+		WHERE r.household_id = ?
+		  AND r.receipt_date >= ?
+		  AND r.receipt_date <  ?
+		  AND r.status IN ('pending','matched','reviewed')`
+
+	if err := h.DB.QueryRow(qTrips, householdID, cur, today).Scan(&resp.Trips.Current); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	// --- trips prior window ---
+	if err := h.DB.QueryRow(qTrips, householdID, prev, cur).Scan(&resp.Trips.Prior); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	if resp.Trips.Prior > 0 {
+		d := ((float64(resp.Trips.Current) - float64(resp.Trips.Prior)) / float64(resp.Trips.Prior)) * 100
+		resp.Trips.DeltaPct = &d
+	}
+
+	// --- avg basket ---
+	const qBasket = `
+		SELECT COALESCE(AVG(CAST(r.total AS REAL)), 0)
+		FROM receipts r
+		WHERE r.household_id = ?
+		  AND r.receipt_date >= ?
+		  AND r.receipt_date <  ?
+		  AND r.status IN ('pending','matched','reviewed')`
+
+	if err := h.DB.QueryRow(qBasket, householdID, cur, today).Scan(&resp.AvgBasket.Current); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	if err := h.DB.QueryRow(qBasket, householdID, prev, cur).Scan(&resp.AvgBasket.Prior); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	resp.AvgBasket.Current = math.Round(resp.AvgBasket.Current*100) / 100
+	resp.AvgBasket.Prior = math.Round(resp.AvgBasket.Prior*100) / 100
+
+	// --- avg items per trip (current window) ---
+	if err := h.DB.QueryRow(`
+		SELECT COALESCE(CAST(COUNT(li.id) AS REAL) / NULLIF(COUNT(DISTINCT r.id), 0), 0)
+		FROM receipts r
+		LEFT JOIN line_items li ON li.receipt_id = r.id
+		WHERE r.household_id = ?
+		  AND r.receipt_date >= ?
+		  AND r.receipt_date <  ?
+		  AND r.status IN ('pending','matched','reviewed')`,
+		householdID, cur, today,
+	).Scan(&resp.AvgItemsPerTrip); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	resp.AvgItemsPerTrip = math.Round(resp.AvgItemsPerTrip*10) / 10
+
+	// --- history days (all-time span) ---
+	if err := h.DB.QueryRow(`
+		SELECT CAST(julianday(?) - julianday(MIN(r.receipt_date)) AS INTEGER)
+		FROM receipts r
+		WHERE r.household_id = ?
+		  AND r.status IN ('pending','matched','reviewed')`,
+		today, householdID,
+	).Scan(&resp.HistoryDays); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	// --- most-shopped DOW (all-time; only when >= 14 days of history) ---
+	if resp.HistoryDays >= 14 {
+		rows, err := h.DB.Query(`
+			SELECT strftime('%w', r.receipt_date) AS dow, COUNT(*) AS cnt
+			FROM receipts r
+			WHERE r.household_id = ?
+			  AND r.status IN ('pending','matched','reviewed')
+			GROUP BY dow
+			ORDER BY cnt DESC, dow ASC
+			LIMIT 2`,
+			householdID,
+		)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+		defer rows.Close()
+
+		type dowRow struct {
+			dow string
+			cnt int
+		}
+		var top []dowRow
+		for rows.Next() {
+			var r dowRow
+			if err := rows.Scan(&r.dow, &r.cnt); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+			}
+			top = append(top, r)
+		}
+		if err := rows.Err(); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+
+		dowNames := []string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+
+		switch len(top) {
+		case 1:
+			idx, _ := strconv.Atoi(top[0].dow)
+			s := dowNames[idx]
+			resp.MostShoppedDOW = &s
+		case 2:
+			if top[0].cnt == top[1].cnt {
+				// Exact two-way tie — return "Day1/Day2" (ORDER BY dow ASC gives lower index first)
+				idx0, _ := strconv.Atoi(top[0].dow)
+				idx1, _ := strconv.Atoi(top[1].dow)
+				s := dowNames[idx0] + "/" + dowNames[idx1]
+				resp.MostShoppedDOW = &s
+			} else {
+				idx, _ := strconv.Atoi(top[0].dow)
+				s := dowNames[idx]
+				resp.MostShoppedDOW = &s
+			}
+		}
+	}
+
+	return c.JSON(http.StatusOK, resp)
 }

@@ -8,6 +8,7 @@ import type {
   Trip,
   Deal,
   BuyAgainItem,
+  Rhythm,
 } from '@/types'
 
 export async function getOverview(): Promise<AnalyticsOverview> {
@@ -44,6 +45,10 @@ export async function getDeals(): Promise<Deal[]> {
 
 export async function getBuyAgain(): Promise<BuyAgainItem[]> {
   return get<BuyAgainItem[]>('/analytics/buy-again')
+}
+
+export async function getRhythm(): Promise<Rhythm> {
+  return get<Rhythm>('/analytics/rhythm')
 }
 
 export const fetchProductTrend = (productId: string) =>
