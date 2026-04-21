@@ -23,7 +23,7 @@ export default function ManualReceiptPage() {
 
   const [storeId, setStoreId] = useState<string>('')
   const [receiptDate, setReceiptDate] = useState<string>(
-    new Date().toISOString().slice(0, 10),
+    new Date().toLocaleDateString('en-CA'),
   )
   const [subtotal, setSubtotal] = useState('')
   const [tax, setTax] = useState('')
