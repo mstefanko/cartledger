@@ -1,13 +1,14 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown, getSavings, getStaples, getPriceMoves } from '@/api/analytics'
+import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown, getSavings, getStaples, getPriceMoves, getInflation } from '@/api/analytics'
 import { TripCostChart } from '@/components/analytics/TripCostChart'
 import { ShoppingRhythmStrip } from '@/components/analytics/ShoppingRhythmStrip'
 import { CategoryBreakdown } from '@/components/analytics/CategoryBreakdown'
 import SavingsCard from '@/components/analytics/SavingsCard'
 import { StaplesTable } from '@/components/analytics/StaplesTable'
 import { PriceMoves } from '@/components/analytics/PriceMoves'
+import InflationCard from '@/components/analytics/InflationCard'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { Badge } from '@/components/ui/Badge'
 
@@ -47,6 +48,11 @@ function AnalyticsPage() {
   const { data: priceMoves, isLoading: priceMovesLoading } = useQuery({
     queryKey: ['analytics', 'price-moves'],
     queryFn: getPriceMoves,
+  })
+
+  const { data: inflation, isLoading: inflationLoading } = useQuery({
+    queryKey: ['analytics', 'inflation'],
+    queryFn: getInflation,
   })
 
   const filteredProducts = productsWithTrends?.filter((p) =>
@@ -112,6 +118,20 @@ function AnalyticsPage() {
           </div>
         ) : (
           <PriceMoves data={priceMoves} />
+        )}
+      </div>
+
+      {/* Personal Inflation Index */}
+      <div className="mt-8">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">
+          Personal Inflation Index
+        </h2>
+        {inflationLoading ? (
+          <div className="h-32 flex items-center justify-center text-body text-neutral-400 bg-white rounded-2xl border border-neutral-200">
+            Loading inflation index...
+          </div>
+        ) : (
+          <InflationCard data={inflation} />
         )}
       </div>
 

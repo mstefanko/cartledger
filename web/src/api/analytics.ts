@@ -13,6 +13,7 @@ import type {
   Savings,
   Staple,
   PriceMoves,
+  InflationIndex,
 } from '@/types'
 
 export async function getOverview(): Promise<AnalyticsOverview> {
@@ -76,4 +77,8 @@ export async function getStaples(): Promise<Staple[]> {
 
 export async function getPriceMoves(): Promise<PriceMoves> {
   return get<PriceMoves>('/analytics/price-moves')
+}
+
+export async function getInflation(): Promise<InflationIndex> {
+  return get<InflationIndex>('/analytics/inflation')
 }

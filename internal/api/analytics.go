@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -36,6 +37,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/savings", h.Savings)
 	analytics.GET("/staples", h.Staples)
 	analytics.GET("/price-moves", h.PriceMoves)
+	analytics.GET("/inflation", h.Inflation)
 }
 
 // --- Response types ---
@@ -1501,4 +1503,288 @@ func (h *AnalyticsHandler) Staples(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, staples)
+}
+
+// --- Inflation types ---
+
+// inflationResponse is the JSON shape for GET /analytics/inflation.
+// Change3moPct and Change6moPct are nil when there is insufficient history or
+// basket overlap. Suppressed=true (with a reason) when BOTH are nil.
+//
+// The index is Laspeyres-style: I(W) = Σ_p qty_p × avg_price_p(W), where
+// qty_p is the per-product quantity median computed from the last 90 days of
+// purchases (falling back to all-time when < 2 observations in the 90-day
+// window). Symmetric exclusion ensures a product only contributes to a
+// comparison if it has observations in BOTH windows of the pair.
+type inflationResponse struct {
+	Change3moPct      *float64 `json:"change_3mo_pct"`
+	Change6moPct      *float64 `json:"change_6mo_pct"`
+	BasketSize        int      `json:"basket_size"`
+	Suppressed        bool     `json:"suppressed"`
+	SuppressionReason *string  `json:"suppression_reason"`
+}
+
+// inflationObs is a single price/quantity observation row from SQL-C.
+type inflationObs struct {
+	productID string
+	price     float64
+	qty       float64
+	date      time.Time
+}
+
+// qInflationSpan returns household receipt span (days) and receipt count.
+// Placeholders: householdID.
+const qInflationSpan = `
+SELECT
+  COALESCE(julianday(MAX(r.receipt_date)) - julianday(MIN(r.receipt_date)), 0) AS span_days,
+  COUNT(*)                                                                       AS receipt_count
+FROM receipts r
+WHERE r.household_id = ?
+  AND r.status IN ('pending', 'matched', 'reviewed')`
+
+// qInflationPrices fetches price + qty for all basket products over the last
+// 210 days. Buckets are computed in Go.
+// Placeholders: householdID, cutoff210 (YYYY-MM-DD), tomorrow (YYYY-MM-DD).
+const qInflationPrices = `
+SELECT
+  pp.product_id,
+  pp.receipt_date,
+  COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) AS price,
+  CAST(pp.quantity AS REAL)                                                 AS qty
+FROM product_prices pp
+JOIN products p ON p.id = pp.product_id
+JOIN receipts r ON r.id = pp.receipt_id
+WHERE p.household_id = ?
+  AND p.is_non_product = 0
+  AND r.status IN ('pending', 'matched', 'reviewed')
+  AND pp.receipt_date >= ?
+  AND pp.receipt_date < ?
+ORDER BY pp.product_id, pp.receipt_date ASC`
+
+// median returns the median of a sorted (ascending) float64 slice.
+// Caller must sort before calling. Returns 0 for empty slice.
+func median(sorted []float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
+}
+
+// Inflation returns a Laspeyres-style personal inflation index comparing the
+// household's staple basket at current prices vs 3-month and 6-month prior windows.
+// GET /api/v1/analytics/inflation
+func (h *AnalyticsHandler) Inflation(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+
+	now := time.Now().UTC()
+	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
+	cutoff30 := now.AddDate(0, 0, -30).Format("2006-01-02")
+	cutoff90 := now.AddDate(0, 0, -90).Format("2006-01-02")
+	cutoff120 := now.AddDate(0, 0, -120).Format("2006-01-02")
+	cutoff180 := now.AddDate(0, 0, -180).Format("2006-01-02")
+	cutoff210 := now.AddDate(0, 0, -210).Format("2006-01-02")
+
+	suppressed := func(reason string) error {
+		r := reason
+		return c.JSON(http.StatusOK, inflationResponse{
+			BasketSize:        0,
+			Suppressed:        true,
+			SuppressionReason: &r,
+		})
+	}
+
+	// --- SQL-A: basket via qStaplesList ---
+	basketRows, err := h.DB.QueryContext(ctx, qStaplesList, householdID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	defer basketRows.Close()
+
+	basketSet := make(map[string]struct{})
+	for basketRows.Next() {
+		var productID, name, category string
+		var timesBought int
+		var cadenceDays, totalSpent, spanDays float64
+		if err := basketRows.Scan(&productID, &name, &category, &timesBought, &cadenceDays, &totalSpent, &spanDays); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+		basketSet[productID] = struct{}{}
+	}
+	if err := basketRows.Err(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	basketSize := len(basketSet)
+
+	// --- SQL-B: household span + receipt count ---
+	var spanDays float64
+	var receiptCount int
+	if err := h.DB.QueryRowContext(ctx, qInflationSpan, householdID).Scan(&spanDays, &receiptCount); err != nil && err != sql.ErrNoRows {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	if basketSize == 0 || receiptCount == 0 {
+		return suppressed("Not enough overlap yet.")
+	}
+
+	// --- SQL-C: batched price+qty fetch over last 210d for basket products ---
+	priceRows, err := h.DB.QueryContext(ctx, qInflationPrices, householdID, cutoff210, tomorrow)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	defer priceRows.Close()
+
+	// Group observations by product_id; filter to basket.
+	type productData struct {
+		obs []inflationObs
+	}
+	byProduct := make(map[string]*productData)
+	for id := range basketSet {
+		byProduct[id] = &productData{}
+	}
+
+	for priceRows.Next() {
+		var o inflationObs
+		var receiptDate string
+		if err := priceRows.Scan(&o.productID, &receiptDate, &o.price, &o.qty); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+		}
+		t, err := time.Parse("2006-01-02", receiptDate)
+		if err != nil {
+			// Try full timestamp format as fallback.
+			t, err = time.Parse("2006-01-02T15:04:05Z", receiptDate)
+			if err != nil {
+				continue
+			}
+		}
+		o.date = t
+		if pd, ok := byProduct[o.productID]; ok {
+			pd.obs = append(pd.obs, o)
+		}
+	}
+	if err := priceRows.Err(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	// Parse window boundaries as time.Time for comparison.
+	cutoff30T, _ := time.Parse("2006-01-02", cutoff30)
+	cutoff90T, _ := time.Parse("2006-01-02", cutoff90)
+	cutoff120T, _ := time.Parse("2006-01-02", cutoff120)
+	cutoff180T, _ := time.Parse("2006-01-02", cutoff180)
+	cutoff210T, _ := time.Parse("2006-01-02", cutoff210)
+	tomorrowT, _ := time.Parse("2006-01-02", tomorrow)
+
+	// For each product, compute:
+	//   qty_p  — median quantity from Q_90d [now-90, now); fallback to all-time if < 2 obs.
+	//   avg price in W_current [now-30, now), W_3mo [now-120, now-90), W_6mo [now-210, now-180).
+	type productStats struct {
+		qty      float64
+		avgCur   *float64 // W_current avg price
+		avg3mo   *float64 // W_3mo avg price
+		avg6mo   *float64 // W_6mo avg price
+	}
+
+	avgOf := func(obs []inflationObs, from, to time.Time) *float64 {
+		var sum float64
+		var n int
+		for _, o := range obs {
+			if !o.date.Before(from) && o.date.Before(to) {
+				sum += o.price
+				n++
+			}
+		}
+		if n == 0 {
+			return nil
+		}
+		v := sum / float64(n)
+		return &v
+	}
+
+	stats := make(map[string]productStats, basketSize)
+	for id, pd := range byProduct {
+		// Compute qty_p from Q_90d: [cutoff90, tomorrow)
+		var qtyQ90 []float64
+		for _, o := range pd.obs {
+			if !o.date.Before(cutoff90T) && o.date.Before(tomorrowT) {
+				qtyQ90 = append(qtyQ90, o.qty)
+			}
+		}
+		var qtySrc []float64
+		if len(qtyQ90) >= 2 {
+			qtySrc = qtyQ90
+		} else {
+			// Fallback to all-time (all rows in SQL-C 210d window).
+			for _, o := range pd.obs {
+				qtySrc = append(qtySrc, o.qty)
+			}
+		}
+		if len(qtySrc) == 0 {
+			continue // skip products with zero observations
+		}
+		sort.Float64s(qtySrc)
+		qtyP := median(qtySrc)
+
+		avgCur := avgOf(pd.obs, cutoff30T, tomorrowT)
+		avg3mo := avgOf(pd.obs, cutoff120T, cutoff90T)
+		avg6mo := avgOf(pd.obs, cutoff210T, cutoff180T)
+
+		stats[id] = productStats{qty: qtyP, avgCur: avgCur, avg3mo: avg3mo, avg6mo: avg6mo}
+	}
+
+	// Compute Laspeyres index for 3-month comparison (W_current vs W_3mo).
+	var iCur3, i3mo float64
+	var overlap3 int
+	for _, s := range stats {
+		if s.avgCur == nil || s.avg3mo == nil {
+			continue
+		}
+		iCur3 += s.qty * (*s.avgCur)
+		i3mo += s.qty * (*s.avg3mo)
+		overlap3++
+	}
+
+	// Compute Laspeyres index for 6-month comparison (W_current vs W_6mo).
+	var iCur6, i6mo float64
+	var overlap6 int
+	for _, s := range stats {
+		if s.avgCur == nil || s.avg6mo == nil {
+			continue
+		}
+		iCur6 += s.qty * (*s.avgCur)
+		i6mo += s.qty * (*s.avg6mo)
+		overlap6++
+	}
+
+	// Apply suppression gates.
+	var change3mo *float64
+	var change6mo *float64
+
+	if spanDays >= 90 && float64(overlap3)/float64(basketSize) >= 0.5 && i3mo > 0 {
+		v := math.Round((iCur3/i3mo-1)*100*100) / 100
+		change3mo = &v
+	}
+	if spanDays >= 180 && float64(overlap6)/float64(basketSize) >= 0.5 && i6mo > 0 {
+		v := math.Round((iCur6/i6mo-1)*100*100) / 100
+		change6mo = &v
+	}
+
+	isSuppressed := change3mo == nil && change6mo == nil
+	var suppressionReason *string
+	if isSuppressed {
+		r := "Not enough overlap yet."
+		suppressionReason = &r
+	}
+
+	return c.JSON(http.StatusOK, inflationResponse{
+		Change3moPct:      change3mo,
+		Change6moPct:      change6mo,
+		BasketSize:        basketSize,
+		Suppressed:        isSuppressed,
+		SuppressionReason: suppressionReason,
+	})
 }

@@ -840,3 +840,13 @@ export interface Staple {
   yearly_projection: number | null
   sparkline_points: number[]
 }
+
+// --- Inflation Index Types ---
+
+export interface InflationIndex {
+  change_3mo_pct: number | null
+  change_6mo_pct: number | null
+  basket_size: number
+  suppressed: boolean
+  suppression_reason: string | null
+}
