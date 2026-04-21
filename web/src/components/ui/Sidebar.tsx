@@ -13,6 +13,7 @@ import {
   Store,
   ScanLine,
   Plus,
+  PencilLine,
   ClipboardCheck,
   type LucideProps,
 } from 'lucide-react'
@@ -240,8 +241,8 @@ function Sidebar({ open, onClose }: SidebarProps) {
         </div>
       </div>
 
-      {/* Scan Receipt button */}
-      <div className="p-3 border-t border-neutral-200">
+      {/* Scan Receipt button + New receipt secondary link */}
+      <div className="p-3 border-t border-neutral-200 flex flex-col gap-2">
         <NavLink
           to="/scan"
           className="flex items-center justify-center gap-2 w-full px-4 py-3 bg-brand text-white font-medium rounded-xl hover:bg-brand-dark transition-colors"
@@ -249,6 +250,21 @@ function Sidebar({ open, onClose }: SidebarProps) {
         >
           <ScanLine size={ICON_SIZE} aria-hidden="true" />
           Scan Receipt
+        </NavLink>
+        <NavLink
+          to="/receipts/new"
+          className={({ isActive }) =>
+            [
+              'flex items-center justify-center gap-2 w-full px-4 py-2 rounded-xl text-caption font-medium transition-colors',
+              isActive
+                ? 'bg-neutral-100 text-neutral-900'
+                : 'text-neutral-700 hover:bg-neutral-100',
+            ].join(' ')
+          }
+          onClick={onClose}
+        >
+          <PencilLine size={ICON_SIZE} aria-hidden="true" />
+          New receipt
         </NavLink>
       </div>
 
