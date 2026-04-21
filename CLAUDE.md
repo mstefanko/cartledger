@@ -72,6 +72,7 @@ go test ./...     # Run Go tests (no frontend tests)
 
 - Date windows for analytics endpoints are computed in Go (`time.Now().AddDate(...)`), never via SQLite `date('now',...)`.
 - Rolling-30-day convention: `/analytics/rhythm` (and similar time-window endpoints) uses `[now-60d, now-30d)` as the prior window and `[now-30d, now)` as the current window for period-over-period comparisons.
+- `discount_amount` is stored as a positive value in `line_items` — do NOT negate when summing (e.g., `/analytics/savings`).
 
 ## Gotchas
 

@@ -1098,7 +1098,9 @@ func (h *AnalyticsHandler) CategoryBreakdown(c echo.Context) error {
 }
 
 // Savings returns total discount_amount across three time windows: month-to-date,
-// last 30 days, and year-to-date.
+// last 30 days, and year-to-date. All windows use `tomorrow` as the exclusive upper
+// bound (to include today's receipts). discount_amount is stored positive and summed
+// without negation.
 // GET /api/v1/analytics/savings
 func (h *AnalyticsHandler) Savings(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
