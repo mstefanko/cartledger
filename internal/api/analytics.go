@@ -1313,10 +1313,12 @@ HAVING
         = MAX(CASE WHEN pp.receipt_date <  DATE('now', '-30 days') THEN pp.unit END)
 ORDER BY observations_recent DESC, p.id ASC`
 
-// PriceMoves returns products whose average unit price has moved materially
-// between the last 30 days (recent) and the prior 30-90 day window.
-// Results are split into "up" and "down" groups, each sorted by |pct_change|
-// descending and capped at 5 items.
+// PriceMoves returns products whose normalized unit price has shifted by >=10%
+// between the last 30 days (recent window) and the 31–90 day window (prior).
+// Only products whose unit is identical across both windows are compared, ensuring
+// apples-to-apples price comparison (e.g. "$/lb" vs "$/ea" are never mixed).
+// Results are split into "up" and "down" slices, each sorted by |pct_change|
+// descending and capped at 5 items per direction.
 // GET /api/v1/analytics/price-moves
 func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
 	ctx := c.Request().Context()
