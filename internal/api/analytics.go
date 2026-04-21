@@ -808,7 +808,7 @@ func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 
 	// All date boundaries computed in Go; never use SQLite date('now',...).
-	now := time.Now()
+	now := time.Now().UTC()
 	today := now.Format("2006-01-02")
 	cur := now.AddDate(0, 0, -30).Format("2006-01-02")
 	prev := now.AddDate(0, 0, -60).Format("2006-01-02")
