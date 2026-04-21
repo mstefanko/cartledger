@@ -1,10 +1,11 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown } from '@/api/analytics'
+import { getTrips, getProductsWithTrends, getRhythm, getCategoryBreakdown, getSavings } from '@/api/analytics'
 import { TripCostChart } from '@/components/analytics/TripCostChart'
 import { ShoppingRhythmStrip } from '@/components/analytics/ShoppingRhythmStrip'
 import { CategoryBreakdown } from '@/components/analytics/CategoryBreakdown'
+import SavingsCard from '@/components/analytics/SavingsCard'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { Badge } from '@/components/ui/Badge'
 
@@ -31,6 +32,11 @@ function AnalyticsPage() {
     queryFn: getCategoryBreakdown,
   })
 
+  const { data: savings, isLoading: savingsLoading } = useQuery({
+    queryKey: ['analytics', 'savings'],
+    queryFn: getSavings,
+  })
+
   const filteredProducts = productsWithTrends?.filter((p) =>
     p.name.toLowerCase().includes(productSearch.toLowerCase())
   ) ?? []
@@ -53,6 +59,20 @@ function AnalyticsPage() {
         ) : (
           rhythm && <ShoppingRhythmStrip data={rhythm} />
         )}
+      </div>
+
+      {/* Savings Card */}
+      <div className="mt-8">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">
+          Savings
+        </h2>
+        {savingsLoading ? (
+          <div className="h-32 flex items-center justify-center text-body text-neutral-400 bg-white rounded-2xl border border-neutral-200">
+            Loading savings...
+          </div>
+        ) : savings ? (
+          <SavingsCard data={savings} />
+        ) : null}
       </div>
 
       {/* Trip Cost Chart */}

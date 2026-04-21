@@ -33,6 +33,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/rhythm", h.Rhythm)
 	analytics.GET("/product-groups/:id/trend", h.GroupTrend)
 	analytics.GET("/category-breakdown", h.CategoryBreakdown)
+	analytics.GET("/savings", h.Savings)
 }
 
 // --- Response types ---
@@ -44,6 +45,12 @@ type overviewResponse struct {
 	TripCount      int     `json:"trip_count"`
 	AvgTripCost    float64 `json:"avg_trip_cost"`
 	UniqueProducts int     `json:"unique_products_purchased"`
+}
+
+type savingsResponse struct {
+	MonthToDate float64 `json:"month_to_date"`
+	Last30D     float64 `json:"last_30d"`
+	YearToDate  float64 `json:"year_to_date"`
 }
 
 type rhythmTrips struct {
@@ -1089,3 +1096,58 @@ func (h *AnalyticsHandler) CategoryBreakdown(c echo.Context) error {
 		Categories: categories,
 	})
 }
+
+// Savings returns total discount_amount across three time windows: month-to-date,
+// last 30 days, and year-to-date.
+// GET /api/v1/analytics/savings
+func (h *AnalyticsHandler) Savings(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	now := time.Now().UTC()
+	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	last30Start := now.AddDate(0, 0, -30).Format("2006-01-02")
+
+	// runQuery executes the savings query for [start, end) and returns the total.
+	runQuery := func(start, end string) (float64, error) {
+		var amount float64
+		err := h.DB.QueryRow(qSavings, householdID, start, end).Scan(&amount)
+		if err != nil {
+			return 0, fmt.Errorf("savings query: %w", err)
+		}
+		return math.Round(amount*100) / 100, nil
+	}
+
+	monthToDate, err := runQuery(monthStart, tomorrow)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	last30D, err := runQuery(last30Start, tomorrow)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	yearToDate, err := runQuery(yearStart, tomorrow)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	return c.JSON(http.StatusOK, savingsResponse{
+		MonthToDate: monthToDate,
+		Last30D:     last30D,
+		YearToDate:  yearToDate,
+	})
+}
+
+// qSavings is the SQL for querying total discounts in a date window.
+// Placeholders: householdID, start (inclusive), end (exclusive).
+const qSavings = `
+SELECT COALESCE(SUM(CAST(li.discount_amount AS REAL)), 0)
+FROM line_items li
+JOIN receipts r ON r.id = li.receipt_id
+WHERE r.household_id = ?
+  AND r.status IN ('pending', 'matched', 'reviewed')
+  AND r.receipt_date >= ?
+  AND r.receipt_date < ?`

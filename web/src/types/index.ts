@@ -800,3 +800,9 @@ export interface CategoryBreakdown {
   total: number
   categories: CategoryBucket[]
 }
+
+export interface Savings {
+  month_to_date: number
+  last_30d: number
+  year_to_date: number
+}

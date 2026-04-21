@@ -10,6 +10,7 @@ import type {
   BuyAgainItem,
   Rhythm,
   CategoryBreakdown,
+  Savings,
 } from '@/types'
 
 export async function getOverview(): Promise<AnalyticsOverview> {
@@ -60,4 +61,8 @@ export const fetchGroupTrend = (groupId: string) =>
 
 export async function getCategoryBreakdown(): Promise<CategoryBreakdown> {
   return get<CategoryBreakdown>('/analytics/category-breakdown')
+}
+
+export async function getSavings(): Promise<Savings> {
+  return get<Savings>('/analytics/savings')
 }
