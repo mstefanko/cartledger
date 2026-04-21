@@ -756,6 +756,25 @@ export interface PricePoint {
   is_sale: boolean
 }
 
+export interface RhythmTrips {
+  current: number
+  prior: number
+  delta_pct: number | null
+}
+
+export interface RhythmBasket {
+  current: number
+  prior: number
+}
+
+export interface Rhythm {
+  trips: RhythmTrips
+  avg_basket: RhythmBasket
+  avg_items_per_trip: number
+  most_shopped_dow: string | null
+  history_days: number
+}
+
 export interface ProductTrendResponse {
   price_history: PricePoint[]
   percent_change: number

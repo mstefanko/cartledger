@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { getTrips, getProductsWithTrends } from '@/api/analytics'
+import { getTrips, getProductsWithTrends, getRhythm } from '@/api/analytics'
 import { TripCostChart } from '@/components/analytics/TripCostChart'
+import { ShoppingRhythmStrip } from '@/components/analytics/ShoppingRhythmStrip'
 import { Sparkline } from '@/components/ui/Sparkline'
 import { Badge } from '@/components/ui/Badge'
 
@@ -19,6 +20,11 @@ function AnalyticsPage() {
     queryFn: () => getProductsWithTrends({ sort: 'price_change', order: 'desc' }),
   })
 
+  const { data: rhythm, isLoading: rhythmLoading } = useQuery({
+    queryKey: ['analytics', 'rhythm'],
+    queryFn: getRhythm,
+  })
+
   const filteredProducts = productsWithTrends?.filter((p) =>
     p.name.toLowerCase().includes(productSearch.toLowerCase())
   ) ?? []
@@ -28,6 +34,20 @@ function AnalyticsPage() {
       <h1 className="font-display text-section font-bold text-neutral-900 tracking-tight">
         Analytics
       </h1>
+
+      {/* Shopping Rhythm */}
+      <div className="mt-6">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">
+          Shopping Rhythm
+        </h2>
+        {rhythmLoading ? (
+          <div className="flex items-center justify-center h-24 text-body text-neutral-400">
+            Loading...
+          </div>
+        ) : (
+          rhythm && <ShoppingRhythmStrip data={rhythm} />
+        )}
+      </div>
 
       {/* Trip Cost Chart */}
       <div className="mt-6">
