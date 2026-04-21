@@ -765,3 +765,19 @@ export interface ProductTrendResponse {
   max_store: string
   avg_price: number
 }
+
+// --- Category Breakdown Types ---
+
+export interface CategoryBucket {
+  name: string
+  current: number
+  prior: number
+  pct_of_total: number
+  delta_pct: number | null
+}
+
+export interface CategoryBreakdown {
+  window_days: number
+  total: number
+  categories: CategoryBucket[]
+}

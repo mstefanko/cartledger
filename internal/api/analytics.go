@@ -31,6 +31,7 @@ func (h *AnalyticsHandler) RegisterRoutes(protected *echo.Group) {
 	analytics.GET("/deals", h.Deals)
 	analytics.GET("/buy-again", h.BuyAgain)
 	analytics.GET("/product-groups/:id/trend", h.GroupTrend)
+	analytics.GET("/category-breakdown", h.CategoryBreakdown)
 }
 
 // --- Response types ---
@@ -780,4 +781,151 @@ func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, items)
+}
+
+// --- Category Breakdown types ---
+
+type categoryBucket struct {
+	Name       string   `json:"name"`
+	Current    float64  `json:"current"`
+	Prior      float64  `json:"prior"`
+	PctOfTotal float64  `json:"pct_of_total"`
+	DeltaPct   *float64 `json:"delta_pct"`
+}
+
+type categoryBreakdownResponse struct {
+	WindowDays int              `json:"window_days"`
+	Total      float64          `json:"total"`
+	Categories []categoryBucket `json:"categories"`
+}
+
+// qCategoryBreakdown is the SQL for one window of category spending.
+// Placeholders: householdID, start (inclusive), end (exclusive).
+const qCategoryBreakdown = `
+SELECT
+  CASE
+    WHEN li.product_id IS NULL                         THEN 'Unmatched'
+    WHEN COALESCE(NULLIF(p.category, ''), NULL) IS NULL THEN 'Uncategorized'
+    ELSE p.category
+  END AS bucket,
+  SUM(CAST(li.total_price AS REAL)) AS amount
+FROM line_items li
+JOIN receipts r ON r.id = li.receipt_id
+LEFT JOIN products p ON p.id = li.product_id
+WHERE r.household_id = ?
+  AND r.status IN ('pending', 'matched', 'reviewed')
+  AND r.receipt_date >= ?
+  AND r.receipt_date < ?
+GROUP BY bucket
+ORDER BY amount DESC`
+
+// CategoryBreakdown returns category spending for the last 30 days vs prior 30 days.
+// GET /api/v1/analytics/category-breakdown
+func (h *AnalyticsHandler) CategoryBreakdown(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+
+	now := time.Now().UTC()
+	today := now.Format("2006-01-02")
+	cur := now.AddDate(0, 0, -30).Format("2006-01-02")
+	prev := now.AddDate(0, 0, -60).Format("2006-01-02")
+
+	// runWindow executes the category query for [start, end) and returns a map
+	// of bucket name → amount.
+	runWindow := func(start, end string) (map[string]float64, error) {
+		rows, err := h.DB.Query(qCategoryBreakdown, householdID, start, end)
+		if err != nil {
+			return nil, fmt.Errorf("category query: %w", err)
+		}
+		defer rows.Close()
+		result := make(map[string]float64)
+		for rows.Next() {
+			var bucket string
+			var amount float64
+			if err := rows.Scan(&bucket, &amount); err != nil {
+				return nil, fmt.Errorf("category scan: %w", err)
+			}
+			result[bucket] = amount
+		}
+		return result, rows.Err()
+	}
+
+	currentMap, err := runWindow(cur, today)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+	priorMap, err := runWindow(prev, cur)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
+
+	// Merge: collect all bucket names from both windows.
+	seen := make(map[string]struct{})
+	for k := range currentMap {
+		seen[k] = struct{}{}
+	}
+	for k := range priorMap {
+		seen[k] = struct{}{}
+	}
+
+	// Compute total from current window.
+	var total float64
+	for _, v := range currentMap {
+		total += v
+	}
+	total = math.Round(total*100) / 100
+
+	// Build bucket list, sorted by current amount DESC (ties: prior amount DESC).
+	type kv struct {
+		name    string
+		current float64
+		prior   float64
+	}
+	kvs := make([]kv, 0, len(seen))
+	for name := range seen {
+		kvs = append(kvs, kv{
+			name:    name,
+			current: currentMap[name],
+			prior:   priorMap[name],
+		})
+	}
+	// Sort by current DESC, then prior DESC as tiebreaker.
+	for i := 0; i < len(kvs); i++ {
+		for j := i + 1; j < len(kvs); j++ {
+			if kvs[j].current > kvs[i].current ||
+				(kvs[j].current == kvs[i].current && kvs[j].prior > kvs[i].prior) {
+				kvs[i], kvs[j] = kvs[j], kvs[i]
+			}
+		}
+	}
+
+	categories := make([]categoryBucket, 0, len(kvs))
+	for _, entry := range kvs {
+		cur := math.Round(entry.current*100) / 100
+		prior := math.Round(entry.prior*100) / 100
+
+		var pct float64
+		if total > 0 {
+			pct = math.Round((cur/total)*10000) / 100
+		}
+
+		var deltaPtr *float64
+		if prior > 0 {
+			delta := math.Round(((cur-prior)/prior)*10000) / 100
+			deltaPtr = &delta
+		}
+
+		categories = append(categories, categoryBucket{
+			Name:       entry.name,
+			Current:    cur,
+			Prior:      prior,
+			PctOfTotal: pct,
+			DeltaPct:   deltaPtr,
+		})
+	}
+
+	return c.JSON(http.StatusOK, categoryBreakdownResponse{
+		WindowDays: 30,
+		Total:      total,
+		Categories: categories,
+	})
 }
