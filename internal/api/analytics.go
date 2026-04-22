@@ -1288,6 +1288,11 @@ type priceMovesResponse struct {
 	Down []priceMoveItem `json:"down"`
 }
 
+// priceMoveThresholdPct is the minimum absolute percent change required for a
+// product to appear in the PriceMoves up/down lists. Sub-threshold moves are
+// considered noise and excluded.
+const priceMoveThresholdPct = 10.0
+
 // qPriceMoves is the SQL for computing average unit price per product in two
 // rolling windows. All date boundaries are passed as ? parameters — plan
 // Invariant: date windows are computed in Go (time.Now().UTC()), never via
@@ -1393,12 +1398,12 @@ func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
 	down := make([]priceMoveItem, 0, 5)
 
 	for _, item := range all {
-		if item.PctChange > 0 {
+		if item.PctChange >= priceMoveThresholdPct {
 			up = append(up, item)
-		} else if item.PctChange < 0 {
+		} else if item.PctChange <= -priceMoveThresholdPct {
 			down = append(down, item)
 		}
-		// pct_change == 0 is excluded (no meaningful move)
+		// Sub-threshold and zero moves are excluded (noise)
 	}
 
 	// Sort each group by |pct_change| DESC (tiebreaker is already observations_recent DESC, p.id ASC from SQL).

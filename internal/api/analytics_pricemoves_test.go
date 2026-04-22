@@ -421,6 +421,109 @@ func formatFloatStr(f float64) string {
 	return fmt.Sprintf("%.2f", f)
 }
 
+// TestPriceMoves_TenPercentThreshold verifies the 10% noise threshold:
+// products with |pct_change| < 10% are excluded; those at exactly 10% or above
+// are included and sorted by |pct_change| DESC.
+func TestPriceMoves_TenPercentThreshold(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PMThresh")
+
+	// Product A: prior=1.00, recent=1.09 (+9%) — must NOT appear.
+	idA := insertPMProduct(t, ah, householdID, "Product A")
+	insertPMPrice(t, ah, householdID, storeID, idA, "-5 days", "1.09", "each")
+	insertPMPrice(t, ah, householdID, storeID, idA, "-6 days", "1.09", "each")
+	insertPMPrice(t, ah, householdID, storeID, idA, "-7 days", "1.09", "each")
+	insertPMPrice(t, ah, householdID, storeID, idA, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idA, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idA, "-42 days", "1.00", "each")
+
+	// Product B: prior=1.00, recent=1.10 (+10%) — must appear in Up.
+	idB := insertPMProduct(t, ah, householdID, "Product B")
+	insertPMPrice(t, ah, householdID, storeID, idB, "-5 days", "1.10", "each")
+	insertPMPrice(t, ah, householdID, storeID, idB, "-6 days", "1.10", "each")
+	insertPMPrice(t, ah, householdID, storeID, idB, "-7 days", "1.10", "each")
+	insertPMPrice(t, ah, householdID, storeID, idB, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idB, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idB, "-42 days", "1.00", "each")
+
+	// Product C: prior=1.00, recent=1.25 (+25%) — must appear in Up.
+	idC := insertPMProduct(t, ah, householdID, "Product C")
+	insertPMPrice(t, ah, householdID, storeID, idC, "-5 days", "1.25", "each")
+	insertPMPrice(t, ah, householdID, storeID, idC, "-6 days", "1.25", "each")
+	insertPMPrice(t, ah, householdID, storeID, idC, "-7 days", "1.25", "each")
+	insertPMPrice(t, ah, householdID, storeID, idC, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idC, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idC, "-42 days", "1.00", "each")
+
+	// Product D: prior=1.00, recent=0.91 (-9%) — must NOT appear.
+	idD := insertPMProduct(t, ah, householdID, "Product D")
+	insertPMPrice(t, ah, householdID, storeID, idD, "-5 days", "0.91", "each")
+	insertPMPrice(t, ah, householdID, storeID, idD, "-6 days", "0.91", "each")
+	insertPMPrice(t, ah, householdID, storeID, idD, "-7 days", "0.91", "each")
+	insertPMPrice(t, ah, householdID, storeID, idD, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idD, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idD, "-42 days", "1.00", "each")
+
+	// Product E: prior=1.00, recent=0.90 (-10%) — must appear in Down.
+	idE := insertPMProduct(t, ah, householdID, "Product E")
+	insertPMPrice(t, ah, householdID, storeID, idE, "-5 days", "0.90", "each")
+	insertPMPrice(t, ah, householdID, storeID, idE, "-6 days", "0.90", "each")
+	insertPMPrice(t, ah, householdID, storeID, idE, "-7 days", "0.90", "each")
+	insertPMPrice(t, ah, householdID, storeID, idE, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idE, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idE, "-42 days", "1.00", "each")
+
+	// Product F: prior=1.00, recent=0.75 (-25%) — must appear in Down.
+	idF := insertPMProduct(t, ah, householdID, "Product F")
+	insertPMPrice(t, ah, householdID, storeID, idF, "-5 days", "0.75", "each")
+	insertPMPrice(t, ah, householdID, storeID, idF, "-6 days", "0.75", "each")
+	insertPMPrice(t, ah, householdID, storeID, idF, "-7 days", "0.75", "each")
+	insertPMPrice(t, ah, householdID, storeID, idF, "-40 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idF, "-41 days", "1.00", "each")
+	insertPMPrice(t, ah, householdID, storeID, idF, "-42 days", "1.00", "each")
+
+	_ = idA
+	_ = idD
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	// Up list: exactly 2 items (C at 25%, B at 10%), sorted by |pct_change| DESC.
+	if len(resp.Up) != 2 {
+		t.Fatalf("expected 2 items in Up list, got %d: %v", len(resp.Up), resp.Up)
+	}
+	if resp.Up[0].Name != "Product C" {
+		t.Errorf("Up[0]: expected 'Product C', got %q", resp.Up[0].Name)
+	}
+	if resp.Up[1].Name != "Product B" {
+		t.Errorf("Up[1]: expected 'Product B', got %q", resp.Up[1].Name)
+	}
+
+	// Down list: exactly 2 items (F at -25%, E at -10%), sorted by |pct_change| DESC.
+	if len(resp.Down) != 2 {
+		t.Fatalf("expected 2 items in Down list, got %d: %v", len(resp.Down), resp.Down)
+	}
+	if resp.Down[0].Name != "Product F" {
+		t.Errorf("Down[0]: expected 'Product F', got %q", resp.Down[0].Name)
+	}
+	if resp.Down[1].Name != "Product E" {
+		t.Errorf("Down[1]: expected 'Product E', got %q", resp.Down[1].Name)
+	}
+
+	// Sub-threshold products A and D must not appear anywhere.
+	for _, item := range resp.Up {
+		if item.Name == "Product A" || item.Name == "Product D" {
+			t.Errorf("sub-threshold product %q must not appear in Up list", item.Name)
+		}
+	}
+	for _, item := range resp.Down {
+		if item.Name == "Product A" || item.Name == "Product D" {
+			t.Errorf("sub-threshold product %q must not appear in Down list", item.Name)
+		}
+	}
+}
+
 // TestPriceMoves_ErrorStatusExcluded — receipt with status='error' should be excluded
 // even when it has 3+ product_prices rows with consistent unit and normalized_price.
 func TestPriceMoves_ErrorStatusExcluded(t *testing.T) {
