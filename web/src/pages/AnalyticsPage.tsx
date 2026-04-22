@@ -14,6 +14,7 @@ import { Badge } from '@/components/ui/Badge'
 
 function AnalyticsPage() {
   const [productSearch, setProductSearch] = useState('')
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
 
   const { data: trips, isLoading: tripsLoading } = useQuery({
     queryKey: ['analytics', 'trips'],
@@ -55,9 +56,15 @@ function AnalyticsPage() {
     queryFn: getInflation,
   })
 
-  const filteredProducts = productsWithTrends?.filter((p) =>
-    p.name.toLowerCase().includes(productSearch.toLowerCase())
-  ) ?? []
+  const filteredProducts = (productsWithTrends ?? []).filter((p) => {
+    const nameOk = p.name.toLowerCase().includes(productSearch.toLowerCase())
+    const categoryOk = !selectedCategory || p.category === selectedCategory
+    return nameOk && categoryOk
+  })
+
+  const filteredStaples = (staples ?? []).filter((s) =>
+    !selectedCategory || s.category === selectedCategory
+  )
 
   return (
     <div className="py-8">
@@ -103,7 +110,21 @@ function AnalyticsPage() {
             Loading staples...
           </div>
         ) : (
-          <StaplesTable staples={staples ?? []} />
+          <>
+            {selectedCategory && (
+              <div className="relative inline-flex items-center gap-1 mb-3 pl-3 pr-7 py-1 bg-neutral-100 rounded-full text-body text-neutral-700">
+                Filtering by {selectedCategory}
+                <button
+                  onClick={() => setSelectedCategory(null)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600"
+                  aria-label="Clear category filter"
+                >
+                  ×
+                </button>
+              </div>
+            )}
+            <StaplesTable staples={filteredStaples} />
+          </>
         )}
       </div>
 
@@ -162,7 +183,7 @@ function AnalyticsPage() {
               Loading categories...
             </div>
           ) : categoryBreakdown ? (
-            <CategoryBreakdown data={categoryBreakdown} />
+            <CategoryBreakdown data={categoryBreakdown} selectedCategory={selectedCategory} onSelect={setSelectedCategory} />
           ) : null}
         </div>
       </div>

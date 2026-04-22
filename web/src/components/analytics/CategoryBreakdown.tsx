@@ -64,9 +64,11 @@ function CenterLabel({
 
 interface CategoryBreakdownProps {
   data: CategoryBreakdownData
+  selectedCategory?: string | null
+  onSelect?: (category: string | null) => void
 }
 
-function CategoryBreakdown({ data }: CategoryBreakdownProps) {
+function CategoryBreakdown({ data, selectedCategory = null, onSelect }: CategoryBreakdownProps) {
   const { categories, total } = data
 
   if (categories.length === 0) {
@@ -114,9 +116,20 @@ function CategoryBreakdown({ data }: CategoryBreakdownProps) {
               strokeWidth={0}
               labelLine={false}
               label={<CenterLabel total={total} />}
+              style={{ cursor: onSelect ? 'pointer' : undefined }}
+              onClick={(entry) => {
+                if (!onSelect) return
+                const name = entry.name as string
+                onSelect(name === selectedCategory ? null : name)
+              }}
             >
               {coloredCategories.map((entry) => (
-                <Cell key={entry.name} fill={entry.color} />
+                <Cell
+                  key={entry.name}
+                  fill={entry.color}
+                  stroke={entry.name === selectedCategory ? '#111827' : undefined}
+                  strokeWidth={entry.name === selectedCategory ? 2 : 0}
+                />
               ))}
             </Pie>
             <Tooltip
@@ -164,8 +177,16 @@ function CategoryBreakdown({ data }: CategoryBreakdownProps) {
                   ? `▼ ${Math.abs(cat.delta_pct).toFixed(1)}%`
                   : '0%'
 
+              const isSelected = cat.name === selectedCategory
               return (
-                <tr key={cat.name} className="hover:bg-neutral-50">
+                <tr
+                  key={cat.name}
+                  className={`hover:bg-neutral-50 ${isSelected ? 'bg-neutral-100' : ''} ${onSelect ? 'cursor-pointer' : ''}`}
+                  onClick={() => {
+                    if (!onSelect) return
+                    onSelect(cat.name === selectedCategory ? null : cat.name)
+                  }}
+                >
                   <td className="py-2 pr-3">
                     <span className="inline-flex items-center gap-1.5">
                       <span
