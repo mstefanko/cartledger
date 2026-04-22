@@ -20,7 +20,7 @@ internal/
     prompt.go              Extraction rules (schema is in tool definition, not prompt)
     claude_cli.go          Legacy CLI client (not wired up in main.go)
     mock.go                Mock client for testing
-  matcher/                 Product matching: fuzzy, rule-based, normalizer
+  matcher/                 Product matching: fuzzy, rule-based, normalizer. session.go adds Session (Engine.NewSession) for batch callers
   models/                  Shared data structs
   units/                   Unit parsing/conversion (lb, oz, gal, etc.)
   worker/                  Background receipt processing (goroutine pool)
@@ -67,6 +67,7 @@ go test ./...     # Run Go tests (no frontend tests)
 - **Migrations** — sequential numbered files in `internal/db/migrations/` (NNN_name.up.sql + .down.sql)
 - **Error handling** — return `fmt.Errorf("context: %w", err)`, Echo handlers return `echo.NewHTTPError`
 - **Frontend API calls** — in `web/src/api/`, consumed via TanStack Query hooks
+- **Matcher batch ingest** — when matching a batch of items (receipt worker, spreadsheet import, or any new batch path), open a `matcher.Session` via `Engine.NewSession(householdID, storeID)` before the items loop and call `session.MatchWithSuggestion` inside the loop. This preloads fuzzy candidates once instead of per-item. `Engine.Match` / `Engine.MatchWithSuggestion` remain available for one-shot callers (e.g., manual POST in `api/receipts.go`). `spreadsheet.MatchEngine` interface requires `NewSession` — any test fake must stub it.
 
 ## Analytics conventions
 
