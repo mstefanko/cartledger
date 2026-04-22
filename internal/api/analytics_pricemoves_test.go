@@ -92,6 +92,36 @@ func insertPMPrice(t *testing.T, ah *AnalyticsHandler, householdID, storeID, pro
 	}
 }
 
+// insertPMPriceNullNorm inserts a product_prices row with normalized_price = NULL
+// and the provided unit_price. Used to test COALESCE fallback behaviour.
+func insertPMPriceNullNorm(t *testing.T, ah *AnalyticsHandler, householdID, storeID, productID string, daysOffset int, unitPrice, unit string) {
+	t.Helper()
+	d := ah.DB
+
+	var receiptID string
+	if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+		t.Fatalf("gen receipt id: %v", err)
+	}
+	offset := fmt.Sprintf("%d days", daysOffset)
+	var receiptDate string
+	if err := d.QueryRow("SELECT date('now', ?)", offset).Scan(&receiptDate); err != nil {
+		t.Fatalf("compute date: %v", err)
+	}
+	if _, err := d.Exec(
+		"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
+		receiptID, householdID, storeID, receiptDate,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price)
+		 VALUES (?, ?, ?, ?, '1', ?, ?, NULL)`,
+		productID, storeID, receiptID, receiptDate, unit, unitPrice,
+	); err != nil {
+		t.Fatalf("insert product_prices: %v", err)
+	}
+}
+
 // findPMItem returns the priceMoveItem matching productID from a slice, or nil.
 func findPMItem(items []priceMoveItem, productID string) *priceMoveItem {
 	for i := range items {
@@ -264,7 +294,7 @@ func TestPriceMoves_PriorAvgZero(t *testing.T) {
 	}
 }
 
-// Case 7: NULL normalized_price rows are excluded by WHERE clause.
+// Case 7: NULL normalized_price falls back to unit_price via COALESCE — product is INCLUDED.
 func TestPriceMoves_NullNormalizedPrice(t *testing.T) {
 	ah, cleanup := newAnalyticsHandler(t)
 	defer cleanup()
@@ -272,36 +302,23 @@ func TestPriceMoves_NullNormalizedPrice(t *testing.T) {
 	householdID, storeID := newPMHousehold(t, ah, "PM7")
 	productID := insertPMProduct(t, ah, householdID, "Milk")
 
-	// Insert rows with NULL normalized_price — all should be skipped.
-	d := ah.DB
-	for _, off := range []string{"-5 days", "-40 days"} {
-		var receiptID string
-		if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
-			t.Fatalf("gen id: %v", err)
-		}
-		var receiptDate string
-		if err := d.QueryRow("SELECT date('now', ?)", off).Scan(&receiptDate); err != nil {
-			t.Fatalf("compute date: %v", err)
-		}
-		if _, err := d.Exec(
-			"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
-			receiptID, householdID, storeID, receiptDate,
-		); err != nil {
-			t.Fatalf("insert receipt: %v", err)
-		}
-		if _, err := d.Exec(
-			`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price)
-			 VALUES (?, ?, ?, ?, '1', 'each', '2.00', NULL)`,
-			productID, storeID, receiptID, receiptDate,
-		); err != nil {
-			t.Fatalf("insert product_prices: %v", err)
-		}
-	}
+	// Recent window: 3 rows at ~2.00 (unit_price, normalized_price=NULL).
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -5, "2.00", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -10, "2.00", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -15, "2.00", "each")
+	// Prior window: 3 rows at ~1.00 (unit_price, normalized_price=NULL) → expect price UP.
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -40, "1.00", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -50, "1.00", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -60, "1.00", "each")
 
 	resp := callPriceMoves(t, ah, householdID)
 
-	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
-		t.Error("null normalized_price rows should be excluded")
+	item := findPMItem(resp.Up, productID)
+	if item == nil {
+		t.Fatal("product with null normalized_price but valid unit_price should appear in Up via COALESCE fallback")
+	}
+	if item.PctChange <= 0 {
+		t.Errorf("expected positive pct_change, got %v", item.PctChange)
 	}
 }
 
@@ -502,5 +519,42 @@ func TestPriceMoves_TwoDistinctDatesExcluded(t *testing.T) {
 
 	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
 		t.Error("product with only 2 distinct receipt dates should be excluded")
+	}
+}
+
+// TestPriceMoves_MixedNullNonNull — a single product with 4 rows mixing NULL and non-NULL
+// normalized_price. COALESCE should blend unit_price for NULL rows with normalized_price
+// for non-NULL rows, producing a correct blended average and appearing in the result.
+//
+// Seed (all unit "each"):
+//
+//	Prior window (~30-90 days ago): row A normalized=1.00, row B normalized=NULL/unit_price=1.50
+//	  → blended prior avg = (1.00 + 1.50) / 2 = 1.25
+//	Recent window (~0-30 days ago): row C normalized=2.00, row D normalized=NULL/unit_price=2.50
+//	  → blended recent avg = (2.00 + 2.50) / 2 = 2.25
+//	Expected pct_change = (2.25 - 1.25) / 1.25 * 100 = 80.00%
+func TestPriceMoves_MixedNullNonNull(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PMMix")
+	productID := insertPMProduct(t, ah, householdID, "MixedProduct")
+
+	// Recent window: 1 non-NULL normalized + 1 NULL normalized (distinct dates).
+	insertPMPrice(t, ah, householdID, storeID, productID, "-5 days", "2.00", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -10, "2.50", "each")
+	// Prior window: 1 non-NULL normalized + 1 NULL normalized (distinct dates).
+	insertPMPrice(t, ah, householdID, storeID, productID, "-40 days", "1.00", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -50, "1.50", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	item := findPMItem(resp.Up, productID)
+	if item == nil {
+		t.Fatalf("expected mixed-null product in Up list; Up=%v Down=%v", resp.Up, resp.Down)
+	}
+	// Blended recent avg = 2.25, blended prior avg = 1.25 → pct_change = 80.00
+	if item.PctChange != 80.00 {
+		t.Errorf("pct_change: expected 80.00, got %f", item.PctChange)
 	}
 }

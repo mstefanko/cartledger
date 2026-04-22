@@ -1301,12 +1301,12 @@ SELECT
     p.id            AS product_id,
     p.name,
     pp.unit,
-    AVG(CASE WHEN pp.receipt_date >= ? THEN CAST(pp.normalized_price AS REAL) END) AS avg_030d,
-    AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END) AS avg_3090d,
+    AVG(CASE WHEN pp.receipt_date >= ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) AS avg_030d,
+    AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) AS avg_3090d,
     ROUND(
-        (AVG(CASE WHEN pp.receipt_date >= ? THEN CAST(pp.normalized_price AS REAL) END) -
-         AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END)) /
-        AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END) * 100
+        (AVG(CASE WHEN pp.receipt_date >= ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) -
+         AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END)) /
+        AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) * 100
     , 2) AS pct_change,
     COUNT(CASE WHEN pp.receipt_date >= ? THEN 1 END) AS observations_recent,
     COUNT(CASE WHEN pp.receipt_date <  ? THEN 1 END) AS observations_prior
@@ -1317,8 +1317,7 @@ WHERE
     r.household_id = ?
     AND pp.receipt_date >= ?
     AND pp.receipt_date <  ?
-    AND pp.normalized_price IS NOT NULL
-    AND CAST(pp.normalized_price AS REAL) > 0
+    AND COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) > 0
     AND r.status IN ('pending', 'matched', 'reviewed')
     AND p.is_non_product = 0
 GROUP BY p.id, p.name, pp.unit
@@ -1326,7 +1325,7 @@ HAVING
     COUNT(DISTINCT DATE(pp.receipt_date)) >= 3
     AND COUNT(CASE WHEN pp.receipt_date >= ? THEN 1 END) >= 1
     AND COUNT(CASE WHEN pp.receipt_date <  ? THEN 1 END) >= 1
-    AND AVG(CASE WHEN pp.receipt_date <  ? THEN CAST(pp.normalized_price AS REAL) END) > 0
+    AND AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) > 0
     AND COUNT(DISTINCT CASE WHEN pp.receipt_date >= ? THEN pp.unit END) = 1
     AND COUNT(DISTINCT CASE WHEN pp.receipt_date <  ? THEN pp.unit END) = 1
     AND MAX(CASE WHEN pp.receipt_date >= ? THEN pp.unit END)
