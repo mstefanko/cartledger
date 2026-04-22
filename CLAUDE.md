@@ -76,6 +76,7 @@ go test ./...     # Run Go tests (no frontend tests)
 - `/analytics/staples` cadence is **calendar-event based** (`COUNT(DISTINCT date)`) — NOT quantity-weighted. That distinguishes it from `/analytics/buy-again`, which divides `AVG(days_gap)` by `AVG(quantity)`. Projection fields are null until the household has >=60 days of history.
 - `/analytics/inflation` uses a **Laspeyres fixed-weight basket**: weights are current-period median quantities, so the index measures pure price change. Symmetric exclusion: a product contributes only if it appears in both windows of a comparison pair. Both deltas are suppressed when history < 90/180 days or basket overlap < 50%.
 - `/analytics/price-moves` (and analytics queries generally) use `COALESCE(normalized_price, unit_price)` as the effective price. Spreadsheet-imported rows populate `unit_price` but leave `normalized_price` NULL; the fallback ensures they participate in price-move detection. Only moves with |pct_change| >= 10% (`priceMoveThresholdPct`) are surfaced; sub-threshold results are filtered in Go after the SQL query.
+- **Analytics category filter** — clicking a `CategoryBreakdown` slice or row sets `selectedCategory` in `AnalyticsPage` state and filters the Staples and Product Trends sections client-side; no additional API call is made.
 
 ## Gotchas
 

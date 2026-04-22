@@ -68,6 +68,7 @@ interface CategoryBreakdownProps {
   onSelect?: (category: string | null) => void
 }
 
+/** Pie chart + table of spend by category. Clicking a slice or row toggles `selectedCategory` via `onSelect` (client-side state only — no API call). */
 function CategoryBreakdown({ data, selectedCategory = null, onSelect }: CategoryBreakdownProps) {
   const { categories, total } = data
 
