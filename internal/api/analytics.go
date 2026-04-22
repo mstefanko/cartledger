@@ -1294,6 +1294,9 @@ type priceMovesResponse struct {
 // SQLite DATE('now', ...). WHERE adds r.status IN ('pending','matched','reviewed')
 // and p.is_non_product = 0 per plan Invariants 3 and 5. HAVING requires
 // COUNT(DISTINCT DATE(receipt_date)) >= 3 for a meaningful price trajectory.
+// Price values use COALESCE(normalized_price, unit_price): spreadsheet-imported
+// rows and unmatched inserts populate unit_price but leave normalized_price NULL,
+// so this fallback ensures those rows participate in price-move detection.
 // Parameter order: cutoff30 (x7 SELECT), householdID, cutoff90, today,
 // cutoff30 (x7 HAVING).
 const qPriceMoves = `
@@ -1332,13 +1335,15 @@ HAVING
         = MAX(CASE WHEN pp.receipt_date <  ? THEN pp.unit END)
 ORDER BY observations_recent DESC, p.id ASC`
 
-// PriceMoves returns products whose normalized unit price has shifted by >=10%
-// between the last 30 days (recent window) and the 31–90 day window (prior).
-// Only products whose unit is identical across both windows are compared, ensuring
-// apples-to-apples price comparison (e.g. "$/lb" vs "$/ea" are never mixed).
-// Requires >=3 distinct dates in the 90-day window for signal confidence.
-// Results are split into "up" and "down" slices, each sorted by |pct_change|
-// descending and capped at 5 items per direction.
+// PriceMoves returns products whose unit price has shifted by >=10% between
+// the last 30 days (recent window) and the 31–90 day window (prior). The price
+// used is COALESCE(normalized_price, unit_price) so that spreadsheet-imported
+// rows (which carry unit_price but no normalized_price) are included alongside
+// scanner-extracted rows. Only products whose unit is identical across both
+// windows are compared, ensuring apples-to-apples comparison (e.g. "$/lb" vs
+// "$/ea" are never mixed). Requires >=3 distinct dates in the 90-day window for
+// signal confidence. Results are split into "up" and "down" slices, each sorted
+// by |pct_change| descending and capped at 5 items per direction.
 // GET /api/v1/analytics/price-moves
 func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
 	ctx := c.Request().Context()
