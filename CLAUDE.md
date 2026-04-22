@@ -68,6 +68,7 @@ go test ./...     # Run Go tests (no frontend tests)
 - **Error handling** — return `fmt.Errorf("context: %w", err)`, Echo handlers return `echo.NewHTTPError`
 - **Frontend API calls** — in `web/src/api/`, consumed via TanStack Query hooks
 - **Matcher batch ingest** — when matching a batch of items (receipt worker, spreadsheet import, or any new batch path), open a `matcher.Session` via `Engine.NewSession(householdID, storeID)` before the items loop and call `session.MatchWithSuggestion` inside the loop. This preloads fuzzy candidates once instead of per-item. `Engine.Match` / `Engine.MatchWithSuggestion` remain available for one-shot callers (e.g., manual POST in `api/receipts.go`). `spreadsheet.MatchEngine` interface requires `NewSession` — any test fake must stub it.
+- **Spreadsheet import pipeline** — `prepareSpreadsheetImport` in `internal/api/import_spreadsheet_prep.go` is the single source of truth for the shared transforms → skip → normalize+since-date → group → (optional split) → duplicate-check pipeline. Preview calls it with `applySplit=true`; Commit calls it with `applySplit=false`. Commit retains a post-helper since-date rebuild of `transformed.Rows` for `spreadsheet.Commit`'s internal normalize/group step — that rebuild is Commit-specific and is not part of the shared helper.
 
 ## Analytics conventions
 
