@@ -85,3 +85,4 @@ go test ./...     # Run Go tests (no frontend tests)
 - SQLite — no concurrent write support, single-writer model
 - Receipt images stored on disk at `DATA_DIR/receipts/{uuid}/`
 - Planning docs (`PLAN-*.md`, `ANALYSIS-*.md`, etc.) are gitignored
+- **WebSocket lifecycle** — `connectWebSocket(queryClient)` in `web/src/api/ws.ts` is mounted exactly once in `AppLayout` (always post-auth via `ProtectedRoute`). Do NOT call it from individual components. Cleanup via `disconnectWebSocket()` runs on unmount/logout. The socket drives React Query cache invalidation for `receipt.complete`, `list.*`, `product.updated`, and `store.updated` messages.
