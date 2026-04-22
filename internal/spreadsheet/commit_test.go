@@ -3,6 +3,7 @@ package spreadsheet
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -57,6 +58,13 @@ func (f *fakeMatchEngine) MatchWithSuggestion(rawName, _, _, _ string) matcher.M
 		return r
 	}
 	return matcher.MatchResult{Method: "unmatched"}
+}
+
+// NewSession deliberately errors so commit falls through to the per-call
+// MatchWithSuggestion path above — that's what every fakeMatchEngine-backed
+// test expects. Session-path coverage lives in internal/matcher/session_test.go.
+func (f *fakeMatchEngine) NewSession(_, _ string) (*matcher.Session, error) {
+	return nil, errors.New("fakeMatchEngine: session unsupported")
 }
 
 // rawSheet builds a ParsedSheet with the given rows laid out in the column
@@ -466,6 +474,13 @@ func (f *flakyEngine) MatchWithSuggestion(rawName, _, _, _ string) matcher.Match
 		return matcher.MatchResult{ProductID: f.realID, Confidence: 0.9, Method: "alias"}
 	}
 	return matcher.MatchResult{Method: "unmatched"}
+}
+
+// NewSession errors so commit falls through to the per-call
+// MatchWithSuggestion path — the flakyEngine test fixture is built around
+// return values from that method.
+func (f *flakyEngine) NewSession(_, _ string) (*matcher.Session, error) {
+	return nil, errors.New("flakyEngine: session unsupported")
 }
 
 func TestCommit_PerReceiptTxIsolation(t *testing.T) {

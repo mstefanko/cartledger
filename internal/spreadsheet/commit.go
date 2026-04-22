@@ -19,9 +19,17 @@ import (
 // Defined as an interface so commit tests can inject a fake that errors on
 // demand without spinning up the full fuzzy-match pipeline. The real
 // *matcher.Engine satisfies this interface by virtue of its own
-// MatchWithSuggestion method.
+// MatchWithSuggestion method and NewSession factory.
+//
+// NewSession returns a batched match session — see internal/matcher/session.go
+// for the contract. Callers SHOULD prefer the session path for in-loop
+// matching (it collapses the per-item fuzzy queries to a per-batch preload),
+// and MUST gracefully fall back to per-call MatchWithSuggestion when
+// NewSession returns an error. Test fakes typically return an error from
+// NewSession to force the fallback path and keep existing tests green.
 type MatchEngine interface {
 	MatchWithSuggestion(rawName, suggestedName, storeID, householdID string) matcher.MatchResult
+	NewSession(householdID, storeID string) (*matcher.Session, error)
 }
 
 // CommitInput carries everything a commit needs. The handler (Phase 5)
@@ -246,6 +254,24 @@ func commitGroup(
 		return "", nil, 0, 0, err
 	}
 
+	// Open a per-group matcher session. Matcher reads target e.db (NOT the
+	// in-flight tx — see matcher/engine.go:30), so a session built here sees
+	// the same committed aliases/products the per-call path would see. Scope
+	// is per-group (not per-Commit) to preserve the exact semantics of the
+	// prior per-call path: aliases written by earlier groups' txs are visible
+	// to this group because we open the session AFTER those txs committed.
+	//
+	// On NewSession error we fall through to the one-shot MatchWithSuggestion
+	// path — test fakes deliberately return an error here to exercise the
+	// fallback and keep their fixture behavior intact. The group itself
+	// continues either way.
+	sess, sessErr := matchEngine.NewSession(in.HouseholdID, storeID)
+	if sessErr != nil {
+		slog.Warn("spreadsheet commit: session open failed, falling back to per-call",
+			"group_id", g.ID, "err", sessErr)
+		sess = nil
+	}
+
 	// Receipt date: the grouping step guarantees every row in a group shares
 	// the same date string. Empty-date groups are already segregated by
 	// GroupRows into their own group; those shouldn't reach commit (the
@@ -322,10 +348,15 @@ func commitGroup(
 		// Matcher: spreadsheet rows don't carry a "suggested name" from an
 		// LLM — pass "" for suggestedName. MatchWithSuggestion degenerates
 		// to the 3-stage raw-name pipeline in that case (see
-		// matcher/engine.go:60-67).
+		// matcher/engine.go:60-67). Prefer the per-group session when it
+		// opened cleanly; fall back to the per-call engine path otherwise.
 		var matchResult matcher.MatchResult
 		if strings.TrimSpace(rawName) != "" {
-			matchResult = matchEngine.MatchWithSuggestion(rawName, "", storeID, in.HouseholdID)
+			if sess != nil {
+				matchResult = sess.MatchWithSuggestion(rawName, "")
+			} else {
+				matchResult = matchEngine.MatchWithSuggestion(rawName, "", storeID, in.HouseholdID)
+			}
 		} else {
 			matchResult = matcher.MatchResult{Method: "unmatched"}
 		}

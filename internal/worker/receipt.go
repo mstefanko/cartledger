@@ -579,6 +579,23 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		}
 	}
 
+	// Open a matcher session for this receipt — collapses the per-item fuzzy
+	// queries (aliases JOIN products + products scan) into a single preload
+	// at open time. Matcher reads use w.db (not the in-flight tx), so the
+	// session's candidate set is consistent with what the per-call path would
+	// see. Session is per-receipt and scoped to this goroutine — do NOT share
+	// across worker goroutines.
+	//
+	// On NewSession error (e.g. transient DB hiccup) we fall through to the
+	// per-call path below; the receipt still processes, just without the
+	// batched optimization.
+	sess, sessErr := w.matchEngine.NewSession(job.HouseholdID, storeID)
+	if sessErr != nil {
+		slog.Warn("worker: match session open failed, using per-call path",
+			"receipt_id", job.ReceiptID, "err", sessErr)
+		sess = nil
+	}
+
 	// 6. Process each extracted item.
 	hasUnmatched := false
 	for i, item := range extraction.Items {
@@ -605,8 +622,16 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			discountAmount = &da
 		}
 
-		// Run matcher with suggested-name fallback.
-		matchResult := w.matchEngine.MatchWithSuggestion(item.RawName, item.SuggestedName, storeID, job.HouseholdID)
+		// Run matcher with suggested-name fallback. Prefer the per-receipt
+		// session when it opened cleanly; fall back to the one-shot path
+		// otherwise. Both paths return byte-identical MatchResult per
+		// internal/matcher/session_test.go:TestSessionEquivalence.
+		var matchResult matcher.MatchResult
+		if sess != nil {
+			matchResult = sess.MatchWithSuggestion(item.RawName, item.SuggestedName)
+		} else {
+			matchResult = w.matchEngine.MatchWithSuggestion(item.RawName, item.SuggestedName, storeID, job.HouseholdID)
+		}
 
 		matched := matchResult.Method
 		if matched == "unmatched" || matched == "suggested" || matched == "cross_store_match" {
