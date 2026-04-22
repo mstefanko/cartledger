@@ -1302,6 +1302,8 @@ const priceMoveThresholdPct = 10.0
 // Price values use COALESCE(normalized_price, unit_price): spreadsheet-imported
 // rows and unmatched inserts populate unit_price but leave normalized_price NULL,
 // so this fallback ensures those rows participate in price-move detection.
+// NOTE: the query returns all products with a calculable pct_change; the
+// priceMoveThresholdPct (10%) filter is applied in Go after scanning rows.
 // Parameter order: cutoff30 (x7 SELECT), householdID, cutoff90, today,
 // cutoff30 (x7 HAVING).
 const qPriceMoves = `
