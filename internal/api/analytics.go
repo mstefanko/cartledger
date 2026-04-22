@@ -816,6 +816,11 @@ func (h *AnalyticsHandler) BuyAgain(c echo.Context) error {
 
 // Rhythm returns shopping cadence stats for the authenticated household.
 // GET /api/v1/analytics/rhythm
+//
+// Two 30-day windows are compared:
+//   - current: [now-30d, tomorrow)  — upper bound is tomorrow (now.AddDate(0,0,1)),
+//     so today's receipts are included
+//   - prior:   [now-60d, now-30d)
 func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 
@@ -990,6 +995,11 @@ ORDER BY amount DESC`
 
 // CategoryBreakdown returns category spending for the last 30 days vs prior 30 days.
 // GET /api/v1/analytics/category-breakdown
+//
+// Two 30-day windows are compared:
+//   - current: [now-30d, tomorrow)  — upper bound is tomorrow (now.AddDate(0,0,1)),
+//     so today's receipts are included
+//   - prior:   [now-60d, now-30d)
 //
 // Buckets are derived from line_items (not product_prices, so unmatched items are
 // never silently dropped):
