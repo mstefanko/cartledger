@@ -20,7 +20,7 @@ internal/
     prompt.go              Extraction rules (schema is in tool definition, not prompt)
     claude_cli.go          Legacy CLI client (not wired up in main.go)
     mock.go                Mock client for testing
-  matcher/                 Product matching: fuzzy, rule-based, normalizer
+  matcher/                 Product matching: fuzzy, rule-based, normalizer. session.go adds Session (Engine.NewSession) for batch callers
   models/                  Shared data structs
   units/                   Unit parsing/conversion (lb, oz, gal, etc.)
   worker/                  Background receipt processing (goroutine pool)
@@ -67,6 +67,8 @@ go test ./...     # Run Go tests (no frontend tests)
 - **Migrations** — sequential numbered files in `internal/db/migrations/` (NNN_name.up.sql + .down.sql)
 - **Error handling** — return `fmt.Errorf("context: %w", err)`, Echo handlers return `echo.NewHTTPError`
 - **Frontend API calls** — in `web/src/api/`, consumed via TanStack Query hooks
+- **Matcher batch ingest** — when matching a batch of items (receipt worker, spreadsheet import, or any new batch path), open a `matcher.Session` via `Engine.NewSession(householdID, storeID)` before the items loop and call `session.MatchWithSuggestion` inside the loop. This preloads fuzzy candidates once instead of per-item. `Engine.Match` / `Engine.MatchWithSuggestion` remain available for one-shot callers (e.g., manual POST in `api/receipts.go`). `spreadsheet.MatchEngine` interface requires `NewSession` — any test fake must stub it.
+- **Spreadsheet import pipeline** — `prepareSpreadsheetImport` in `internal/api/import_spreadsheet_prep.go` is the single source of truth for the shared transforms → skip → normalize+since-date → group → (optional split) → duplicate-check pipeline. Preview calls it with `applySplit=true`; Commit calls it with `applySplit=false`. Commit retains a post-helper since-date rebuild of `transformed.Rows` for `spreadsheet.Commit`'s internal normalize/group step — that rebuild is Commit-specific and is not part of the shared helper.
 
 ## Analytics conventions
 
@@ -85,3 +87,4 @@ go test ./...     # Run Go tests (no frontend tests)
 - SQLite — no concurrent write support, single-writer model
 - Receipt images stored on disk at `DATA_DIR/receipts/{uuid}/`
 - Planning docs (`PLAN-*.md`, `ANALYSIS-*.md`, etc.) are gitignored
+- **WebSocket lifecycle** — `connectWebSocket(queryClient)` in `web/src/api/ws.ts` is mounted exactly once in `AppLayout` (always post-auth via `ProtectedRoute`). Do NOT call it from individual components. Cleanup via `disconnectWebSocket()` runs on unmount/logout. The socket drives React Query cache invalidation for `receipt.complete`, `list.*`, `product.updated`, and `store.updated` messages.

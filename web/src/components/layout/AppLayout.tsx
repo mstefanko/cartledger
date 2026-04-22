@@ -1,9 +1,19 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Outlet } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
+import { connectWebSocket, disconnectWebSocket } from '@/api/ws'
 import { Sidebar } from '@/components/ui/Sidebar'
 
 function AppLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    connectWebSocket(queryClient)
+    return () => {
+      disconnectWebSocket()
+    }
+  }, [queryClient])
 
   return (
     <div className="flex h-screen overflow-hidden bg-white">

@@ -924,53 +924,20 @@ func previewCacheKey(req previewRequest, revision int) string {
 func (h *ImportSpreadsheetHandler) buildPreview(c echo.Context, s *spreadsheet.Staging, ps *spreadsheet.ParsedSheet, req previewRequest) previewResponse {
 	mapping := jsonToRoleMap(req.Mapping)
 
-	// Apply the persistent transform chain first, then the one-shot
-	// skip_row_indices the client supplied in this preview request. The
-	// chain-skips are carried on Staging; ad-hoc skips are NOT persisted
-	// (plan distinguishes saved transforms from per-preview skip toggles).
-	transformed := spreadsheet.ApplyTransforms(ps, s.Chain)
-	if len(req.SkipRowIndices) > 0 {
-		skipSet := make(map[int]bool, len(req.SkipRowIndices))
-		for _, i := range req.SkipRowIndices {
-			skipSet[i] = true
-		}
-		filtered := transformed.Rows[:0:0]
-		for _, r := range transformed.Rows {
-			if !skipSet[r.Index] {
-				filtered = append(filtered, r)
-			}
-		}
-		transformed = &spreadsheet.ParsedSheet{
-			Name:          transformed.Name,
-			Headers:       transformed.Headers,
-			Rows:          filtered,
-			ColumnSamples: transformed.ColumnSamples,
-			TypeCoverage:  transformed.TypeCoverage,
-		}
-	}
-
-	// Since-date filter: drop rows whose parsed date is before since_date.
-	// We apply this AFTER NormalizeRow so we filter on the parsed date, not
-	// a raw string that may not match the selected date format.
-	parsed := make([]spreadsheet.ParsedValue, 0, len(transformed.Rows))
-	for _, raw := range transformed.Rows {
-		pv := spreadsheet.NormalizeRow(raw, mapping, req.UnitOptions, req.Grouping, req.DateFormat)
-		if req.SinceDate != "" && pv.Date != "" && pv.Date < req.SinceDate {
-			continue
-		}
-		parsed = append(parsed, pv)
-	}
-
-	groups := spreadsheet.GroupRows(parsed, req.Grouping)
-	groups = spreadsheet.ApplySplitSuggested(parsed, groups)
-
-	// Duplicate check against committed receipts. Errors are non-fatal —
-	// the preview still renders without duplicate badges.
-	duplicates, err := spreadsheet.CheckDuplicates(c.Request().Context(), h.DB, s.HouseholdID, groups)
+	prep, err := h.prepareSpreadsheetImport(c.Request().Context(), s, ps, mapping, prepareArgs{
+		SkipRowIndices: req.SkipRowIndices,
+		UnitOptions:    req.UnitOptions,
+		Grouping:       req.Grouping,
+		DateFormat:     req.DateFormat,
+		SinceDate:      req.SinceDate,
+	}, true)
 	if err != nil {
 		slog.Warn("spreadsheet preview: duplicate check failed", "err", err, "import_id", s.ImportID)
-		duplicates = spreadsheet.DuplicateMap{}
 	}
+	transformed := prep.Transformed
+	parsed := prep.Parsed
+	groups := prep.Groups
+	duplicates := prep.Duplicates
 
 	// Build preview rows (cap at 50 per plan).
 	pvByIdx := make(map[int]spreadsheet.ParsedValue, len(parsed))
@@ -1181,44 +1148,24 @@ func (h *ImportSpreadsheetHandler) Commit(c echo.Context) error {
 		})
 	}
 
-	// Replay transforms + per-request skips the same way preview does —
-	// the commit path MUST normalize from the same inputs the user saw.
-	transformed := spreadsheet.ApplyTransforms(ps, s.Chain)
-	if len(req.SkipRowIndices) > 0 {
-		skipSet := make(map[int]bool, len(req.SkipRowIndices))
-		for _, i := range req.SkipRowIndices {
-			skipSet[i] = true
-		}
-		filtered := transformed.Rows[:0:0]
-		for _, r := range transformed.Rows {
-			if !skipSet[r.Index] {
-				filtered = append(filtered, r)
-			}
-		}
-		transformed = &spreadsheet.ParsedSheet{
-			Name:          transformed.Name,
-			Headers:       transformed.Headers,
-			Rows:          filtered,
-			ColumnSamples: transformed.ColumnSamples,
-			TypeCoverage:  transformed.TypeCoverage,
-		}
-	}
-
 	mapping := jsonToRoleMap(req.Mapping)
 
-	// Build groups here to run a fresh duplicate check BEFORE delegating to
-	// spreadsheet.Commit (which re-runs its own normalize/group internally).
-	// CheckDuplicates is read-only so duplicating the work is cheap; the
-	// alternative (threading it through CommitInput) would require a plumbing
-	// change in the spreadsheet package that's out of scope for Phase 5.
-	parsed := make([]spreadsheet.ParsedValue, 0, len(transformed.Rows))
-	for _, raw := range transformed.Rows {
-		pv := spreadsheet.NormalizeRow(raw, mapping, req.UnitOptions, req.Grouping, req.DateFormat)
-		if req.SinceDate != "" && pv.Date != "" && pv.Date < req.SinceDate {
-			continue
-		}
-		parsed = append(parsed, pv)
+	// Run the shared pipeline (transforms → skips → normalize+since → group → check duplicates).
+	// applySplit=false: commit doesn't need split suggestions (only preview does).
+	prep, err := h.prepareSpreadsheetImport(c.Request().Context(), s, ps, mapping, prepareArgs{
+		SkipRowIndices: req.SkipRowIndices,
+		UnitOptions:    req.UnitOptions,
+		Grouping:       req.Grouping,
+		DateFormat:     req.DateFormat,
+		SinceDate:      req.SinceDate,
+	}, false)
+	if err != nil {
+		slog.Warn("spreadsheet commit: duplicate check failed", "err", err)
 	}
+	transformed := prep.Transformed
+	parsed := prep.Parsed
+	groups := prep.Groups
+	duplicates := prep.Duplicates
 
 	// SINCE filter: drop rows whose parsed date is older than since_date
 	// by actually deleting them from the transformed sheet so Commit's
@@ -1241,13 +1188,6 @@ func (h *ImportSpreadsheetHandler) Commit(c echo.Context) error {
 			ColumnSamples: transformed.ColumnSamples,
 			TypeCoverage:  transformed.TypeCoverage,
 		}
-	}
-
-	groups := spreadsheet.GroupRows(parsed, req.Grouping)
-	duplicates, err := spreadsheet.CheckDuplicates(c.Request().Context(), h.DB, householdID, groups)
-	if err != nil {
-		slog.Warn("spreadsheet commit: duplicate check failed", "err", err)
-		duplicates = spreadsheet.DuplicateMap{}
 	}
 
 	// Translate group_overrides into IncludedGroupIDs / ConfirmedDuplicates.
