@@ -299,6 +299,38 @@ func TestCategoryBreakdown_OutsideWindow(t *testing.T) {
 	}
 }
 
+// TestCategoryBreakdown_TodayReceipt — regression: a receipt inserted with receipt_date = today
+// (i.e. "0 days" offset) must appear in the current window. This validates the fix that changed
+// the current-window upper bound from `today` (< today, exclusive) to `tomorrow` (< tomorrow, inclusive).
+func TestCategoryBreakdown_TodayReceipt(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	var householdID string
+	if err := ah.DB.QueryRow("INSERT INTO households (name) VALUES ('HTodayCB') RETURNING id").Scan(&householdID); err != nil {
+		t.Fatalf("insert household: %v", err)
+	}
+
+	_, receiptID := insertReceiptRelative(t, ah, householdID, "0 days", "matched")
+	productID := insertProductNamed(t, ah, householdID, "TodayItem", "Grocery")
+	insertLineItemForReceipt(t, ah, receiptID, productID, "15.00")
+
+	resp := callCategoryBreakdown(t, ah, householdID)
+
+	if resp.Total != 15.00 {
+		t.Errorf("total: expected 15.00 (today's receipt included), got %f", resp.Total)
+	}
+	if len(resp.Categories) != 1 {
+		t.Fatalf("expected 1 category, got %d: %v", len(resp.Categories), resp.Categories)
+	}
+	if resp.Categories[0].Name != "Grocery" {
+		t.Errorf("category name: expected 'Grocery', got %q", resp.Categories[0].Name)
+	}
+	if resp.Categories[0].Current != 15.00 {
+		t.Errorf("current: expected 15.00, got %f", resp.Categories[0].Current)
+	}
+}
+
 // TestCategoryBreakdown_HouseholdScoping — case 8: two households, each sees only its own totals.
 func TestCategoryBreakdown_HouseholdScoping(t *testing.T) {
 	ah, cleanup := newAnalyticsHandler(t)

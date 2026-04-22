@@ -222,6 +222,40 @@ func TestRhythm_MostShoppedDOW_ClearWinner(t *testing.T) {
 	}
 }
 
+// TestRhythm_TodayReceipt: a receipt dated today (receipt_date == time.Now().UTC().Format("2006-01-02"))
+// must be included in the current window. Regression for the today-exclusion bug where
+// receipt_date < today excluded receipts stored exactly on today's date.
+func TestRhythm_TodayReceipt(t *testing.T) {
+	ph, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, _ := seedTestData(t, ph)
+	ah := &AnalyticsHandler{DB: ph.DB, Cfg: ph.Cfg}
+
+	todayDate := time.Now().UTC().Format("2006-01-02")
+	receiptID := insertReceipt(t, ah, householdID, todayDate, "42.00", "matched")
+
+	if _, err := ah.DB.Exec(
+		"INSERT INTO line_items (receipt_id, raw_name, total_price) VALUES (?, 'item', '42.00')",
+		receiptID,
+	); err != nil {
+		t.Fatalf("insert line_item: %v", err)
+	}
+
+	resp, code := rhythmCall(t, ah, householdID)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if resp.Trips.Current != 1 {
+		t.Errorf("trips.current: expected 1 (today's receipt included), got %d", resp.Trips.Current)
+	}
+	if resp.AvgBasket.Current != 42.0 {
+		t.Errorf("avg_basket.current: expected 42.0, got %f", resp.AvgBasket.Current)
+	}
+	if resp.AvgItemsPerTrip != 1.0 {
+		t.Errorf("avg_items_per_trip: expected 1.0, got %f", resp.AvgItemsPerTrip)
+	}
+}
+
 // TestRhythm_MostShoppedDOW_TieReturnsString: exact two-way tie between
 // Saturday and Sunday across >= 14 days → "Saturday/Sunday".
 func TestRhythm_MostShoppedDOW_TieReturnsString(t *testing.T) {

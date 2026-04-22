@@ -71,7 +71,7 @@ go test ./...     # Run Go tests (no frontend tests)
 ## Analytics conventions
 
 - Date windows for analytics endpoints are computed in Go (`time.Now().AddDate(...)`), never via SQLite `date('now',...)`.
-- Rolling-30-day convention: `/analytics/rhythm` (and similar time-window endpoints) uses `[now-60d, now-30d)` as the prior window and `[now-30d, now)` as the current window for period-over-period comparisons.
+- Rolling-30-day convention: `/analytics/rhythm` (and similar time-window endpoints) uses `[now-60d, now-30d)` as the prior window and `[now-30d, now+1d)` as the current window for period-over-period comparisons (upper bound is `tomorrow = now.AddDate(0,0,1)`, so today's receipts are included).
 - `discount_amount` is stored as a positive value in `line_items` — do NOT negate when summing (e.g., `/analytics/savings`).
 - `/analytics/staples` cadence is **calendar-event based** (`COUNT(DISTINCT date)`) — NOT quantity-weighted. That distinguishes it from `/analytics/buy-again`, which divides `AVG(days_gap)` by `AVG(quantity)`. Projection fields are null until the household has >=60 days of history.
 - `/analytics/inflation` uses a **Laspeyres fixed-weight basket**: weights are current-period median quantities, so the index measures pure price change. Symmetric exclusion: a product contributes only if it appears in both windows of a comparison pair. Both deltas are suppressed when history < 90/180 days or basket overlap < 50%.

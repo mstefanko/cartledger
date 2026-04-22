@@ -821,7 +821,7 @@ func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 
 	// All date boundaries computed in Go; never use SQLite date('now',...).
 	now := time.Now().UTC()
-	today := now.Format("2006-01-02")
+	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
 	cur := now.AddDate(0, 0, -30).Format("2006-01-02")
 	prev := now.AddDate(0, 0, -60).Format("2006-01-02")
 
@@ -836,7 +836,7 @@ func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 		  AND r.receipt_date <  ?
 		  AND r.status IN ('pending','matched','reviewed')`
 
-	if err := h.DB.QueryRow(qTrips, householdID, cur, today).Scan(&resp.Trips.Current); err != nil {
+	if err := h.DB.QueryRow(qTrips, householdID, cur, tomorrow).Scan(&resp.Trips.Current); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 	}
 
@@ -859,7 +859,7 @@ func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 		  AND r.receipt_date <  ?
 		  AND r.status IN ('pending','matched','reviewed')`
 
-	if err := h.DB.QueryRow(qBasket, householdID, cur, today).Scan(&resp.AvgBasket.Current); err != nil {
+	if err := h.DB.QueryRow(qBasket, householdID, cur, tomorrow).Scan(&resp.AvgBasket.Current); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 	}
 	if err := h.DB.QueryRow(qBasket, householdID, prev, cur).Scan(&resp.AvgBasket.Prior); err != nil {
@@ -877,7 +877,7 @@ func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 		  AND r.receipt_date >= ?
 		  AND r.receipt_date <  ?
 		  AND r.status IN ('pending','matched','reviewed')`,
-		householdID, cur, today,
+		householdID, cur, tomorrow,
 	).Scan(&resp.AvgItemsPerTrip); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 	}
@@ -889,7 +889,7 @@ func (h *AnalyticsHandler) Rhythm(c echo.Context) error {
 		FROM receipts r
 		WHERE r.household_id = ?
 		  AND r.status IN ('pending','matched','reviewed')`,
-		today, householdID,
+		tomorrow, householdID,
 	).Scan(&resp.HistoryDays); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 	}
@@ -1000,7 +1000,7 @@ func (h *AnalyticsHandler) CategoryBreakdown(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 
 	now := time.Now().UTC()
-	today := now.Format("2006-01-02")
+	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
 	cur := now.AddDate(0, 0, -30).Format("2006-01-02")
 	prev := now.AddDate(0, 0, -60).Format("2006-01-02")
 
@@ -1024,7 +1024,7 @@ func (h *AnalyticsHandler) CategoryBreakdown(c echo.Context) error {
 		return result, rows.Err()
 	}
 
-	currentMap, err := runWindow(cur, today)
+	currentMap, err := runWindow(cur, tomorrow)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 	}
