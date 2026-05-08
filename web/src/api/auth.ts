@@ -18,8 +18,8 @@ export async function getStatus(): Promise<StatusResponse> {
 // The response body carries the user object only (the `token` field is a
 // legacy artefact that will be empty post-cutover; do NOT rely on it).
 //
-// setup() REQUIRES a one-time bootstrap token (printed to server stderr on
-// first boot). We forward it as `?bootstrap=<token>` — the backend
+// setup() REQUIRES a one-time bootstrap token (printed to the server logs
+// whenever setup is needed). We forward it as `?bootstrap=<token>` — the backend
 // (internal/api/auth.go Setup) accepts both the query param and the
 // X-Bootstrap-Token header; query param is simpler for the SPA and avoids a
 // custom header on the CORS allow-list.

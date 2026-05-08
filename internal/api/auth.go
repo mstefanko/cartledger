@@ -104,14 +104,34 @@ func (h *AuthHandler) Status(c echo.Context) error {
 	if err := h.DB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
+	if count == 0 {
+		if err := h.ensureBootstrapForEmptyUsers(); err != nil {
+			slog.Warn("bootstrap token ensure failed", "err", err)
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
 	return c.JSON(http.StatusOK, map[string]bool{"needs_setup": count == 0})
 }
 
-// Setup handles first-boot setup: creates household + user in a single transaction.
+func (h *AuthHandler) ensureBootstrapForEmptyUsers() error {
+	if h.Bootstrap == nil {
+		return nil
+	}
+	token, activated, err := h.Bootstrap.EnsureForEmptyUsers(h.DB)
+	if err != nil {
+		return err
+	}
+	if activated && token != "" && h.Cfg != nil {
+		PrintBootstrapBanner(h.Cfg, token)
+	}
+	return nil
+}
+
+// Setup handles owner setup: creates household + first user in a single transaction.
 // POST /api/v1/setup
 //
-// A one-time bootstrap token (printed to stderr on first boot when users is
-// empty) is REQUIRED. The client may pass it as either:
+// A one-time bootstrap token (printed to stderr whenever users is empty) is
+// REQUIRED. The client may pass it as either:
 //   - query parameter: ?bootstrap=<token>
 //   - header: X-Bootstrap-Token: <token>
 //
@@ -125,6 +145,10 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 	candidate := c.QueryParam("bootstrap")
 	if candidate == "" {
 		candidate = c.Request().Header.Get("X-Bootstrap-Token")
+	}
+	if err := h.ensureBootstrapForEmptyUsers(); err != nil {
+		slog.Warn("bootstrap token ensure failed", "err", err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	if h.Bootstrap == nil || !h.Bootstrap.Check(candidate) {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or missing bootstrap token"})

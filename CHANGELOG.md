@@ -34,16 +34,15 @@ the session format changed.
   testing.
 
 **New first-run bootstrap flow:**
-When the `users` table is empty at boot, the server prints a one-time
-URL to stderr:
+When the `users` table is empty at boot, or becomes empty again while the
+server is running, the server prints a one-time URL to stderr:
 
     http://localhost:8079/setup?bootstrap=<random-token>
 
 The `/setup` endpoint now **requires** the `?bootstrap=` token (or the
-`X-Bootstrap-Token` header). The token is regenerated on first boot only;
-if the server restarts before setup completes, the same URL keeps working.
-Once setup succeeds, the token is marked consumed and `/setup` rejects
-every further call with 401.
+`X-Bootstrap-Token` header). The token is reused if the server restarts before
+setup completes, then marked consumed after setup succeeds. If all users are
+later cleared, a fresh token is generated and logged again.
 
 ### Added
 - **Image retention janitor** (`internal/imaging/retention.go`): when

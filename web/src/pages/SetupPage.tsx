@@ -12,9 +12,9 @@ function SetupPage() {
   const navigate = useNavigate()
   const { setAuth } = useAuth()
 
-  // The one-time bootstrap token is printed to the server's stderr on first
-  // boot as part of a "setup URL". Without it, POST /setup returns 401 — so
-  // we require it to be present in the query string.
+  // The one-time bootstrap token is printed to the server logs whenever setup
+  // is needed. Without it, POST /setup returns 401 — so we require it to be
+  // present in the query string.
   const [searchParams] = useSearchParams()
   const bootstrapToken = searchParams.get('bootstrap') ?? ''
 
@@ -49,7 +49,7 @@ function SetupPage() {
   }
 
   const missingTokenMessage = !bootstrapToken
-    ? 'Setup requires the bootstrap URL printed at server startup — open it from the server logs.'
+    ? 'Setup requires the bootstrap URL printed in the server logs. A fresh URL is logged whenever no users exist.'
     : null
 
   const errorMessage =

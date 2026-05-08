@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useAuth, AuthProvider } from '@/hooks/useAuth'
 import { AppLayout } from '@/components/layout/AppLayout'
 import LoginPage from '@/pages/LoginPage'
@@ -50,6 +50,7 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
 
 function PublicRoute({ children }: { children: ReactNode }) {
   const { isAuthenticated, needsSetup, isLoading } = useAuth()
+  const location = useLocation()
 
   if (isLoading) {
     return (
@@ -59,8 +60,11 @@ function PublicRoute({ children }: { children: ReactNode }) {
     )
   }
 
-  // If setup is needed, only allow the setup page
+  // If setup is needed, only allow the setup page.
   if (needsSetup) {
+    if (location.pathname !== '/setup') {
+      return <Navigate to="/setup" replace />
+    }
     return <>{children}</>
   }
 
