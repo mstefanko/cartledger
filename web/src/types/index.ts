@@ -323,14 +323,10 @@ export interface StatusResponse {
   needs_setup: boolean
 }
 
-export interface InviteResponse {
-  link: string
-  expires_in: string
-}
-
 export interface ValidateInviteResponse {
   household_name: string
   invited_by: string
+  email?: string
 }
 
 export interface JoinRequest {

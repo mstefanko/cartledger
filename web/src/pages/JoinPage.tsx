@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { validateInvite, join } from '@/api/auth'
@@ -52,6 +52,14 @@ function JoinPage() {
         ? 'Something went wrong. Please try again.'
         : null
 
+  const invite = inviteQuery.data
+
+  useEffect(() => {
+    if (invite?.email && !email) {
+      setEmail(invite.email)
+    }
+  }, [invite?.email, email])
+
   if (!token) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-white px-4">
@@ -82,8 +90,6 @@ function JoinPage() {
       </div>
     )
   }
-
-  const invite = inviteQuery.data
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-white px-4">

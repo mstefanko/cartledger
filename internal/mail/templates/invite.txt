@@ -1,0 +1,5 @@
+Hello,
+
+{{.InviterName}} invited you to join {{.Household}} on CartLedger.
+
+{{.URL}}

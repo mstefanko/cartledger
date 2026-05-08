@@ -90,9 +90,36 @@ go test ./...
 | `LLM_MODEL` | `claude-sonnet-4-20250514` | Claude model ID (e.g., `claude-haiku-4-5-20251001` for cheaper/faster) |
 | `ANTHROPIC_API_KEY` | — | Required for receipt scanning |
 | `JWT_SECRET` | `change-me-in-production` | JWT signing key |
+| `SMTP_HOST` | *(empty)* | SMTP server hostname. Leave empty to disable outbound email |
+| `SMTP_PORT` | `587` | SMTP server port |
+| `SMTP_USER` | *(empty)* | SMTP username |
+| `SMTP_PASS` | *(empty)* | SMTP password or app password |
+| `SMTP_FROM` | *(empty)* | Sender address, required when `SMTP_HOST` is set |
+| `SMTP_TLS_MODE` | `starttls` | `none`, `starttls`, or `tls` |
+| `APP_BASE_URL` | `http://localhost:8079` | Public app URL for reset and invite links; required when email is enabled |
 | `ALLOW_PRIVATE_INTEGRATIONS` | `false` | Allow integration base URLs on loopback/LAN/RFC1918 addresses (self-hosters on a LAN typically want `true`) |
 
 Mealie (and other recipe/shopping integrations) are configured per-household in the UI: **Settings -> Integrations**. No environment variables required.
+
+### Email and Password Recovery
+
+Password reset and invite emails are disabled when `SMTP_HOST` is empty. In that mode, reset requests still return success so account existence is not exposed; an operator can reset a password from the server with:
+
+```bash
+cartledger reset-password user@example.com
+```
+
+Gmail app-password example:
+
+```bash
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-address@gmail.com
+SMTP_PASS=your-16-character-app-password
+SMTP_FROM="CartLedger <your-address@gmail.com>"
+SMTP_TLS_MODE=starttls
+APP_BASE_URL=https://cartledger.example.com
+```
 
 ## Project Structure
 

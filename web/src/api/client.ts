@@ -47,7 +47,11 @@ async function handleResponse<T>(response: Response): Promise<T> {
     // /profile probe hard-reloads /login on every mount, looping forever.
     const path = window.location.pathname
     const onPublic =
-      path === '/login' || path === '/setup' || path.startsWith('/join/')
+      path === '/login' ||
+      path === '/setup' ||
+      path === '/forgot-password' ||
+      path === '/reset-password' ||
+      path.startsWith('/join/')
     if (!onPublic) {
       window.location.href = '/login'
     }

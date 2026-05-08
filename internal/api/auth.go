@@ -24,6 +24,8 @@ var setupMu sync.Mutex
 // emailRegex is a basic email format check: must contain @ with a dot after it.
 var emailRegex = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 
+var dummyPasswordHash = "$2a$10$xqm3pLcC3lrgsLCbfDA99eUsKXNATPEOorAWVFaDXn5MyX0E.rbUK"
+
 // AuthHandler holds dependencies for auth-related endpoints.
 type AuthHandler struct {
 	DB        *sql.DB
@@ -77,7 +79,6 @@ type userResponse struct {
 // publicRateLimited applies rate limiting to login/setup/join to prevent brute-force attacks.
 func (h *AuthHandler) RegisterRoutes(public *echo.Group, publicRateLimited *echo.Group, protected *echo.Group) {
 	public.GET("/status", h.Status)
-	public.GET("/invite/:token/validate", h.ValidateInvite)
 
 	// Rate-limited auth endpoints: 10 requests/minute per IP.
 	publicRateLimited.POST("/setup", h.Setup)
@@ -90,7 +91,6 @@ func (h *AuthHandler) RegisterRoutes(public *echo.Group, publicRateLimited *echo
 	// clearing a cookie they already don't possess.
 	public.POST("/logout", h.Logout)
 
-	protected.POST("/invite", h.CreateInvite)
 	protected.GET("/profile", h.GetProfile)
 	protected.PUT("/profile", h.UpdateProfile)
 	protected.PUT("/household", h.UpdateHousehold)
@@ -141,8 +141,8 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 	if !emailRegex.MatchString(req.Email) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid email format"})
 	}
-	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+	if err := auth.ValidateNewPassword(req.Password); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
 	// Serialize setup requests with a mutex to prevent the TOCTOU race where
@@ -186,8 +186,8 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 	// creating here is definitionally the first user and gets is_admin=1.
 	// The /join path does NOT promote; only the bootstrap-gated /setup does.
 	_, err = tx.Exec(
-		"INSERT INTO users (id, household_id, email, name, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
-		userID, householdID, req.Email, req.UserName, passwordHash, now,
+		"INSERT INTO users (id, household_id, email, name, password_hash, is_admin, created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+		userID, householdID, req.Email, req.UserName, passwordHash, now, auth.SQLiteDateTime(now),
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create user"})
@@ -243,6 +243,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		req.Email,
 	).Scan(&userID, &householdID, &name, &passwordHash, &isAdmin)
 	if err == sql.ErrNoRows {
+		_ = auth.CheckPassword(dummyPasswordHash, req.Password)
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
 	}
 	if err != nil {
@@ -279,50 +280,7 @@ func (h *AuthHandler) Logout(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "logged out"})
 }
 
-// CreateInvite generates an invite link with a signed JWT (7-day expiry).
-// POST /api/v1/invite (authenticated)
-func (h *AuthHandler) CreateInvite(c echo.Context) error {
-	userID := auth.UserIDFrom(c)
-	householdID := auth.HouseholdIDFrom(c)
-
-	// Look up inviter name for the invite token claims.
-	var inviterName string
-	if err := h.DB.QueryRow("SELECT name FROM users WHERE id = ?", userID).Scan(&inviterName); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
-	}
-
-	token, err := auth.CreateInviteToken(h.Cfg.JWTSecret, householdID, userID, inviterName)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create invite token"})
-	}
-
-	return c.JSON(http.StatusOK, map[string]string{
-		"token":      token,
-		"expires_in": "7 days",
-	})
-}
-
-// ValidateInvite validates an invite JWT and returns household + inviter info.
-// GET /api/v1/invite/:token/validate
-func (h *AuthHandler) ValidateInvite(c echo.Context) error {
-	tokenStr := c.Param("token")
-	claims, err := auth.ValidateInviteToken(h.Cfg.JWTSecret, tokenStr)
-	if err != nil {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired invite"})
-	}
-
-	var householdName string
-	if err := h.DB.QueryRow("SELECT name FROM households WHERE id = ?", claims.HouseholdID).Scan(&householdName); err != nil {
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "household not found"})
-	}
-
-	return c.JSON(http.StatusOK, map[string]string{
-		"household_name": householdName,
-		"invited_by":     claims.InviterName,
-	})
-}
-
-// Join validates an invite JWT, creates a new user, and returns an auth JWT.
+// Join validates a DB-backed invite, creates a new user, and returns an auth JWT.
 // POST /api/v1/join
 func (h *AuthHandler) Join(c echo.Context) error {
 	var req joinRequest
@@ -336,16 +294,12 @@ func (h *AuthHandler) Join(c echo.Context) error {
 	if !emailRegex.MatchString(req.Email) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid email format"})
 	}
-	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
-	}
-
-	claims, err := auth.ValidateInviteToken(h.Cfg.JWTSecret, req.Token)
-	if err != nil {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired invite"})
+	if err := auth.ValidateNewPassword(req.Password); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
 	now := time.Now().UTC()
+	nowStr := auth.SQLiteDateTime(now)
 	userID := uuid.New().String()
 
 	passwordHash, err := auth.HashPassword(req.Password)
@@ -360,6 +314,27 @@ func (h *AuthHandler) Join(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
+	var inviteID, householdID string
+	var inviteEmail sql.NullString
+	err = tx.QueryRow(
+		`SELECT id, household_id, email
+		 FROM invite_links
+		 WHERE token_hash = ?
+		   AND expires_at > ?
+		   AND consumed_at IS NULL
+		   AND revoked_at IS NULL`,
+		auth.HashToken(strings.TrimSpace(req.Token)), nowStr,
+	).Scan(&inviteID, &householdID, &inviteEmail)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired invite"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if inviteEmail.Valid && inviteEmail.String != "" && !strings.EqualFold(inviteEmail.String, req.Email) {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "invite is for a different email"})
+	}
+
 	// Check for duplicate email inside the transaction.
 	var existing int
 	if err := tx.QueryRow("SELECT COUNT(*) FROM users WHERE email = ?", req.Email).Scan(&existing); err != nil {
@@ -370,18 +345,33 @@ func (h *AuthHandler) Join(c echo.Context) error {
 	}
 
 	_, err = tx.Exec(
-		"INSERT INTO users (id, household_id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-		userID, claims.HouseholdID, req.Email, req.UserName, passwordHash, now,
+		"INSERT INTO users (id, household_id, email, name, password_hash, created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		userID, householdID, req.Email, req.UserName, passwordHash, now, nowStr,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create user"})
+	}
+
+	res, err := tx.Exec(
+		"UPDATE invite_links SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
+		nowStr, inviteID, nowStr,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if n != 1 {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired invite"})
 	}
 
 	if err := tx.Commit(); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
 	}
 
-	token, err := auth.CreateAuthToken(h.Cfg.JWTSecret, userID, claims.HouseholdID)
+	token, err := auth.CreateAuthToken(h.Cfg.JWTSecret, userID, householdID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create token"})
 	}
@@ -392,7 +382,7 @@ func (h *AuthHandler) Join(c echo.Context) error {
 	return c.JSON(http.StatusCreated, authResponse{
 		User: userResponse{
 			ID:          userID,
-			HouseholdID: claims.HouseholdID,
+			HouseholdID: householdID,
 			Email:       req.Email,
 			Name:        req.UserName,
 		},

@@ -1,0 +1,2 @@
+-- SQLite can't drop a column without a table rebuild on older deployments.
+-- Leaving the nullable audit column in place is safe on rollback.

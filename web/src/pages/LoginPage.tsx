@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { useAuth } from '@/hooks/useAuth'
 import { Button } from '@/components/ui/Button'
@@ -71,6 +71,12 @@ function LoginPage() {
           <Button type="submit" fullWidth disabled={mutation.isPending}>
             {mutation.isPending ? 'Signing in...' : 'Sign In'}
           </Button>
+          <Link
+            to="/forgot-password"
+            className="text-center text-caption font-medium text-brand hover:text-brand-dark"
+          >
+            Forgot password?
+          </Link>
         </form>
       </div>
     </div>

@@ -20,6 +20,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
+	appmail "github.com/mstefanko/cartledger/internal/mail"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/spreadsheet"
 	"github.com/mstefanko/cartledger/internal/worker"
@@ -33,7 +34,7 @@ import (
 // that stand up a router with pre-populated users); the Setup handler then
 // rejects every call with 401, which matches the user-facing behavior of
 // "setup already completed".
-func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore, matchEngine spreadsheet.MatchEngine) (*echo.Echo, *RateLimiter) {
+func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore, matchEngine spreadsheet.MatchEngine, mailer appmail.Mailer) (*echo.Echo, *RateLimiter) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -185,6 +186,12 @@ func NewRouter(database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker 
 
 	authHandler := &AuthHandler{DB: database, Cfg: cfg, Bootstrap: bootstrap}
 	authHandler.RegisterRoutes(public, publicRateLimited, protected)
+
+	passwordHandler := &PasswordHandler{DB: database, Cfg: cfg, Mailer: mailer, SendContext: appCtx}
+	passwordHandler.RegisterRoutes(publicRateLimited, protected)
+
+	invitesHandler := &InvitesHandler{DB: database, Cfg: cfg, Mailer: mailer, SendContext: appCtx}
+	invitesHandler.RegisterRoutes(public, protected)
 
 	storeHandler := &StoreHandler{DB: database, Cfg: cfg}
 	storeHandler.RegisterRoutes(protected)

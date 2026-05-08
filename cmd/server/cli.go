@@ -38,6 +38,7 @@ With no subcommand, it runs the HTTP server (same as "cartledger serve").`,
 	root.AddCommand(newBackupCmd())
 	root.AddCommand(newRestoreCmd())
 	root.AddCommand(newPromoteAdminCmd())
+	root.AddCommand(newResetPasswordCmd())
 	root.AddCommand(newVersionCmd())
 
 	return root

@@ -21,6 +21,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
+	appmail "github.com/mstefanko/cartledger/internal/mail"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
@@ -96,6 +97,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Run migrations.
 	if err := db.RunMigrations(database); err != nil {
 		fatalExit("run migrations", "err", err)
+	}
+
+	mailer, err := appmail.New(cfg)
+	if err != nil {
+		fatalExit("init mailer", "err", err)
+	}
+	if mailer.Enabled() {
+		slog.Info("mailer enabled", "host", cfg.SMTPHost, "port", cfg.SMTPPort, "tls_mode", cfg.SMTPTLSMode)
+	} else {
+		slog.Info("mailer disabled")
 	}
 
 	// Start WebSocket hub.
@@ -214,13 +225,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		api.PrintBootstrapBanner(cfg, bootstrap.Token())
 	}
 
-	// Set up Echo with router, middleware, and all routes.
-	e, rateLimiter := api.NewRouter(database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore, matchEngine)
-	defer rateLimiter.Close()
-
 	// Graceful shutdown via signal.NotifyContext.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Set up Echo with router, middleware, and all routes.
+	e, rateLimiter := api.NewRouter(ctx, database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore, matchEngine, mailer)
+	defer rateLimiter.Close()
 
 	// Start the retention janitor now that we have a cancellable context.
 	// Stop is deferred so it runs during graceful shutdown.
@@ -228,6 +239,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		retentionJanitor.Start(ctx)
 		defer retentionJanitor.Stop()
 	}
+
+	authJanitor := db.NewJanitor(database, time.Hour, slog.Default())
+	authJanitor.Start(ctx)
 
 	// Start server in a goroutine.
 	go func() {

@@ -2,6 +2,8 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth, AuthProvider } from '@/hooks/useAuth'
 import { AppLayout } from '@/components/layout/AppLayout'
 import LoginPage from '@/pages/LoginPage'
+import ForgotPasswordPage from '@/pages/ForgotPasswordPage'
+import ResetPasswordPage from '@/pages/ResetPasswordPage'
 import ManualReceiptPage from '@/pages/ManualReceiptPage'
 import SetupPage from '@/pages/SetupPage'
 import JoinPage from '@/pages/JoinPage'
@@ -17,6 +19,7 @@ import ShoppingListPage from '@/pages/ShoppingListPage'
 import ImportPage from '@/pages/ImportPage'
 import SpreadsheetCommitResult from '@/pages/import/spreadsheet/SpreadsheetCommitResult'
 import SettingsPage from '@/pages/SettingsPage'
+import AdminInvitesPage from '@/pages/AdminInvitesPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import StoreViewPage from '@/pages/StoreViewPage'
 import ProductGroupPage from '@/pages/ProductGroupPage'
@@ -69,6 +72,14 @@ function PublicRoute({ children }: { children: ReactNode }) {
   return <>{children}</>
 }
 
+function AdminRoute({ children }: { children: ReactNode }) {
+  const { user } = useAuth()
+  if (!user?.is_admin) {
+    return <Navigate to="/" replace />
+  }
+  return <>{children}</>
+}
+
 function AppRoutes() {
   return (
     <Routes>
@@ -81,6 +92,8 @@ function AppRoutes() {
           </PublicRoute>
         }
       />
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
       <Route
         path="/setup"
         element={
@@ -123,6 +136,14 @@ function AppRoutes() {
         <Route path="import/spreadsheet/result" element={<SpreadsheetCommitResult />} />
         <Route path="conversions" element={<Navigate to="/settings?tab=conversions" replace />} />
         <Route path="settings" element={<SettingsPage />} />
+        <Route
+          path="admin/invites"
+          element={
+            <AdminRoute>
+              <AdminInvitesPage />
+            </AdminRoute>
+          }
+        />
         <Route path="scan" element={<ScanPage />} />
         <Route path="review" element={<ReviewPage />} />
       </Route>

@@ -15,12 +15,14 @@ import {
   Plus,
   PencilLine,
   ClipboardCheck,
+  UserPlus,
   type LucideProps,
 } from 'lucide-react'
 import { listStores } from '@/api/stores'
 import { listLists, createList } from '@/api/lists'
 import { getUnmatchedCount } from '@/api/review'
 import { useHasIntegrations } from '@/hooks/useHasIntegrations'
+import { useAuth } from '@/hooks/useAuth'
 
 interface SidebarProps {
   open: boolean
@@ -54,6 +56,12 @@ const IMPORT_LINK: { to: string; label: string; Icon: IconComponent } = {
   Icon: Upload,
 }
 
+const ADMIN_INVITES_LINK: { to: string; label: string; Icon: IconComponent } = {
+  to: '/admin/invites',
+  label: 'Invites',
+  Icon: UserPlus,
+}
+
 const ICON_SIZE = 16
 
 function StoreIcon({ icon }: { icon: string | null }) {
@@ -69,6 +77,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
   const queryClient = useQueryClient()
   const [creatingList, setCreatingList] = useState(false)
   const [newListName, setNewListName] = useState('')
+  const { user } = useAuth()
 
   const storesQuery = useQuery({
     queryKey: ['stores'],
@@ -85,9 +94,10 @@ function Sidebar({ open, onClose }: SidebarProps) {
   const { hasAny: hasIntegrations, isLoading: integrationsLoading } = useHasIntegrations()
   // While loading, hide the Import link entirely so it doesn't flash in and
   // then disappear once we learn there are no configured integrations.
+  const adminLinks = user?.is_admin ? [ADMIN_INVITES_LINK] : []
   const visiblePageLinks = !integrationsLoading && hasIntegrations
-    ? [...pageLinks, IMPORT_LINK]
-    : pageLinks
+    ? [...pageLinks, ...adminLinks, IMPORT_LINK]
+    : [...pageLinks, ...adminLinks]
 
   const listsQuery = useQuery({
     queryKey: ['shopping-lists'],

@@ -16,9 +16,11 @@ require (
 	github.com/sahilm/fuzzy v0.1.1
 	github.com/shopspring/decimal v1.2.0
 	github.com/spf13/cobra v1.10.2
+	github.com/wneessen/go-mail v0.7.2
 	github.com/xuri/excelize/v2 v2.10.1
 	golang.org/x/crypto v0.50.0
 	golang.org/x/image v0.39.0
+	golang.org/x/term v0.42.0
 	golang.org/x/text v0.36.0
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.18.1

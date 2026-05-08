@@ -40,7 +40,7 @@ type Config struct {
 	// default is 2_000_000 (~$6/mo at Sonnet pricing). See
 	// internal/llm/usage.go.
 	LLMMonthlyTokenBudget int64
-	JWTSecret       string
+	JWTSecret             string
 	// AllowPrivateIntegrations, when true, permits integration base_urls that
 	// resolve to loopback / link-local / RFC1918 / IPv6 ULA addresses. Default
 	// is false to prevent SSRF probes of internal services; self-hosted users
@@ -90,6 +90,16 @@ type Config struct {
 	// default 404). Default true. Env: IMPORT_SPREADSHEET_ENABLED.
 	// See PLAN-spreadsheet-import.md §Rollout.
 	ImportSpreadsheetEnabled bool
+
+	// SMTP/mail settings. Empty SMTPHost disables outbound mail. AppBaseURL is
+	// used to build invite and password-reset links.
+	SMTPHost    string
+	SMTPPort    int
+	SMTPUser    string
+	SMTPPass    string
+	SMTPFrom    string
+	SMTPTLSMode string
+	AppBaseURL  string
 }
 
 // defaultDevAllowedOrigins is the default ALLOWED_ORIGINS set used in non-
@@ -171,21 +181,31 @@ func Load() (*Config, error) {
 	_ = godotenv.Load() // ignore error if .env doesn't exist
 
 	cfg := &Config{
-		Port:                     getEnv("PORT", "8079"),
-		DataDir:                  getEnv("DATA_DIR", "./data"),
-		AnthropicAPIKey:          getEnv("ANTHROPIC_API_KEY", ""),
-		GeminiAPIKey:             getEnv("GEMINI_API_KEY", ""),
-		LLMProvider:              getEnv("LLM_PROVIDER", ""),
-		LLMModel:                 getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
-		LLMMonthlyTokenBudget:    getEnvInt64("LLM_MONTHLY_TOKEN_BUDGET", 0),
-		JWTSecret:                os.Getenv("JWT_SECRET"), // no default — policy applied below
-		AllowPrivateIntegrations: getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
-		LockInactivityTTL:        getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
-		RateLimitEnabled:         getEnvBool("RATE_LIMIT_ENABLED", true),
+		Port:                        getEnv("PORT", "8079"),
+		DataDir:                     getEnv("DATA_DIR", "./data"),
+		AnthropicAPIKey:             getEnv("ANTHROPIC_API_KEY", ""),
+		GeminiAPIKey:                getEnv("GEMINI_API_KEY", ""),
+		LLMProvider:                 getEnv("LLM_PROVIDER", ""),
+		LLMModel:                    getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
+		LLMMonthlyTokenBudget:       getEnvInt64("LLM_MONTHLY_TOKEN_BUDGET", 0),
+		JWTSecret:                   os.Getenv("JWT_SECRET"), // no default — policy applied below
+		AllowPrivateIntegrations:    getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
+		LockInactivityTTL:           getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
+		RateLimitEnabled:            getEnvBool("RATE_LIMIT_ENABLED", true),
 		ImageRetentionDays:          int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
 		ImageRetentionSweepInterval: getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
 		BackupRetainCount:           int(getEnvInt64("BACKUP_RETAIN_COUNT", 5)),
 		ImportSpreadsheetEnabled:    getEnvBool("IMPORT_SPREADSHEET_ENABLED", true),
+		SMTPHost:                    strings.TrimSpace(getEnv("SMTP_HOST", "")),
+		SMTPPort:                    int(getEnvInt64("SMTP_PORT", 587)),
+		SMTPUser:                    getEnv("SMTP_USER", ""),
+		SMTPPass:                    getEnv("SMTP_PASS", ""),
+		SMTPFrom:                    strings.TrimSpace(getEnv("SMTP_FROM", "")),
+		SMTPTLSMode:                 strings.ToLower(strings.TrimSpace(getEnv("SMTP_TLS_MODE", "starttls"))),
+		AppBaseURL:                  strings.TrimRight(strings.TrimSpace(getEnv("APP_BASE_URL", "")), "/"),
+	}
+	if cfg.SMTPHost == "" && cfg.AppBaseURL == "" {
+		cfg.AppBaseURL = "http://localhost:8079"
 	}
 
 	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty
@@ -287,6 +307,23 @@ func (c *Config) Validate() error {
 	// cross-site WebSocket upgrades.
 	if isProduction() && len(c.AllowedOrigins) == 0 {
 		errs = append(errs, errors.New("ALLOWED_ORIGINS: must be set in production (comma-separated scheme+host list, e.g. https://cartledger.example.com)"))
+	}
+
+	if c.SMTPHost != "" {
+		if c.SMTPFrom == "" {
+			errs = append(errs, errors.New("SMTP_FROM: required when SMTP_HOST is set"))
+		}
+		if c.AppBaseURL == "" {
+			errs = append(errs, errors.New("APP_BASE_URL: required when SMTP_HOST is set"))
+		}
+	}
+	if c.SMTPPort <= 0 || c.SMTPPort > 65535 {
+		errs = append(errs, errors.New("SMTP_PORT: must be between 1 and 65535"))
+	}
+	switch c.SMTPTLSMode {
+	case "none", "starttls", "tls":
+	default:
+		errs = append(errs, fmt.Errorf("SMTP_TLS_MODE: unknown value %q (valid: none, starttls, tls)", c.SMTPTLSMode))
 	}
 
 	return errors.Join(errs...)

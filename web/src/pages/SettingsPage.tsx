@@ -1,11 +1,11 @@
 import { useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getProfile, updateProfile, updateHousehold, deleteAllData } from '@/api/auth'
+import { changePassword, getProfile, updateProfile, updateHousehold, deleteAllData } from '@/api/auth'
+import { ApiClientError } from '@/api/client'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Modal } from '@/components/ui/Modal'
-import { InviteModal } from '@/components/ui/InviteModal'
 import ConversionsPage from './ConversionsPage'
 import IntegrationsTab from '@/components/settings/IntegrationsTab'
 import BackupCard from '@/components/settings/BackupCard'
@@ -18,7 +18,6 @@ const ALL_TABS = [
   'conversions',
   'integrations',
   'data',
-  'invite',
   'danger',
 ] as const
 type Tab = (typeof ALL_TABS)[number]
@@ -29,7 +28,6 @@ const tabLabels: Record<Tab, string> = {
   conversions: 'Unit Conversions',
   integrations: 'Integrations',
   data: 'Data',
-  invite: 'Invite Members',
   danger: 'Danger Zone',
 }
 
@@ -92,7 +90,6 @@ function SettingsPage() {
       {activeTab === 'conversions' && <ConversionsPage />}
       {activeTab === 'integrations' && <IntegrationsTab />}
       {activeTab === 'data' && isAdmin && <DataTab />}
-      {activeTab === 'invite' && <InviteTab />}
       {activeTab === 'danger' && <DangerTab />}
     </div>
   )
@@ -135,28 +132,109 @@ function ProfileTab() {
   if (isLoading) return <p className="text-body text-neutral-400">Loading...</p>
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-6 max-w-lg">
+    <div className="flex flex-col gap-6 max-w-lg">
+      <div className="bg-white rounded-2xl shadow-subtle p-6">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-4">
+          Your Profile
+        </h2>
+        <div className="flex flex-col gap-4">
+          <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+          <Input label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <div className="flex justify-end">
+            <Button
+              size="sm"
+              onClick={() => mutation.mutate({ name, email })}
+              disabled={mutation.isPending}
+            >
+              {mutation.isPending ? 'Saving...' : 'Save Changes'}
+            </Button>
+          </div>
+          {mutation.isSuccess && (
+            <p className="text-small text-green-600">Profile updated.</p>
+          )}
+          {mutation.isError && (
+            <p className="text-small text-expensive">Failed to update profile.</p>
+          )}
+        </div>
+      </div>
+      <ChangePasswordCard />
+    </div>
+  )
+}
+
+function ChangePasswordCard() {
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+
+  const mutation = useMutation({
+    mutationFn: () => changePassword(currentPassword, newPassword),
+    onSuccess: () => {
+      setCurrentPassword('')
+      setNewPassword('')
+      setConfirmPassword('')
+    },
+  })
+
+  const mismatch = newPassword !== '' && confirmPassword !== '' && newPassword !== confirmPassword
+  const errorMessage =
+    mismatch
+      ? 'Passwords do not match.'
+      : mutation.error instanceof ApiClientError
+        ? mutation.error.message
+        : mutation.error
+          ? 'Failed to change password.'
+          : null
+
+  return (
+    <div className="bg-white rounded-2xl shadow-subtle p-6">
       <h2 className="font-display text-feature font-semibold text-neutral-900 mb-4">
-        Your Profile
+        Change Password
       </h2>
       <div className="flex flex-col gap-4">
-        <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} />
-        <Input label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <Input
+          label="Current Password"
+          type="password"
+          value={currentPassword}
+          onChange={(e) => setCurrentPassword(e.target.value)}
+        />
+        <Input
+          label="New Password"
+          type="password"
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
+          minLength={8}
+          helperText="This logs you in here. Other devices stay signed in until their session expires."
+        />
+        <Input
+          label="Confirm New Password"
+          type="password"
+          value={confirmPassword}
+          onChange={(e) => setConfirmPassword(e.target.value)}
+          minLength={8}
+        />
+        {errorMessage && (
+          <p className="text-small text-expensive" role="alert">
+            {errorMessage}
+          </p>
+        )}
+        {mutation.isSuccess && (
+          <p className="text-small text-green-600">Password changed.</p>
+        )}
         <div className="flex justify-end">
           <Button
             size="sm"
-            onClick={() => mutation.mutate({ name, email })}
-            disabled={mutation.isPending}
+            onClick={() => mutation.mutate()}
+            disabled={
+              mutation.isPending ||
+              !currentPassword ||
+              newPassword.length < 8 ||
+              newPassword !== confirmPassword
+            }
           >
-            {mutation.isPending ? 'Saving...' : 'Save Changes'}
+            {mutation.isPending ? 'Updating...' : 'Update Password'}
           </Button>
         </div>
-        {mutation.isSuccess && (
-          <p className="text-small text-green-600">Profile updated.</p>
-        )}
-        {mutation.isError && (
-          <p className="text-small text-expensive">Failed to update profile.</p>
-        )}
       </div>
     </div>
   )
@@ -210,24 +288,6 @@ function HouseholdTab() {
           <p className="text-small text-green-600">Household updated.</p>
         )}
       </div>
-    </div>
-  )
-}
-
-function InviteTab() {
-  const [showInvite, setShowInvite] = useState(false)
-
-  return (
-    <div className="bg-white rounded-2xl shadow-subtle p-6 max-w-lg">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-2">
-        Invite Members
-      </h2>
-      <p className="text-body text-neutral-500 mb-4">
-        Generate an invite link to add someone to your household. They will be able to view and
-        collaborate on your shopping lists and receipts.
-      </p>
-      <Button onClick={() => setShowInvite(true)}>Generate Invite Link</Button>
-      <InviteModal open={showInvite} onClose={() => setShowInvite(false)} />
     </div>
   )
 }
