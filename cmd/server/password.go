@@ -30,7 +30,7 @@ func newResetPasswordCmd() *cobra.Command {
 
 func runResetPassword(email, password string) error {
 	initLogger()
-	cfg, err := config.Load()
+	cfg, err := config.LoadBase()
 	if err != nil {
 		return fmt.Errorf("configuration error: %w", err)
 	}

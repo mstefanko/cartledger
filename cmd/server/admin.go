@@ -29,7 +29,7 @@ func newPromoteAdminCmd() *cobra.Command {
 
 func runPromoteAdmin(email string) error {
 	initLogger()
-	cfg, err := config.Load()
+	cfg, err := config.LoadBase()
 	if err != nil {
 		return fmt.Errorf("configuration error: %w", err)
 	}

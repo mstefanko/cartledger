@@ -37,6 +37,17 @@ cp .env.example .env
 
 Edit `.env` — set `ANTHROPIC_API_KEY` for receipt scanning.
 
+For day-to-day or production use, keep durable data outside the repo working
+tree. On macOS, a good local path is:
+
+```bash
+DATA_DIR="/Users/you/Library/Application Support/cartledger"
+```
+
+For disk-loss protection, pair that directory with Time Machine or another
+machine-level backup. On macOS, verify inclusion with
+`tmutil isexcluded "/Users/you/Library/Application Support/cartledger"`.
+
 ### 2. Run with Docker (recommended)
 
 ```bash
@@ -85,7 +96,8 @@ go test ./...
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8079` | Server port |
-| `DATA_DIR` | `./data` | SQLite DB and uploads directory |
+| `DATA_DIR` | `./data` | SQLite DB and uploads directory. Use an absolute path outside the repo for durable data |
+| `BACKUP_RETAIN_COUNT` | `14` | Completed backup archives to keep under `DATA_DIR/backups` |
 | `LLM_PROVIDER` | *(auto)* | `claude` (API), `mock`, or empty for auto-detect |
 | `LLM_MODEL` | `claude-sonnet-4-20250514` | Claude model ID (e.g., `claude-haiku-4-5-20251001` for cheaper/faster) |
 | `ANTHROPIC_API_KEY` | — | Required for receipt scanning |
@@ -100,6 +112,27 @@ go test ./...
 | `ALLOW_PRIVATE_INTEGRATIONS` | `false` | Allow integration base URLs on loopback/LAN/RFC1918 addresses (self-hosters on a LAN typically want `true`) |
 
 Mealie (and other recipe/shopping integrations) are configured per-household in the UI: **Settings -> Integrations**. No environment variables required.
+
+## Backups and Restore
+
+Create a managed backup archive:
+
+```bash
+cartledger backup
+```
+
+Archives are written to `DATA_DIR/backups/` and recorded in the `backups`
+table. Restore into a fresh data directory with:
+
+```bash
+DATA_DIR="/path/to/fresh/cartledger-data" cartledger restore /path/to/backup.tar.gz
+```
+
+On macOS, daily backups can be installed with:
+
+```bash
+scripts/install-backup-launchd.sh --data-dir "/Users/you/Library/Application Support/cartledger"
+```
 
 ### Email and Password Recovery
 

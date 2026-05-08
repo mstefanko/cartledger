@@ -83,7 +83,7 @@ type Config struct {
 	// BackupRetainCount is the max number of status='complete' backup rows
 	// (and their archive files) to keep on disk. When a new backup finishes
 	// the runner prunes oldest-first down to this count. Env:
-	// BACKUP_RETAIN_COUNT. Default 5; validated positive in Load.
+	// BACKUP_RETAIN_COUNT. Default 14; validated positive in Load.
 	BackupRetainCount int
 	// ImportSpreadsheetEnabled gates the CSV/XLSX spreadsheet import HTTP
 	// surface. When false, the routes are NOT registered (Echo returns its
@@ -178,6 +178,18 @@ func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
 // Otherwise, if JWT_SECRET is unset/default, Load generates an ephemeral
 // random secret and logs a warning that sessions will invalidate on restart.
 func Load() (*Config, error) {
+	return load(true)
+}
+
+// LoadBase reads the same environment as Load but only validates settings that
+// DB-only CLI commands need. Backup, restore, promote-admin, and reset-password
+// do not instantiate the HTTP server, auth middleware, mailer, or LLM client,
+// so they should not fail because server-only configuration is absent.
+func LoadBase() (*Config, error) {
+	return load(false)
+}
+
+func load(server bool) (*Config, error) {
 	_ = godotenv.Load() // ignore error if .env doesn't exist
 
 	cfg := &Config{
@@ -194,7 +206,7 @@ func Load() (*Config, error) {
 		RateLimitEnabled:            getEnvBool("RATE_LIMIT_ENABLED", true),
 		ImageRetentionDays:          int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
 		ImageRetentionSweepInterval: getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
-		BackupRetainCount:           int(getEnvInt64("BACKUP_RETAIN_COUNT", 5)),
+		BackupRetainCount:           int(getEnvInt64("BACKUP_RETAIN_COUNT", 14)),
 		ImportSpreadsheetEnabled:    getEnvBool("IMPORT_SPREADSHEET_ENABLED", true),
 		SMTPHost:                    strings.TrimSpace(getEnv("SMTP_HOST", "")),
 		SMTPPort:                    int(getEnvInt64("SMTP_PORT", 587)),
@@ -208,26 +220,28 @@ func Load() (*Config, error) {
 		cfg.AppBaseURL = "http://localhost:8079"
 	}
 
-	// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset / empty
-	// value leaves TrustedProxies nil — no proxies trusted.
-	trustedProxies, err := parseTrustedProxies(os.Getenv("TRUST_PROXY"))
-	if err != nil {
-		return nil, err
-	}
-	cfg.TrustedProxies = trustedProxies
+	if server {
+		// Parse TRUST_PROXY into netip.Prefix slice at load time. An unset /
+		// empty value leaves TrustedProxies nil — no proxies trusted.
+		trustedProxies, err := parseTrustedProxies(os.Getenv("TRUST_PROXY"))
+		if err != nil {
+			return nil, err
+		}
+		cfg.TrustedProxies = trustedProxies
 
-	// Parse ALLOWED_ORIGINS: comma-separated scheme+host entries. In dev mode,
-	// default to a localhost set when unset. In prod, leave empty and let
-	// Validate fail with a clear error.
-	cfg.AllowedOrigins = parseAllowedOrigins(os.Getenv("ALLOWED_ORIGINS"))
-	if len(cfg.AllowedOrigins) == 0 && !isProduction() {
-		cfg.AllowedOrigins = append([]string(nil), defaultDevAllowedOrigins...)
+		// Parse ALLOWED_ORIGINS: comma-separated scheme+host entries. In dev
+		// mode, default to a localhost set when unset. In prod, leave empty
+		// and let Validate fail with a clear error.
+		cfg.AllowedOrigins = parseAllowedOrigins(os.Getenv("ALLOWED_ORIGINS"))
+		if len(cfg.AllowedOrigins) == 0 && !isProduction() {
+			cfg.AllowedOrigins = append([]string(nil), defaultDevAllowedOrigins...)
+		}
 	}
 
-	// JWT_SECRET dev/prod policy. In non-production mode, synthesize an
-	// ephemeral secret so `make dev` and tests Just Work. In production,
-	// Validate will reject unset / default values.
-	if !isProduction() && (cfg.JWTSecret == "" || cfg.JWTSecret == defaultJWTSecret) {
+	// JWT_SECRET dev/prod policy. In non-production server mode, synthesize
+	// an ephemeral secret so `make dev` and tests Just Work. DB-only CLI
+	// commands do not use JWTs, so avoid noisy warnings there.
+	if server && !isProduction() && (cfg.JWTSecret == "" || cfg.JWTSecret == defaultJWTSecret) {
 		secret, err := randomHex(32)
 		if err != nil {
 			return nil, fmt.Errorf("generate ephemeral JWT_SECRET: %w", err)
@@ -236,8 +250,14 @@ func Load() (*Config, error) {
 		slog.Warn("JWT_SECRET unset or default; generated ephemeral secret — sessions will invalidate on restart. Set JWT_SECRET or CARTLEDGER_ENV=production for persistent sessions.")
 	}
 
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+	var validateErr error
+	if server {
+		validateErr = cfg.Validate()
+	} else {
+		validateErr = cfg.ValidateBase()
+	}
+	if validateErr != nil {
+		return nil, validateErr
 	}
 
 	// Materialize the BackupDir eagerly so the HTTP / CLI / runner surfaces
@@ -255,6 +275,10 @@ func Load() (*Config, error) {
 // can print them all at once.
 func (c *Config) Validate() error {
 	var errs []error
+
+	if err := c.ValidateBase(); err != nil {
+		errs = append(errs, err)
+	}
 
 	// JWT_SECRET must be set and non-default in production.
 	if isProduction() {
@@ -280,25 +304,6 @@ func (c *Config) Validate() error {
 		if _, ok := knownLLMProviders[c.LLMProvider]; !ok {
 			errs = append(errs, fmt.Errorf("LLM_PROVIDER: unknown value %q (valid: claude, claude-cli, gemini, mock)", c.LLMProvider))
 		}
-	}
-
-	// DATA_DIR must exist (or be creatable) and writable.
-	if c.DataDir == "" {
-		errs = append(errs, errors.New("DATA_DIR: must not be empty"))
-	} else if err := ensureWritableDir(c.DataDir); err != nil {
-		errs = append(errs, fmt.Errorf("DATA_DIR: %w", err))
-	}
-
-	// PORT must be non-empty (numeric check is loose — net/http will fail
-	// fast on bind with a clearer error than anything we invent here).
-	if strings.TrimSpace(c.Port) == "" {
-		errs = append(errs, errors.New("PORT: must not be empty"))
-	}
-
-	// BACKUP_RETAIN_COUNT must be positive; 0 would mean "prune every backup
-	// on completion", which is never a useful configuration.
-	if c.BackupRetainCount <= 0 {
-		errs = append(errs, errors.New("BACKUP_RETAIN_COUNT: must be positive"))
 	}
 
 	// In production, ALLOWED_ORIGINS must be explicitly set. The dev default
@@ -329,13 +334,41 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+// ValidateBase checks configuration required by DB-only CLI commands and
+// shared filesystem setup. It intentionally does not require server-only
+// settings such as JWT_SECRET, LLM credentials, allowed origins, or SMTP.
+func (c *Config) ValidateBase() error {
+	var errs []error
+
+	// DATA_DIR must exist (or be creatable) and writable.
+	if c.DataDir == "" {
+		errs = append(errs, errors.New("DATA_DIR: must not be empty"))
+	} else if err := ensureWritableDir(c.DataDir); err != nil {
+		errs = append(errs, fmt.Errorf("DATA_DIR: %w", err))
+	}
+
+	// PORT must be non-empty (numeric check is loose — net/http will fail
+	// fast on bind with a clearer error than anything we invent here).
+	if strings.TrimSpace(c.Port) == "" {
+		errs = append(errs, errors.New("PORT: must not be empty"))
+	}
+
+	// BACKUP_RETAIN_COUNT must be positive; 0 would mean "prune every backup
+	// on completion", which is never a useful configuration.
+	if c.BackupRetainCount <= 0 {
+		errs = append(errs, errors.New("BACKUP_RETAIN_COUNT: must be positive"))
+	}
+
+	return errors.Join(errs...)
+}
+
 // DBPath returns the full path to the SQLite database file.
 func (c *Config) DBPath() string {
 	return filepath.Join(c.DataDir, "cartledger.db")
 }
 
 // BackupDir returns the directory where backup archives live. Created by
-// Load() after validation so callers can assume it exists.
+// Load / LoadBase after validation so callers can assume it exists.
 func (c *Config) BackupDir() string {
 	return filepath.Join(c.DataDir, "backups")
 }

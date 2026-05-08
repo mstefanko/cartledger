@@ -28,7 +28,7 @@ import (
 // The CLI and HTTP surfaces share the same internal/backup.Runner so there
 // is exactly one code path in production. By default the output path is
 // $DATA_DIR/backups/backup-<UTC timestamp>.tar.gz — the directory is created
-// by config.Load() so operators don't have to mkdir it manually.
+// by config.LoadBase() so operators don't have to mkdir it manually.
 func newBackupCmd() *cobra.Command {
 	var outPath string
 	cmd := &cobra.Command{
@@ -57,7 +57,7 @@ backups table. Useful for ad-hoc snapshots piped through a network copy.`,
 
 func runBackup(outPath string) error {
 	initLogger()
-	cfg, err := config.Load()
+	cfg, err := config.LoadBase()
 	if err != nil {
 		return fmt.Errorf("configuration error: %w", err)
 	}

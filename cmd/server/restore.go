@@ -44,7 +44,7 @@ schema (no-op if it's already current).`,
 
 func runRestore(archivePath string, force bool) error {
 	initLogger()
-	cfg, err := config.Load()
+	cfg, err := config.LoadBase()
 	if err != nil {
 		return fmt.Errorf("configuration error: %w", err)
 	}

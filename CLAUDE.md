@@ -43,7 +43,8 @@ go test ./...     # Run Go tests (no frontend tests)
 - `LLM_MODEL` — defaults to `claude-sonnet-4-20250514`, set `claude-haiku-4-5-20251001` for cheaper
 - `LLM_PROVIDER` — `claude` (default/auto), `mock`
 - `PORT` — default 8079
-- `DATA_DIR` — default `./data` (SQLite DB + receipt images)
+- `DATA_DIR` — default `./data` for dev/tests; durable use should point outside the repo, e.g. `~/Library/Application Support/cartledger`
+- `BACKUP_RETAIN_COUNT` — default 14 completed archives under `$DATA_DIR/backups`
 - `JWT_SECRET` — change in production
 
 ## LLM Integration (the part you'll touch most)
@@ -85,6 +86,8 @@ go test ./...     # Run Go tests (no frontend tests)
 - `web/dist/` is gitignored — frontend is built separately, not embedded in Go binary
 - The `claude_cli.go` client exists but is dead code (not wired in main.go switch)
 - SQLite — no concurrent write support, single-writer model
+- `DATA_DIR` should live OUTSIDE the repo working tree for any data you care about. The dev default `./data` is fine for tests and throwaway work; production/day-to-day use should point somewhere like `~/Library/Application Support/cartledger`. The repo working tree is subject to branch ops, swarm worktree teardown, `git clean`, and IDE cleanup actions, all of which can delete an in-tree `data/` directory.
 - Receipt images stored on disk at `DATA_DIR/receipts/{uuid}/`
+- Backups: `cartledger backup` produces an archive in `$DATA_DIR/backups/`; `cartledger restore <archive>` restores into a fresh `$DATA_DIR`. Daily backups are scheduled via launchd; see `scripts/install-backup-launchd.sh`.
 - Planning docs (`PLAN-*.md`, `ANALYSIS-*.md`, etc.) are gitignored
 - **WebSocket lifecycle** — `connectWebSocket(queryClient)` in `web/src/api/ws.ts` is mounted exactly once in `AppLayout` (always post-auth via `ProtectedRoute`). Do NOT call it from individual components. Cleanup via `disconnectWebSocket()` runs on unmount/logout. The socket drives React Query cache invalidation for `receipt.complete`, `list.*`, `product.updated`, and `store.updated` messages.
