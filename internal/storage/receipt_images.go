@@ -47,6 +47,9 @@ func UpsertReceiptImage(ctx context.Context, db execContexter, img ReceiptImage)
 	if img.CreatedAt.IsZero() {
 		img.CreatedAt = time.Now().UTC()
 	}
+	if err := ValidateOwnerID(img.ReceiptID); err != nil {
+		return err
+	}
 	if img.MimeType == "" {
 		img.MimeType = MimeTypeFromKey(img.StorageKey)
 	}

@@ -23,6 +23,7 @@ import (
 	appmail "github.com/mstefanko/cartledger/internal/mail"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/spreadsheet"
+	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
 	"github.com/mstefanko/cartledger/web"
@@ -278,7 +279,11 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	// (not 403) to avoid leaking receipt existence across households.
 	//
 	// Expected layout: <DataDir>/receipts/<receipt_uuid>/<image_file>
-	absBase, baseErr := filepath.Abs(filepath.Join(cfg.DataDir, "receipts"))
+	receiptsRoot, baseErr := storage.LegacyReceiptsRoot(cfg.DataDir)
+	absBase := ""
+	if baseErr == nil {
+		absBase, baseErr = filepath.Abs(receiptsRoot)
+	}
 	v1.GET("/files/*", func(c echo.Context) error {
 		c.Response().Header().Set("Deprecation", "true")
 		c.Response().Header().Set("Warning", `299 - "/api/v1/files/* is deprecated; use /api/v1/receipts/:id/images/:kind/:page"`)
@@ -297,12 +302,11 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid path"})
 		}
 
-		// Receipt image paths are stored as filepath.Join(DataDir, "receipts",
-		// <uuid>, <file>) in internal/api/receipts.go and processed_* writes in
-		// internal/worker/receipt.go. Depending on whether DataDir is absolute
-		// (Docker: /data) or relative (dev: ./data), the stored value is
-		// correspondingly absolute or relative. The SPA requests that stored
-		// path verbatim via /api/v1/files/<path>, so we see forms like:
+		// Historical receipt image paths were stored under DATA_DIR/receipts.
+		// Depending on whether DataDir is absolute (Docker: /data) or relative
+		// (dev: ./data), the stored value is correspondingly absolute or
+		// relative. The SPA requests that stored path verbatim via
+		// /api/v1/files/<path>, so we see forms like:
 		//   /api/v1/files//data/receipts/<uuid>/1.jpg   (absolute DataDir)
 		//   /api/v1/files/data/receipts/<uuid>/1.jpg    (relative DataDir)
 		//   /api/v1/files/<uuid>/1.jpg                  (receipt-relative — ideal)

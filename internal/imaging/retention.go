@@ -183,11 +183,17 @@ func (j *Janitor) sweep(ctx context.Context) {
 	if !j.enabled() {
 		return
 	}
-	root := filepath.Join(j.dataDir, "receipts")
+	root, err := storage.LegacyReceiptsRoot(j.dataDir)
+	if err != nil {
+		slog.Warn("retention: storage unavailable", "err", err)
+		return
+	}
 	cutoff := j.now().Add(-j.ttl)
 	if j.db != nil {
-		j.sweepReceiptImageRows(ctx, cutoff)
-		return
+		j.sweepReceiptImageRows(ctx, cutoff, root)
+		// Keep the historical filesystem sweep as a compatibility backstop for
+		// hybrid installs until receipt_images reconciliation has seen every
+		// legacy file.
 	}
 
 	entries, err := os.ReadDir(root)
@@ -235,7 +241,7 @@ func (j *Janitor) sweep(ctx context.Context) {
 	}
 }
 
-func (j *Janitor) sweepReceiptImageRows(ctx context.Context, cutoff time.Time) {
+func (j *Janitor) sweepReceiptImageRows(ctx context.Context, cutoff time.Time, root string) {
 	localStore, err := storage.NewLocal(j.dataDir)
 	if err != nil {
 		slog.Warn("retention: storage unavailable", "err", err)
@@ -280,7 +286,7 @@ func (j *Janitor) sweepReceiptImageRows(ctx context.Context, cutoff time.Time) {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			continue
 		}
-		if !info.ModTime().Before(cutoff) && !createdAt.Before(cutoff) {
+		if !info.ModTime().Before(cutoff) || !createdAt.Before(cutoff) {
 			continue
 		}
 		size := info.Size()
@@ -300,7 +306,7 @@ func (j *Janitor) sweepReceiptImageRows(ctx context.Context, cutoff time.Time) {
 
 	if deleted > 0 {
 		slog.Info("retention: swept",
-			"root", filepath.Join(j.dataDir, "receipts"),
+			"root", root,
 			"deleted_files", deleted,
 			"bytes_reclaimed", bytesReclaimed,
 			"ttl", j.ttl,
@@ -310,7 +316,7 @@ func (j *Janitor) sweepReceiptImageRows(ctx context.Context, cutoff time.Time) {
 		}
 	} else {
 		slog.Debug("retention: swept (nothing to delete)",
-			"root", filepath.Join(j.dataDir, "receipts"),
+			"root", root,
 			"ttl", j.ttl,
 		)
 	}

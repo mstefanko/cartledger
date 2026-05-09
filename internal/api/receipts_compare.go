@@ -445,11 +445,7 @@ func compareCellSizeKnown(quantity decimal.Decimal, unit string) bool {
 	if unit == "" || !quantity.GreaterThan(decimal.Zero) {
 		return false
 	}
-	_, parsedUnit, err := units.Parse(strings.TrimSpace(quantity.String() + " " + unit))
-	if err != nil {
-		return false
-	}
-	category := units.Classify(parsedUnit)
+	category := units.Classify(unit)
 	return category == units.CategoryWeight || category == units.CategoryVolume
 }
 

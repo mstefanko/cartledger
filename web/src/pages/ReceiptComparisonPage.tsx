@@ -47,6 +47,8 @@ function compareErrorMessage(error: unknown): string {
   return 'Failed to compare receipts.'
 }
 
+const compareLimitNotice = `Only the first ${RECEIPT_COMPARE_LIMIT} receipts are being compared.`
+
 function ReceiptChip({
   receipt,
   onRemove,
@@ -99,23 +101,26 @@ function ReceiptComparisonPage() {
   const [minOverlap, setMinOverlap] = useState(2)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(
-    parsed.truncated || urlTruncated
-      ? `Only the first ${RECEIPT_COMPARE_LIMIT} receipts are being compared.`
-      : null,
+    parsed.truncated || urlTruncated ? compareLimitNotice : null,
   )
 
   useEffect(() => {
     setSelectedIds(parsed.ids)
-    if (parsed.truncated || urlTruncated) {
-      setNotice(`Only the first ${RECEIPT_COMPARE_LIMIT} receipts are being compared.`)
-      if (parsed.truncated) {
-        const params = new URLSearchParams(searchParams)
+    setNotice(parsed.truncated || urlTruncated ? compareLimitNotice : null)
+  }, [parsed.ids, parsed.truncated, urlTruncated])
+
+  useEffect(() => {
+    if (!parsed.truncated) return
+    setSearchParams(
+      (currentParams) => {
+        const params = new URLSearchParams(currentParams)
         params.set('ids', parsed.ids.join(','))
         params.set('truncated', '1')
-        setSearchParams(params, { replace: true })
-      }
-    }
-  }, [parsed.ids, parsed.truncated, searchParams, setSearchParams, urlTruncated])
+        return params
+      },
+      { replace: true },
+    )
+  }, [parsed.ids, parsed.truncated, setSearchParams])
 
   const effectiveMinOverlap =
     selectedIds.length >= 2 ? Math.min(minOverlap, selectedIds.length) : 2
@@ -164,9 +169,7 @@ function ReceiptComparisonPage() {
     if (next.length > 0) params.set('ids', next.join(','))
     if (truncated) params.set('truncated', '1')
     setSearchParams(params)
-    setNotice(
-      truncated ? `Only the first ${RECEIPT_COMPARE_LIMIT} receipts are being compared.` : null,
-    )
+    setNotice(truncated ? compareLimitNotice : null)
   }
 
   function removeReceipt(id: string) {

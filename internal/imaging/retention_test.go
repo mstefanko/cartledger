@@ -2,11 +2,14 @@ package imaging
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // uuidA / uuidB are syntactically valid length-36 UUID v4 strings. The
@@ -198,4 +201,67 @@ func TestJanitor_StartStop(t *testing.T) {
 
 	// Second Stop is a no-op (idempotency).
 	j.Stop()
+}
+
+func TestJanitor_DBRowsRequireCreatedAtAndMTimeBeforeCutoff(t *testing.T) {
+	t.Parallel()
+
+	data := t.TempDir()
+	database, err := sql.Open("sqlite", filepath.Join(data, "test.db"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`
+		CREATE TABLE receipt_images (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			storage_key TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			deleted_at DATETIME
+		);
+	`); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	now := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-100 * 24 * time.Hour)
+	fresh := now.Add(-5 * 24 * time.Hour)
+
+	freshMtime := writeFileAt(t, data, filepath.Join("receipts", uuidA, "original", "1.jpg"), "fresh-mtime", fresh)
+	freshCreated := writeFileAt(t, data, filepath.Join("receipts", uuidA, "original", "2.jpg"), "fresh-created", old)
+	staleBoth := writeFileAt(t, data, filepath.Join("receipts", uuidA, "original", "3.jpg"), "stale", old)
+
+	rows := []struct {
+		id        string
+		key       string
+		createdAt time.Time
+	}{
+		{"fresh_mtime", "receipts/" + uuidA + "/original/1.jpg", old},
+		{"fresh_created", "receipts/" + uuidA + "/original/2.jpg", fresh},
+		{"stale_both", "receipts/" + uuidA + "/original/3.jpg", old},
+	}
+	for _, row := range rows {
+		if _, err := database.Exec(
+			"INSERT INTO receipt_images (id, kind, storage_key, created_at) VALUES (?, 'original', ?, ?)",
+			row.id, row.key, row.createdAt,
+		); err != nil {
+			t.Fatalf("insert row %s: %v", row.id, err)
+		}
+	}
+
+	j := NewJanitor(data, 30, time.Hour)
+	j.now = func() time.Time { return now }
+	j.SetDB(database)
+	j.sweep(context.Background())
+
+	if _, err := os.Stat(freshMtime); err != nil {
+		t.Fatalf("fresh mtime file should remain: %v", err)
+	}
+	if _, err := os.Stat(freshCreated); err != nil {
+		t.Fatalf("fresh created_at file should remain: %v", err)
+	}
+	if _, err := os.Stat(staleBoth); !os.IsNotExist(err) {
+		t.Fatalf("stale file should be deleted; stat err=%v", err)
+	}
 }

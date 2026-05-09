@@ -54,10 +54,10 @@ export async function compareReceipts(
 }
 
 export function useCompareReceipts(receiptIds: string[], minOverlap: number) {
-  const sortedIds = [...receiptIds].sort()
+  const orderedIds = [...receiptIds]
   return useQuery({
-    queryKey: ['receipts', 'compare', sortedIds, minOverlap],
-    queryFn: () => compareReceipts(receiptIds, minOverlap),
+    queryKey: ['receipts', 'compare', orderedIds, minOverlap],
+    queryFn: () => compareReceipts(orderedIds, minOverlap),
     enabled: receiptIds.length >= 2,
   })
 }

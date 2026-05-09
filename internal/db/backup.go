@@ -32,6 +32,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mstefanko/cartledger/internal/storage"
 )
 
 // Manifest is the payload written as MANIFEST.json inside the backup tarball.
@@ -164,7 +166,14 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 	//    missing image (see BackupResult.MissingImages) and the walk
 	//    continues — the retention janitor may prune files between our walk
 	//    and tar steps.
-	receiptsDir := filepath.Join(opts.DataDir, "receipts")
+	receiptsDir, err := storage.LegacyReceiptsRoot(opts.DataDir)
+	if err != nil {
+		tw.Close()
+		gzw.Close()
+		out.Close()
+		os.Remove(opts.OutputPath)
+		return nil, fmt.Errorf("resolve receipts dir: %w", err)
+	}
 	if opts.IncludeReceipts || !explicitlyDisabled(opts) {
 		if info, err := os.Stat(receiptsDir); err == nil && info.IsDir() {
 			added, bytes, missed, err := addDirToTar(tw, receiptsDir, "receipts", createdAt)
@@ -192,7 +201,14 @@ func Backup(opts BackupOptions) (*BackupResult, error) {
 	//    them on restore would be silent data loss. Fresh installs without
 	//    any product uploads won't have the directory yet; that's fine
 	//    (skip gracefully on ENOENT, matching the receipts/ pattern above).
-	productsDir := filepath.Join(opts.DataDir, "products")
+	productsDir, err := storage.LegacyProductsRoot(opts.DataDir)
+	if err != nil {
+		tw.Close()
+		gzw.Close()
+		out.Close()
+		os.Remove(opts.OutputPath)
+		return nil, fmt.Errorf("resolve products dir: %w", err)
+	}
 	if info, err := os.Stat(productsDir); err == nil && info.IsDir() {
 		added, bytes, missed, err := addDirToTar(tw, productsDir, "products", createdAt)
 		if err != nil {

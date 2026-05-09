@@ -93,6 +93,7 @@ export interface Receipt {
   subtotal: string | null
   tax: string | null
   total: string | null
+  /** @deprecated Use images[] from the receipt detail response. */
   image_paths: string | null
   raw_llm_json: string | null
   status: 'pending' | 'matched' | 'reviewed' | 'processing' | 'error'

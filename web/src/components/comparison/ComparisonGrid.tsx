@@ -40,6 +40,13 @@ function ReceiptColumnHeader({ receipt }: { receipt: CompareReceipt }) {
   )
 }
 
+function productDetailPath(product: CompareProduct): string {
+  if (product.product_group_id) {
+    return `/product-groups/${product.product_group_id}`
+  }
+  return `/products/${product.product_id}`
+}
+
 function ComparisonCell({
   appearance,
   isBest,
@@ -124,7 +131,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
                 <th className="sticky left-0 z-10 min-w-[190px] max-w-[220px] bg-white px-3 py-3 text-left border-b border-r border-neutral-200">
                   <div className="flex min-w-0 flex-col gap-1">
                     <Link
-                      to={`/products/${product.product_id}`}
+                      to={productDetailPath(product)}
                       className="break-words text-body-medium font-semibold text-neutral-900 hover:text-brand"
                     >
                       {product.name}

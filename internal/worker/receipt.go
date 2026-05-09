@@ -167,7 +167,10 @@ func (w *ReceiptWorker) Resubmit(receiptID, householdID string) error {
 		}
 	}
 
-	imageDir := filepath.Join(w.cfg.DataDir, "receipts", receiptID)
+	imageDir, err := storage.LegacyReceiptDir(w.cfg.DataDir, receiptID)
+	if err != nil {
+		return ErrImagesGone
+	}
 	if !legacyReceiptDirHasOriginals(imageDir) {
 		return ErrImagesGone
 	}
@@ -431,7 +434,10 @@ func (w *ReceiptWorker) loadOriginalImages(ctx context.Context, localStore *stor
 
 	imageDir := job.ImageDir
 	if imageDir == "" {
-		imageDir = filepath.Join(dataDir, "receipts", job.ReceiptID)
+		imageDir, err = storage.LegacyReceiptDir(dataDir, job.ReceiptID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	entries, err := os.ReadDir(imageDir)
 	if err != nil {

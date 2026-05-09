@@ -2,9 +2,12 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -12,21 +15,24 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ReconcileSummary reports receipt image metadata backfill work.
 type ReconcileSummary struct {
-	ReceiptsScanned int
-	RowsUpserted    int
-	FilesCopied     int
-	MissingFiles    int
-	Warnings        int
+	ReceiptsScanned   int
+	RowsUpserted      int
+	FilesCopied       int
+	MissingFiles      int
+	Warnings          int
+	OrphanDirsRemoved int
 }
 
 // ReconcileReceiptImages backfills receipt_images from historical
-// receipts.image_paths plus files already on disk. Legacy flat files are copied
-// into the canonical original/processed subdirectories; the legacy file is left
-// in place so the migration is additive.
+// receipts.image_paths plus files already on disk. Legacy files already under
+// DATA_DIR are referenced in place; external legacy files are copied into the
+// canonical original/processed subdirectories.
 func ReconcileReceiptImages(ctx context.Context, database *sql.DB, dataDir string, log *slog.Logger) (ReconcileSummary, error) {
 	var summary ReconcileSummary
 	if database == nil {
@@ -55,6 +61,7 @@ func ReconcileReceiptImages(ctx context.Context, database *sql.DB, dataDir strin
 	}
 	defer rows.Close()
 
+	seenReceipts := make(map[string]struct{})
 	for rows.Next() {
 		var receiptID string
 		var rawImagePaths sql.NullString
@@ -62,6 +69,7 @@ func ReconcileReceiptImages(ctx context.Context, database *sql.DB, dataDir strin
 		if err := rows.Scan(&receiptID, &rawImagePaths, &createdAt); err != nil {
 			return summary, err
 		}
+		seenReceipts[receiptID] = struct{}{}
 		summary.ReceiptsScanned++
 		refs := map[string]LegacyReceiptImageRef{}
 		if rawImagePaths.Valid {
@@ -96,7 +104,20 @@ func ReconcileReceiptImages(ctx context.Context, database *sql.DB, dataDir strin
 		})
 
 		for _, ref := range ordered {
-			img, copied, missing := materializeReceiptImage(ctx, local, receiptID, ref, createdAt)
+			img, copied, missing, materializeErr := materializeReceiptImage(ctx, local, receiptID, ref, createdAt)
+			if materializeErr != nil {
+				if ctx.Err() != nil {
+					return summary, ctx.Err()
+				}
+				summary.Warnings++
+				log.Warn("storage: materialize receipt image failed",
+					"receipt_id", receiptID,
+					"storage_key", ref.StorageKey,
+					"legacy_path", ref.LegacyPath,
+					"err", materializeErr,
+				)
+				continue
+			}
 			if copied {
 				summary.FilesCopied++
 			}
@@ -104,7 +125,16 @@ func ReconcileReceiptImages(ctx context.Context, database *sql.DB, dataDir strin
 				summary.MissingFiles++
 			}
 			if err := UpsertReceiptImage(ctx, database, img); err != nil {
-				return summary, fmt.Errorf("upsert receipt image: %w", err)
+				if ctx.Err() != nil {
+					return summary, ctx.Err()
+				}
+				summary.Warnings++
+				log.Warn("storage: upsert receipt image failed",
+					"receipt_id", receiptID,
+					"storage_key", img.StorageKey,
+					"err", err,
+				)
+				continue
 			}
 			summary.RowsUpserted++
 		}
@@ -112,13 +142,21 @@ func ReconcileReceiptImages(ctx context.Context, database *sql.DB, dataDir strin
 	if err := rows.Err(); err != nil {
 		return summary, err
 	}
-	if summary.RowsUpserted > 0 || summary.FilesCopied > 0 || summary.MissingFiles > 0 || summary.Warnings > 0 {
+	removed, warnings, err := sweepOrphanReceiptDirs(ctx, local, seenReceipts, log)
+	if err != nil {
+		return summary, err
+	}
+	summary.OrphanDirsRemoved += removed
+	summary.Warnings += warnings
+
+	if summary.RowsUpserted > 0 || summary.FilesCopied > 0 || summary.MissingFiles > 0 || summary.Warnings > 0 || summary.OrphanDirsRemoved > 0 {
 		log.Info("storage: receipt image metadata reconciled",
 			"receipts_scanned", summary.ReceiptsScanned,
 			"rows_upserted", summary.RowsUpserted,
 			"files_copied", summary.FilesCopied,
 			"missing_files", summary.MissingFiles,
 			"warnings", summary.Warnings,
+			"orphan_dirs_removed", summary.OrphanDirsRemoved,
 		)
 	}
 	return summary, nil
@@ -144,9 +182,12 @@ func refKey(ref LegacyReceiptImageRef) string {
 }
 
 func scanReceiptImageFiles(dataDir, receiptID string) ([]LegacyReceiptImageRef, error) {
-	root := filepath.Join(dataDir, "receipts", receiptID)
+	root, err := LegacyReceiptDir(dataDir, receiptID)
+	if err != nil {
+		return nil, err
+	}
 	var refs []LegacyReceiptImageRef
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, os.ErrNotExist) {
 				return fs.SkipDir
@@ -183,7 +224,7 @@ func isSupportedImageName(name string) bool {
 	return ext == ".jpg" || ext == ".jpeg" || ext == ".png"
 }
 
-func materializeReceiptImage(ctx context.Context, local *Local, receiptID string, ref LegacyReceiptImageRef, createdAt time.Time) (ReceiptImage, bool, bool) {
+func materializeReceiptImage(ctx context.Context, local *Local, receiptID string, ref LegacyReceiptImageRef, createdAt time.Time) (ReceiptImage, bool, bool, error) {
 	img := ReceiptImage{
 		ReceiptID:  receiptID,
 		Kind:       ref.Kind,
@@ -197,8 +238,12 @@ func materializeReceiptImage(ctx context.Context, local *Local, receiptID string
 	if err == nil {
 		if info, statErr := os.Stat(canonicalPath); statErr == nil && info.Mode().IsRegular() {
 			img.SizeBytes = info.Size()
-			return img, false, false
+			return img, false, false, nil
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return img, false, false, err
 	}
 
 	legacyPath := ref.LegacyPath
@@ -206,17 +251,164 @@ func materializeReceiptImage(ctx context.Context, local *Local, receiptID string
 		legacyPath = filepath.Join(local.Root(), legacyPath)
 	}
 	if legacyPath != "" {
-		if data, err := os.ReadFile(legacyPath); err == nil {
-			_ = ctx
-			if werr := local.WriteFileAtomic(ref.StorageKey, data, 0o644); werr == nil {
-				img.SizeBytes = int64(len(data))
-				sha := SHA256Hex(data)
-				img.SHA256 = sql.NullString{String: sha, Valid: true}
-				return img, true, false
+		if existingKey, ok := storageKeyForLocalPath(local, legacyPath); ok {
+			if info, statErr := os.Stat(legacyPath); statErr == nil && info.Mode().IsRegular() {
+				img.StorageKey = existingKey
+				img.MimeType = MimeTypeFromKey(existingKey)
+				img.SizeBytes = info.Size()
+				return img, false, false, nil
 			}
+		}
+		size, sha, err := copyFileToLocalAtomic(ctx, local, ref.StorageKey, legacyPath, 0o644)
+		if err == nil {
+			img.SizeBytes = size
+			img.SHA256 = sql.NullString{String: sha, Valid: true}
+			return img, true, false, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return img, false, false, err
 		}
 	}
 
 	img.DeletedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
-	return img, false, true
+	return img, false, true, nil
+}
+
+func storageKeyForLocalPath(local *Local, p string) (string, bool) {
+	absPath, err := filepath.Abs(p)
+	if err != nil {
+		return "", false
+	}
+	sep := string(filepath.Separator)
+	if absPath != local.absRoot && !strings.HasPrefix(absPath+sep, local.absRoot+sep) {
+		return "", false
+	}
+	rel, err := filepath.Rel(local.absRoot, absPath)
+	if err != nil || rel == "." {
+		return "", false
+	}
+	key := filepath.ToSlash(rel)
+	if err := ValidateKey(key); err != nil {
+		return "", false
+	}
+	return key, true
+}
+
+func copyFileToLocalAtomic(ctx context.Context, local *Local, key, source string, perm os.FileMode) (int64, string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, "", err
+	}
+	src, err := os.Open(source)
+	if err != nil {
+		return 0, "", err
+	}
+	defer src.Close()
+	info, err := src.Stat()
+	if err != nil {
+		return 0, "", err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, "", fmt.Errorf("source is not a regular file: %s", source)
+	}
+
+	dest, err := local.Path(key)
+	if err != nil {
+		return 0, "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return 0, "", fmt.Errorf("create storage dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".*.tmp")
+	if err != nil {
+		return 0, "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	hash := sha256.New()
+	buf := make([]byte, 128*1024)
+	var copied int64
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = tmp.Close()
+			return 0, "", err
+		}
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			if _, err := tmp.Write(chunk); err != nil {
+				_ = tmp.Close()
+				return 0, "", fmt.Errorf("write temp file: %w", err)
+			}
+			if _, err := hash.Write(chunk); err != nil {
+				_ = tmp.Close()
+				return 0, "", fmt.Errorf("hash file: %w", err)
+			}
+			copied += int64(n)
+		}
+		if readErr == nil {
+			continue
+		}
+		if !errors.Is(readErr, io.EOF) {
+			_ = tmp.Close()
+			return 0, "", fmt.Errorf("read source file: %w", readErr)
+		}
+		break
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return 0, "", fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, "", fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		return 0, "", fmt.Errorf("rename temp file: %w", err)
+	}
+	cleanup = false
+	return copied, hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func sweepOrphanReceiptDirs(ctx context.Context, local *Local, seenReceipts map[string]struct{}, log *slog.Logger) (int, int, error) {
+	root, err := local.Path("receipts")
+	if err != nil {
+		return 0, 0, err
+	}
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var removed int
+	var warnings int
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return removed, warnings, err
+		}
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if _, ok := seenReceipts[name]; ok {
+			continue
+		}
+		if _, err := uuid.Parse(name); err != nil {
+			continue
+		}
+		if err := local.DeleteReceipt(name); err != nil {
+			warnings++
+			log.Warn("storage: remove orphan receipt image directory failed", "receipt_id", name, "err", err)
+			continue
+		}
+		removed++
+	}
+	return removed, warnings, nil
 }

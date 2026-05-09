@@ -1498,7 +1498,10 @@ func (h *ReceiptHandler) receiptImages(receiptID string) ([][]byte, error) {
 		}
 	}
 
-	imageDir := filepath.Join(h.Cfg.DataDir, "receipts", receiptID)
+	imageDir, err := storage.LegacyReceiptDir(h.Cfg.DataDir, receiptID)
+	if err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(imageDir)
 	if err != nil {
 		return nil, err

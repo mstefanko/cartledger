@@ -381,8 +381,15 @@ func (r *Runner) runBody(ctx context.Context, id string) error {
 // vacuum temp file + the tar+gzip output concurrently on disk.
 func (r *Runner) preflight() error {
 	dbSize := fileSizeOrZero(r.cfg.DBPath())
-	imagesSize := dirSizeOrZero(filepath.Join(r.cfg.DataDir, "receipts")) +
-		dirSizeOrZero(filepath.Join(r.cfg.DataDir, "products"))
+	receiptsRoot, err := storage.LegacyReceiptsRoot(r.cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	productsRoot, err := storage.LegacyProductsRoot(r.cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	imagesSize := dirSizeOrZero(receiptsRoot) + dirSizeOrZero(productsRoot)
 	need := uint64(2 * (dbSize + imagesSize))
 
 	free, err := r.disk.FreeBytes(r.cfg.BackupDir())
@@ -404,8 +411,14 @@ func (r *Runner) preflight() error {
 // missing-image diff in countMissingImages is O(1) per DB reference.
 func (r *Runner) snapshotImageFiles() map[string]struct{} {
 	out := make(map[string]struct{})
-	for _, sub := range []string{"receipts", "products"} {
-		root := filepath.Join(r.cfg.DataDir, sub)
+	roots := make([]string, 0, 2)
+	if root, err := storage.LegacyReceiptsRoot(r.cfg.DataDir); err == nil {
+		roots = append(roots, root)
+	}
+	if root, err := storage.LegacyProductsRoot(r.cfg.DataDir); err == nil {
+		roots = append(roots, root)
+	}
+	for _, root := range roots {
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				if errors.Is(walkErr, os.ErrNotExist) {

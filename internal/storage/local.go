@@ -17,6 +17,8 @@ import (
 const (
 	ReceiptImageKindOriginal  = "original"
 	ReceiptImageKindProcessed = "processed"
+
+	maxStorageKeyLength = 4096
 )
 
 // Local resolves app-relative storage keys under one filesystem root.
@@ -128,6 +130,37 @@ func (l *Local) DeleteProduct(productID string) error {
 	return l.removeSubtree("products/" + productID)
 }
 
+// LegacyReceiptsRoot returns the DATA_DIR-relative receipts root. It exists
+// for compatibility paths that still need to inspect pre-receipt_images files.
+func LegacyReceiptsRoot(dataDir string) (string, error) {
+	local, err := NewLocal(dataDir)
+	if err != nil {
+		return "", err
+	}
+	return local.Path("receipts")
+}
+
+// LegacyReceiptDir returns the DATA_DIR-relative directory for one receipt.
+func LegacyReceiptDir(dataDir, receiptID string) (string, error) {
+	if err := ValidateOwnerID(receiptID); err != nil {
+		return "", err
+	}
+	local, err := NewLocal(dataDir)
+	if err != nil {
+		return "", err
+	}
+	return local.Path("receipts/" + receiptID)
+}
+
+// LegacyProductsRoot returns the DATA_DIR-relative products root.
+func LegacyProductsRoot(dataDir string) (string, error) {
+	local, err := NewLocal(dataDir)
+	if err != nil {
+		return "", err
+	}
+	return local.Path("products")
+}
+
 func (l *Local) removeSubtree(key string) error {
 	p, err := l.Path(key)
 	if err != nil {
@@ -204,7 +237,7 @@ func ValidateOwnerID(id string) error {
 	if id == "" {
 		return errors.New("owner id must not be empty")
 	}
-	if strings.ContainsAny(id, `/\`+"\x00") || id == "." || id == ".." {
+	if strings.ContainsAny(id, `/\`+"\x00") || containsASCIIControl(id) || id == "." || id == ".." {
 		return fmt.Errorf("invalid owner id %q", id)
 	}
 	return nil
@@ -215,8 +248,14 @@ func ValidateKey(key string) error {
 	if key == "" {
 		return errors.New("storage key must not be empty")
 	}
+	if len(key) > maxStorageKeyLength {
+		return fmt.Errorf("storage key length %d exceeds limit %d", len(key), maxStorageKeyLength)
+	}
 	if strings.Contains(key, "\x00") {
 		return fmt.Errorf("storage key %q contains NUL", key)
+	}
+	if containsASCIIControl(key) {
+		return fmt.Errorf("storage key %q contains control characters", key)
 	}
 	if strings.Contains(key, `\`) {
 		return fmt.Errorf("storage key %q must use forward slashes", key)
@@ -239,6 +278,15 @@ func ValidateKey(key string) error {
 		}
 	}
 	return nil
+}
+
+func containsASCIIControl(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func hasUnsafeSegments(key string) bool {
@@ -311,7 +359,11 @@ func NormalizeLegacyReceiptImageReference(dataDir, receiptID, raw string) (Legac
 	if err != nil {
 		return LegacyReceiptImageRef{}, err
 	}
-	ref.LegacyPath = raw
+	if filepath.IsAbs(raw) {
+		ref.LegacyPath = raw
+	} else {
+		ref.LegacyPath = slashed
+	}
 
 	if filepath.IsAbs(raw) && dataDir != "" {
 		local, err := NewLocal(dataDir)
