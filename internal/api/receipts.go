@@ -175,6 +175,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.POST("/scan", h.Scan, middleware.BodyLimit(uploadBodyLimit))
 	receipts.POST("/manual", h.CreateManual)
 	receipts.GET("", h.List)
+	receipts.POST("/compare", h.compareReceipts)
 	receipts.GET("/:id/images/:kind/:page", h.ServeImage)
 	receipts.GET("/:id", h.Get)
 	receipts.POST("/:id/line-items", h.CreateLineItem)

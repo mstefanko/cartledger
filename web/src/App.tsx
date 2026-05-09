@@ -10,6 +10,7 @@ import JoinPage from '@/pages/JoinPage'
 import DashboardPage from '@/pages/DashboardPage'
 import ScanPage from '@/pages/ScanPage'
 import ReceiptReviewPage from '@/pages/ReceiptReviewPage'
+import ReceiptComparisonPage from '@/pages/ReceiptComparisonPage'
 import ReceiptsPage from '@/pages/ReceiptsPage'
 import ProductsPage from '@/pages/ProductsPage'
 import ProductDetailPage from '@/pages/ProductDetailPage'
@@ -162,6 +163,7 @@ function AppRoutes() {
         <Route path="lists/:id" element={<ShoppingListPage />} />
         <Route path="rules" element={<RulesPage />} />
         <Route path="receipts" element={<ReceiptsPage />} />
+        <Route path="receipts/compare" element={<ReceiptComparisonPage />} />
         <Route path="receipts/new" element={<ManualReceiptPage />} />
         <Route path="receipts/:id" element={<ReceiptReviewPage />} />
         <Route path="import" element={<ImportPage />} />
