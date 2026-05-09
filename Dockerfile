@@ -39,7 +39,7 @@ ENV PORT=8079 \
 
 USER 10001:10001
 
-# Explicit mount point for persistent state (SQLite DB + receipt images)
+# Explicit mount point for persistent state (SQLite DB + images + backups)
 VOLUME ["/data"]
 
 EXPOSE 8079

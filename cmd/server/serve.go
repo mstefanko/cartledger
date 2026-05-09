@@ -23,6 +23,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/locks"
 	appmail "github.com/mstefanko/cartledger/internal/mail"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/worker"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
@@ -98,6 +99,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := db.RunMigrations(database); err != nil {
 		fatalExit("run migrations", "err", err)
 	}
+	{
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if _, err := storage.ReconcileReceiptImages(reconcileCtx, database, cfg.DataDir, slog.Default()); err != nil {
+			cancel()
+			fatalExit("reconcile receipt image metadata", "err", err)
+		}
+		cancel()
+	}
 
 	mailer, err := appmail.New(cfg)
 	if err != nil {
@@ -166,8 +175,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// registered automatically by the default registry — we do not add
 	// them explicitly.
 	metrics, err := api.NewMetrics(api.MetricsConfig{
-		DataDir: cfg.DataDir,
-		Worker:  receiptWorker,
+		DataDir:  cfg.DataDir,
+		Database: database,
+		Worker:   receiptWorker,
 	})
 	if err != nil {
 		fatalExit("init metrics", "err", err)
@@ -189,6 +199,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	var retentionJanitor *imaging.Janitor
 	if cfg.ImageRetentionDays > 0 {
 		retentionJanitor = imaging.NewJanitor(cfg.DataDir, cfg.ImageRetentionDays, cfg.ImageRetentionSweepInterval)
+		retentionJanitor.SetDB(database)
 		retentionJanitor.SetMetrics(metrics)
 		slog.Info("retention janitor enabled",
 			"days", cfg.ImageRetentionDays,

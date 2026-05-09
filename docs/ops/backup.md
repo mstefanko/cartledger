@@ -22,9 +22,9 @@ rejections) see [`migration-recovery.md`](./migration-recovery.md).
 A backup is a single gzipped tar archive containing:
 
 - `cartledger.db` — the full SQLite database, produced by `PRAGMA wal_checkpoint(TRUNCATE)` followed by `VACUUM INTO`. Deterministic and self-consistent at the moment the backup started.
-- `receipts/<receipt-id>/*.jpg|*.png` — every stored receipt image and its preprocessed counterpart that was on disk when the backup started.
+- `receipts/<receipt-id>/**` — every stored receipt image and processed display image that was on disk when the backup started.
 - `products/**` — any product images the app has saved.
-- `manifest.json` — `schema_version`, `app_version`, `created_at`, `missing_images`, and a host identifier. Used by the restore validator.
+- `manifest.json` — `schema_version`, `app_version`, `created_at`, file counts, and a host identifier. Used by the restore validator. Managed backup rows also record `missing_images`.
 
 The archive is plain `tar.gz` — `tar tf backup-*.tar.gz` lists the entries without any special tooling.
 
@@ -32,7 +32,7 @@ The archive is plain `tar.gz` — `tar tf backup-*.tar.gz` lists the entries wit
 
 - **Environment variables.** `ANTHROPIC_API_KEY`, `JWT_SECRET`, `INTEGRATIONS_KEY`, `DATA_DIR`, `PORT`, `ALLOWED_ORIGINS`, etc. are process-level config — they live in your systemd unit / docker-compose file / `.env`, not in `DATA_DIR`. You restore these separately.
 - **Integration tokens in plaintext.** Mealie and other integration tokens are stored encrypted-at-rest in the DB with `INTEGRATIONS_KEY`. The archive contains the ciphertext. Without `INTEGRATIONS_KEY` an attacker who steals the backup cannot decrypt those tokens — but this also means you must preserve `INTEGRATIONS_KEY` across a restore or integrations will fail to authenticate.
-- **Pruned original images.** The retention janitor (see `IMAGE_RETENTION_DAYS`) may have removed originals older than N days. The DB still references them; the backup records a `missing_images` count in the manifest so you know how many rows lost their image.
+- **Pruned original images.** The retention janitor (see `IMAGE_RETENTION_DAYS`) may remove originals older than N days and marks their `receipt_images` rows as pruned. Processed display images stay active. Pruned originals are not counted as missing active images; `missing_images` is reserved for active image rows whose files are unexpectedly absent.
 - **WAL/SHM sidecar files.** Backup runs a checkpoint first, so the archive's `cartledger.db` is fully self-contained — no `-wal` or `-shm` files needed.
 - **The `backups/` subdirectory itself.** Backups do not include prior backups (no recursive archiving).
 

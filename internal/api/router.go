@@ -280,6 +280,8 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	// Expected layout: <DataDir>/receipts/<receipt_uuid>/<image_file>
 	absBase, baseErr := filepath.Abs(filepath.Join(cfg.DataDir, "receipts"))
 	v1.GET("/files/*", func(c echo.Context) error {
+		c.Response().Header().Set("Deprecation", "true")
+		c.Response().Header().Set("Warning", `299 - "/api/v1/files/* is deprecated; use /api/v1/receipts/:id/images/:kind/:page"`)
 		claims, err := auth.AuthenticateWithQueryToken(c, cfg.JWTSecret, database)
 		if err != nil {
 			return err

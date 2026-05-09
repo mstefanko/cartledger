@@ -1,14 +1,18 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +26,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
 
@@ -122,6 +127,12 @@ type receiptWarningResponse struct {
 	Actual   *string `json:"actual,omitempty"`
 }
 
+type receiptImageResponse struct {
+	Kind string `json:"kind"`
+	Page int    `json:"page"`
+	URL  string `json:"url"`
+}
+
 type receiptDetailResponse struct {
 	ID                 string                   `json:"id"`
 	HouseholdID        string                   `json:"household_id"`
@@ -144,6 +155,8 @@ type receiptDetailResponse struct {
 	CreatedAt          string                   `json:"created_at"`
 	ErrorMessage       *string                  `json:"error_message,omitempty"`
 	Warnings           []receiptWarningResponse `json:"warnings"`
+	Images             []receiptImageResponse   `json:"images"`
+	CanReprocess       bool                     `json:"can_reprocess"`
 	LineItems          []lineItemResponse       `json:"line_items"`
 }
 
@@ -162,6 +175,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.POST("/scan", h.Scan, middleware.BodyLimit(uploadBodyLimit))
 	receipts.POST("/manual", h.CreateManual)
 	receipts.GET("", h.List)
+	receipts.GET("/:id/images/:kind/:page", h.ServeImage)
 	receipts.GET("/:id", h.Get)
 	receipts.POST("/:id/line-items", h.CreateLineItem)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
@@ -214,20 +228,30 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	receiptID := uuid.New().String()
 	now := time.Now().UTC()
 
-	imageDir := filepath.Join(h.Cfg.DataDir, "receipts", receiptID)
-	if err := os.MkdirAll(imageDir, 0o755); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create image directory"})
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "storage unavailable"})
 	}
 
 	// Save images to disk.
+	type savedReceiptImage struct {
+		key        string
+		mimeType   string
+		pageNumber int
+		sizeBytes  int64
+		sha256     string
+	}
+	savedImages := make([]savedReceiptImage, 0, len(files))
 	var imagePaths []string
 	for i, fh := range files {
 		ext := ".jpg"
 		if fh.Header.Get("Content-Type") == "image/png" {
 			ext = ".png"
 		}
-		filename := fmt.Sprintf("%d%s", i+1, ext)
-		destPath := filepath.Join(imageDir, filename)
+		key, err := storage.ReceiptOriginalKey(receiptID, i+1, ext)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to prepare image storage"})
+		}
 
 		src, err := fh.Open()
 		if err != nil {
@@ -256,21 +280,55 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 
 		// PNG input → re-encoded as PNG; JPEG → re-encoded as JPEG. Both
 		// preserve the on-disk extension we already chose from Content-Type.
-		if err := os.WriteFile(destPath, scrubbed, 0o644); err != nil {
+		if err := localStore.WriteFileAtomic(key, scrubbed, 0o644); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save image"})
 		}
 
-		imagePaths = append(imagePaths, destPath)
+		imagePaths = append(imagePaths, key)
+		savedImages = append(savedImages, savedReceiptImage{
+			key:        key,
+			mimeType:   fh.Header.Get("Content-Type"),
+			pageNumber: i + 1,
+			sizeBytes:  int64(len(scrubbed)),
+			sha256:     storage.SHA256Hex(scrubbed),
+		})
 	}
 
 	imagePathsStr := strings.Join(imagePaths, ",")
 
-	_, err = h.DB.Exec(
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		_ = localStore.DeleteReceipt(receiptID)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create receipt"})
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(c.Request().Context(),
 		`INSERT INTO receipts (id, household_id, scanned_by, receipt_date, image_paths, status, created_at)
 		 VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
 		receiptID, householdID, userID, now, imagePathsStr, now,
 	)
 	if err != nil {
+		_ = localStore.DeleteReceipt(receiptID)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create receipt"})
+	}
+	for _, img := range savedImages {
+		if err := storage.UpsertReceiptImage(c.Request().Context(), tx, storage.ReceiptImage{
+			ReceiptID:  receiptID,
+			Kind:       storage.ReceiptImageKindOriginal,
+			PageNumber: img.pageNumber,
+			StorageKey: img.key,
+			MimeType:   img.mimeType,
+			SizeBytes:  img.sizeBytes,
+			SHA256:     sql.NullString{String: img.sha256, Valid: true},
+			CreatedAt:  now,
+		}); err != nil {
+			_ = localStore.DeleteReceipt(receiptID)
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to record image metadata"})
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = localStore.DeleteReceipt(receiptID)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create receipt"})
 	}
 
@@ -278,7 +336,6 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	if err := h.Worker.Submit(worker.ReceiptJob{
 		ReceiptID:   receiptID,
 		HouseholdID: householdID,
-		ImageDir:    imageDir,
 	}); err != nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "server busy, please try again later"})
 	}
@@ -712,6 +769,10 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		s := total.String()
 		resp.Total = &s
 	}
+	// Do not leak raw historical image_paths values (which may be absolute
+	// host paths). The compatibility field is rebuilt from receipt_images
+	// below as app-relative storage keys.
+	resp.ImagePaths = nil
 
 	// Fetch line items with product info and suggestion data.
 	rows, err := h.DB.Query(
@@ -777,8 +838,122 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	accounted, warnings := receiptReviewWarnings(resp.ItemsSoldCount, resp.LineItems)
 	resp.AccountedItemCount = accounted
 	resp.Warnings = warnings
+	images, canReprocess, compatImagePaths, err := h.receiptImagesForResponse(c.Request().Context(), receiptID)
+	if err != nil {
+		slog.Warn("receipts: load image metadata failed", "receipt_id", receiptID, "err", err)
+	} else {
+		resp.Images = images
+		resp.CanReprocess = canReprocess
+		if compatImagePaths != "" {
+			resp.ImagePaths = &compatImagePaths
+		} else {
+			resp.ImagePaths = nil
+		}
+	}
 
 	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *ReceiptHandler) receiptImagesForResponse(ctx context.Context, receiptID string) ([]receiptImageResponse, bool, string, error) {
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err != nil {
+		return nil, false, "", err
+	}
+	rows, err := storage.ListReceiptImages(ctx, h.DB, receiptID, "")
+	if err != nil {
+		return nil, false, "", err
+	}
+	images := make([]receiptImageResponse, 0, len(rows))
+	processedKeys := make([]string, 0)
+	originalKeys := make([]string, 0)
+	canReprocess := false
+	for _, row := range rows {
+		images = append(images, receiptImageResponse{
+			Kind: row.Kind,
+			Page: row.PageNumber,
+			URL:  receiptImageURL(receiptID, row.Kind, row.PageNumber, filepath.Ext(row.StorageKey)),
+		})
+		if row.Kind == storage.ReceiptImageKindProcessed {
+			processedKeys = append(processedKeys, row.StorageKey)
+		}
+		if row.Kind == storage.ReceiptImageKindOriginal {
+			originalKeys = append(originalKeys, row.StorageKey)
+			if !canReprocess {
+				p, err := localStore.Path(row.StorageKey)
+				if err == nil {
+					if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
+						canReprocess = true
+					}
+				}
+			}
+		}
+	}
+	compat := strings.Join(processedKeys, ",")
+	if compat == "" {
+		compat = strings.Join(originalKeys, ",")
+	}
+	return images, canReprocess, compat, nil
+}
+
+func receiptImageURL(receiptID, kind string, page int, ext string) string {
+	if ext == "" {
+		ext = ".jpg"
+	}
+	return fmt.Sprintf("/api/v1/receipts/%s/images/%s/%d%s",
+		url.PathEscape(receiptID), url.PathEscape(kind), page, ext)
+}
+
+// ServeImage returns a receipt-scoped image after household ownership checks.
+func (h *ReceiptHandler) ServeImage(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+	kind := c.Param("kind")
+	if kind != storage.ReceiptImageKindOriginal && kind != storage.ReceiptImageKindProcessed {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	pageParam := c.Param("page")
+	page, _, err := storage.ParsePageFilename(pageParam)
+	if err != nil {
+		page, err = strconv.Atoi(pageParam)
+		if err != nil || page <= 0 {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+		}
+	}
+
+	var storageKey, mimeType string
+	err = h.DB.QueryRowContext(c.Request().Context(),
+		`SELECT ri.storage_key, ri.mime_type
+		   FROM receipt_images ri
+		   JOIN receipts r ON r.id = ri.receipt_id
+		  WHERE ri.receipt_id = ?
+		    AND r.household_id = ?
+		    AND ri.kind = ?
+		    AND ri.page_number = ?
+		    AND ri.deleted_at IS NULL`,
+		receiptID, householdID, kind, page,
+	).Scan(&storageKey, &mimeType)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "storage unavailable"})
+	}
+	path, err := localStore.Path(storageKey)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	if _, err := os.Stat(path); err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	if mimeType != "" {
+		c.Response().Header().Set(echo.HeaderContentType, mimeType)
+	}
+	return c.File(path)
 }
 
 func receiptReviewWarnings(itemsSoldCount *int, lineItems []lineItemResponse) (string, []receiptWarningResponse) {
@@ -1306,6 +1481,22 @@ func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, recei
 }
 
 func (h *ReceiptHandler) receiptImages(receiptID string) ([][]byte, error) {
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err == nil {
+		rows, rerr := storage.ListReceiptImages(context.Background(), h.DB, receiptID, storage.ReceiptImageKindOriginal)
+		if rerr == nil && len(rows) > 0 {
+			images := make([][]byte, 0, len(rows))
+			for _, row := range rows {
+				data, err := localStore.ReadFile(row.StorageKey)
+				if err != nil {
+					return nil, err
+				}
+				images = append(images, data)
+			}
+			return images, nil
+		}
+	}
+
 	imageDir := filepath.Join(h.Cfg.DataDir, "receipts", receiptID)
 	entries, err := os.ReadDir(imageDir)
 	if err != nil {
@@ -1685,12 +1876,12 @@ func (h *ReceiptHandler) Delete(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	receiptID := c.Param("id")
 
-	// Verify receipt belongs to household and get image_paths for cleanup.
-	var imagePaths *string
+	// Verify receipt belongs to household before deleting DB rows/files.
+	var exists int
 	err := h.DB.QueryRow(
-		"SELECT image_paths FROM receipts WHERE id = ? AND household_id = ?",
+		"SELECT 1 FROM receipts WHERE id = ? AND household_id = ?",
 		receiptID, householdID,
-	).Scan(&imagePaths)
+	).Scan(&exists)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
@@ -1715,15 +1906,9 @@ func (h *ReceiptHandler) Delete(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
 	}
 
-	// Clean up image files.
-	if imagePaths != nil {
-		for _, p := range strings.Split(*imagePaths, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				_ = os.RemoveAll(filepath.Dir(p))
-				break // all images in same dir
-			}
-		}
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err == nil {
+		_ = localStore.DeleteReceipt(receiptID)
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})

@@ -18,6 +18,7 @@ package imaging
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"os"
@@ -25,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mstefanko/cartledger/internal/storage"
 )
 
 // uuidV4Len is the fixed length of a UUID v4 canonical string
@@ -52,6 +55,7 @@ type RetentionMetricsRecorder interface {
 // sweep to exit. Stop is idempotent.
 type Janitor struct {
 	dataDir  string
+	db       *sql.DB
 	ttl      time.Duration // retention window (days * 24h); janitor is disabled when 0
 	interval time.Duration // how often to sweep
 
@@ -88,6 +92,12 @@ func NewJanitor(dataDir string, days int, interval time.Duration) *Janitor {
 // SetMetrics wires a metrics recorder for deletion counters. Optional.
 func (j *Janitor) SetMetrics(m RetentionMetricsRecorder) {
 	j.metrics = m
+}
+
+// SetDB enables receipt_images-aware retention. Without a DB, Janitor falls
+// back to the historical filename-prefix sweep for tests and old callers.
+func (j *Janitor) SetDB(db *sql.DB) {
+	j.db = db
 }
 
 // enabled reports whether the janitor has a positive retention window.
@@ -175,6 +185,10 @@ func (j *Janitor) sweep(ctx context.Context) {
 	}
 	root := filepath.Join(j.dataDir, "receipts")
 	cutoff := j.now().Add(-j.ttl)
+	if j.db != nil {
+		j.sweepReceiptImageRows(ctx, cutoff)
+		return
+	}
 
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -216,6 +230,87 @@ func (j *Janitor) sweep(ctx context.Context) {
 	} else {
 		slog.Debug("retention: swept (nothing to delete)",
 			"root", root,
+			"ttl", j.ttl,
+		)
+	}
+}
+
+func (j *Janitor) sweepReceiptImageRows(ctx context.Context, cutoff time.Time) {
+	localStore, err := storage.NewLocal(j.dataDir)
+	if err != nil {
+		slog.Warn("retention: storage unavailable", "err", err)
+		return
+	}
+	rows, err := j.db.QueryContext(ctx,
+		`SELECT id, storage_key, created_at
+		   FROM receipt_images
+		  WHERE kind = 'original' AND deleted_at IS NULL`,
+	)
+	if err != nil {
+		if !strings.Contains(err.Error(), "no such table") {
+			slog.Warn("retention: query receipt images failed", "err", err)
+		}
+		return
+	}
+	defer rows.Close()
+
+	var deleted int
+	var bytesReclaimed int64
+	now := j.now().UTC()
+	for rows.Next() {
+		if ctx.Err() != nil {
+			break
+		}
+		var id, key string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &key, &createdAt); err != nil {
+			continue
+		}
+		full, err := localStore.Path(key)
+		if err != nil {
+			continue
+		}
+		info, err := os.Lstat(full)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && createdAt.Before(cutoff) {
+				_, _ = j.db.ExecContext(ctx, "UPDATE receipt_images SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL", now, id)
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			continue
+		}
+		if !info.ModTime().Before(cutoff) && !createdAt.Before(cutoff) {
+			continue
+		}
+		size := info.Size()
+		if err := os.Remove(full); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("retention: remove failed", "path", full, "err", err)
+			}
+			continue
+		}
+		_, _ = j.db.ExecContext(ctx, "UPDATE receipt_images SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL", now, id)
+		deleted++
+		bytesReclaimed += size
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("retention: iterate receipt images failed", "err", err)
+	}
+
+	if deleted > 0 {
+		slog.Info("retention: swept",
+			"root", filepath.Join(j.dataDir, "receipts"),
+			"deleted_files", deleted,
+			"bytes_reclaimed", bytesReclaimed,
+			"ttl", j.ttl,
+		)
+		if j.metrics != nil {
+			j.metrics.RecordRetentionDeleted("age", deleted)
+		}
+	} else {
+		slog.Debug("retention: swept (nothing to delete)",
+			"root", filepath.Join(j.dataDir, "receipts"),
 			"ttl", j.ttl,
 		)
 	}

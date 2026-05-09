@@ -199,6 +199,9 @@ func TestReprocessDuplicatePendingRetryIsIdempotent(t *testing.T) {
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		t.Fatalf("mkdir image dir: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(imageDir, "1.jpg"), []byte("fake"), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
 
 	receiptWorker := worker.NewReceiptWorker(
 		0,

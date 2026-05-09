@@ -22,6 +22,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/units"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
@@ -155,9 +156,19 @@ var ErrReceiptAlreadyQueued = fmt.Errorf("receipt already queued")
 // clearing error_message before calling Resubmit; that ordering lets us fail
 // fast (no DB mutation) if the queue is closed or the images are gone.
 func (w *ReceiptWorker) Resubmit(receiptID, householdID string) error {
+	localStore, err := storage.NewLocal(w.cfg.DataDir)
+	if err == nil {
+		originals, qerr := storage.ListExistingReceiptOriginals(context.Background(), w.db, localStore, receiptID)
+		if qerr == nil && len(originals) > 0 {
+			return w.Submit(ReceiptJob{
+				ReceiptID:   receiptID,
+				HouseholdID: householdID,
+			})
+		}
+	}
+
 	imageDir := filepath.Join(w.cfg.DataDir, "receipts", receiptID)
-	info, err := os.Stat(imageDir)
-	if err != nil || !info.IsDir() {
+	if !legacyReceiptDirHasOriginals(imageDir) {
 		return ErrImagesGone
 	}
 	return w.Submit(ReceiptJob{
@@ -399,50 +410,163 @@ func (w *ReceiptWorker) markPending(receiptID string) {
 	}
 }
 
-func (w *ReceiptWorker) processJob(job ReceiptJob) error {
-	// 1. Read image files from disk.
-	entries, err := os.ReadDir(job.ImageDir)
+func (w *ReceiptWorker) loadOriginalImages(ctx context.Context, localStore *storage.Local, dataDir string, job ReceiptJob) ([]sourceImage, error) {
+	rows, err := storage.ListReceiptImages(ctx, w.db, job.ReceiptID, storage.ReceiptImageKindOriginal)
+	if err == nil && len(rows) > 0 {
+		out := make([]sourceImage, 0, len(rows))
+		for _, row := range rows {
+			data, err := localStore.ReadFile(row.StorageKey)
+			if err != nil {
+				return nil, fmt.Errorf("read receipt image %s: %w", row.StorageKey, err)
+			}
+			out = append(out, sourceImage{
+				pageNumber: row.PageNumber,
+				ext:        filepath.Ext(row.StorageKey),
+				key:        row.StorageKey,
+				data:       data,
+			})
+		}
+		return out, nil
+	}
+
+	imageDir := job.ImageDir
+	if imageDir == "" {
+		imageDir = filepath.Join(dataDir, "receipts", job.ReceiptID)
+	}
+	entries, err := os.ReadDir(imageDir)
 	if err != nil {
-		return fmt.Errorf("read image dir: %w", err)
+		return nil, fmt.Errorf("read image dir: %w", err)
+	}
+	out := make([]sourceImage, 0)
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "processed_") {
+			continue
+		}
+		page, ext, err := storage.ParsePageFilename(entry.Name())
+		if err != nil {
+			ext = strings.ToLower(filepath.Ext(entry.Name()))
+			if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
+				continue
+			}
+			page = len(out) + 1
+		}
+		if page <= 0 {
+			continue
+		}
+		imgPath := filepath.Join(imageDir, entry.Name())
+		data, err := os.ReadFile(imgPath)
+		if err != nil {
+			return nil, fmt.Errorf("read image %s: %w", entry.Name(), err)
+		}
+		key, err := storage.ReceiptOriginalKey(job.ReceiptID, page, ext)
+		if err != nil {
+			return nil, err
+		}
+		if err := localStore.WriteFileAtomic(key, data, 0o644); err == nil {
+			_ = storage.UpsertReceiptImage(ctx, w.db, storage.ReceiptImage{
+				ReceiptID:  job.ReceiptID,
+				Kind:       storage.ReceiptImageKindOriginal,
+				PageNumber: page,
+				StorageKey: key,
+				MimeType:   storage.MimeTypeFromKey(key),
+				SizeBytes:  int64(len(data)),
+				SHA256:     sql.NullString{String: storage.SHA256Hex(data), Valid: true},
+				CreatedAt:  time.Now().UTC(),
+			})
+		}
+		out = append(out, sourceImage{
+			pageNumber: page,
+			ext:        ext,
+			key:        key,
+			data:       data,
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no receipt images found")
+	}
+	return out, nil
+}
+
+type sourceImage struct {
+	pageNumber int
+	ext        string
+	key        string
+	data       []byte
+}
+
+func legacyReceiptDirHasOriginals(imageDir string) bool {
+	entries, err := os.ReadDir(imageDir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "processed_") {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *ReceiptWorker) processJob(job ReceiptJob) error {
+	dataDir := ""
+	if w.cfg != nil {
+		dataDir = w.cfg.DataDir
+	}
+	if dataDir == "" && job.ImageDir != "" {
+		dataDir = filepath.Dir(filepath.Dir(job.ImageDir))
+	}
+	localStore, err := storage.NewLocal(dataDir)
+	if err != nil {
+		return fmt.Errorf("open local storage: %w", err)
+	}
+
+	// 1. Read original image files from storage.
+	sources, err := w.loadOriginalImages(context.Background(), localStore, dataDir, job)
+	if err != nil {
+		return err
 	}
 
 	var images [][]byte
 	var processedPaths []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		// Skip previously processed files on rescan.
-		if strings.HasPrefix(entry.Name(), "processed_") {
-			continue
-		}
-		imgPath := filepath.Join(job.ImageDir, entry.Name())
-		data, err := os.ReadFile(imgPath)
-		if err != nil {
-			return fmt.Errorf("read image %s: %w", entry.Name(), err)
-		}
-
+	for _, src := range sources {
 		// Preprocess: resize, grayscale, contrast, sharpen, crop.
 		// Falls back to raw image on any error.
-		originalSize := len(data)
-		processed, _ := imaging.PreprocessReceipt(data)
-		slog.Debug("worker: image preprocessed", "name", entry.Name(), "orig_kb", originalSize/1024, "processed_kb", len(processed)/1024)
+		originalSize := len(src.data)
+		processed, _ := imaging.PreprocessReceipt(src.data)
+		slog.Debug("worker: image preprocessed", "key", src.key, "orig_kb", originalSize/1024, "processed_kb", len(processed)/1024)
 
-		// Save preprocessed version alongside original.
-		processedName := "processed_" + entry.Name()
-		processedPath := filepath.Join(job.ImageDir, processedName)
-		if err := os.WriteFile(processedPath, processed, 0644); err != nil {
+		processedKey, err := storage.ReceiptProcessedKey(job.ReceiptID, src.pageNumber, src.ext)
+		if err != nil {
+			return fmt.Errorf("build processed image key: %w", err)
+		}
+		if err := localStore.WriteFileAtomic(processedKey, processed, 0o644); err != nil {
 			slog.Warn("worker: failed to save preprocessed image", "err", err)
 			// Fall back to original path for display.
-			processedPaths = append(processedPaths, filepath.Join(job.ImageDir, entry.Name()))
+			processedPaths = append(processedPaths, src.key)
 		} else {
-			processedPaths = append(processedPaths, processedPath)
+			processedPaths = append(processedPaths, processedKey)
+			if err := storage.UpsertReceiptImage(context.Background(), w.db, storage.ReceiptImage{
+				ReceiptID:  job.ReceiptID,
+				Kind:       storage.ReceiptImageKindProcessed,
+				PageNumber: src.pageNumber,
+				StorageKey: processedKey,
+				MimeType:   storage.MimeTypeFromKey(processedKey),
+				SizeBytes:  int64(len(processed)),
+				SHA256:     sql.NullString{String: storage.SHA256Hex(processed), Valid: true},
+				CreatedAt:  time.Now().UTC(),
+			}); err != nil {
+				slog.Warn("worker: failed to upsert processed image metadata", "err", err)
+			}
 		}
 
 		images = append(images, processed)
 	}
 	if len(images) == 0 {
-		return fmt.Errorf("no images found in %s", job.ImageDir)
+		return fmt.Errorf("no images found for receipt %s", job.ReceiptID)
 	}
 
 	// Update image_paths to point to processed versions for frontend display.
@@ -489,6 +613,8 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		return fmt.Errorf("llm extraction: %w", err)
 	}
 	slog.Info("worker: LLM returned", "receipt_id", job.ReceiptID, "store", extraction.StoreName, "items", len(extraction.Items))
+
+	NormalizeExtractedPayment(extraction)
 
 	// 3. Store raw_llm_json on the receipt.
 	rawJSON, err := json.Marshal(extraction)

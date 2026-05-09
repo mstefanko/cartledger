@@ -80,3 +80,67 @@ func TestLoadRequiresLLMConfigForServer(t *testing.T) {
 		t.Fatalf("Load err = %v, want ANTHROPIC_API_KEY validation error", err)
 	}
 }
+
+func TestValidateBaseRejectsQuotedDataDir(t *testing.T) {
+	for _, raw := range []string{`"` + t.TempDir() + `"`, `'` + t.TempDir() + `'`} {
+		cfg := validTestConfig(t)
+		cfg.DataDir = raw
+		err := cfg.ValidateBase()
+		if err == nil || !strings.Contains(err.Error(), "literal quote") || !strings.Contains(err.Error(), ".env") {
+			t.Fatalf("ValidateBase(%q) err = %v, want literal quote .env error", raw, err)
+		}
+	}
+}
+
+func TestValidateBaseRejectsWhitespaceDataDir(t *testing.T) {
+	cfg := validTestConfig(t)
+	cfg.DataDir = " " + t.TempDir()
+	err := cfg.ValidateBase()
+	if err == nil || !strings.Contains(err.Error(), "whitespace") || !strings.Contains(err.Error(), ".env") {
+		t.Fatalf("ValidateBase err = %v, want whitespace .env error", err)
+	}
+
+	cfg = validTestConfig(t)
+	cfg.DataDir = "   "
+	err = cfg.ValidateBase()
+	if err == nil || !strings.Contains(err.Error(), "whitespace-only") {
+		t.Fatalf("ValidateBase err = %v, want whitespace-only error", err)
+	}
+}
+
+func TestValidateBaseProductionRequiresAbsoluteDataDir(t *testing.T) {
+	t.Setenv("CARTLEDGER_ENV", "production")
+	t.Setenv("PROD", "")
+	cfg := validTestConfig(t)
+	cfg.DataDir = "./data"
+	err := cfg.ValidateBase()
+	if err == nil || !strings.Contains(err.Error(), "absolute path in production") {
+		t.Fatalf("ValidateBase err = %v, want production absolute path error", err)
+	}
+}
+
+func TestValidateBaseAllowsDevRelativeAndSpaces(t *testing.T) {
+	t.Setenv("CARTLEDGER_ENV", "")
+	t.Setenv("PROD", "false")
+
+	cfg := validTestConfig(t)
+	cfg.DataDir = filepath.Join(t.TempDir(), "Application Support", "cartledger")
+	if err := cfg.ValidateBase(); err != nil {
+		t.Fatalf("ValidateBase path with spaces: %v", err)
+	}
+
+	cfg = validTestConfig(t)
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("abs cwd: %v", err)
+	}
+	rel, err := filepath.Rel(cwd, cfg.DataDir)
+	if err != nil {
+		t.Fatalf("rel: %v", err)
+	}
+	cfg.DataDir = rel
+	if err := cfg.ValidateBase(); err != nil {
+		t.Fatalf("ValidateBase dev relative path: %v", err)
+	}
+}

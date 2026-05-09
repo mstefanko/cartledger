@@ -96,7 +96,7 @@ go test ./...
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8079` | Server port |
-| `DATA_DIR` | `./data` | SQLite DB and uploads directory. Use an absolute path outside the repo for durable data |
+| `DATA_DIR` | `./data` | SQLite DB, receipt/product images, backups, and restore staging. Use an absolute path outside the repo for durable data; Docker/Unraid should use `/data` |
 | `BACKUP_RETAIN_COUNT` | `14` | Completed backup archives to keep under `DATA_DIR/backups` |
 | `LLM_PROVIDER` | *(auto)* | `claude` (API), `mock`, or empty for auto-detect |
 | `LLM_MODEL` | `claude-sonnet-4-20250514` | Claude model ID (e.g., `claude-haiku-4-5-20251001` for cheaper/faster) |
@@ -112,6 +112,19 @@ go test ./...
 | `ALLOW_PRIVATE_INTEGRATIONS` | `false` | Allow integration base URLs on loopback/LAN/RFC1918 addresses (self-hosters on a LAN typically want `true`) |
 
 Mealie (and other recipe/shopping integrations) are configured per-household in the UI: **Settings -> Integrations**. No environment variables required.
+
+## Unraid / Docker Storage
+
+CartLedger v1 supports local filesystem storage only. For Unraid, mount one durable host directory into the container and keep all mutable state under `/data`:
+
+```yaml
+volumes:
+  - /mnt/user/appdata/cartledger:/data
+environment:
+  - DATA_DIR=/data
+```
+
+The host directory must be writable by container uid/gid `10001:10001`. `/data` contains `cartledger.db`, receipt images, product images, backups, and restore staging. Copy backups off the appdata share or protect that share with your normal Unraid backup tooling; receipt images may include sensitive purchase, payment, or loyalty details.
 
 ## Backups and Restore
 

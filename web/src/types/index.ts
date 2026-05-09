@@ -103,10 +103,18 @@ export interface Receipt {
   items_sold_count?: number | null
   accounted_item_count?: string
   warnings?: ReceiptWarning[]
+  images?: ReceiptImage[]
+  can_reprocess?: boolean
   created_at: string
   // Populated when status='error' — the worker's most recent failure reason.
   // Cleared on successful reprocess (see POST /receipts/:id/reprocess).
   error_message?: string | null
+}
+
+export interface ReceiptImage {
+  kind: 'original' | 'processed'
+  page: number
+  url: string
 }
 
 export interface LineItem {

@@ -14,8 +14,10 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/search"
+	"github.com/mstefanko/cartledger/internal/storage"
 )
 
 // ProductHandler holds dependencies for product-related endpoints.
@@ -108,11 +110,11 @@ func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
 // RegisterRoutes mounts product endpoints onto the protected group.
 func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products := protected.Group("/products")
-	products.POST("/merge", h.Merge)                                     // Must be before /:id to avoid "merge" matching as an ID.
-	products.POST("/bulk-group", h.BulkGroup)                            // Must be before /:id.
-	products.GET("/duplicate-candidates", h.DuplicateCandidates)         // Must be before /:id.
-	products.POST("/not-duplicate-pairs", h.MarkNotDuplicate)            // Must be before /:id.
-	products.DELETE("/not-duplicate-pairs", h.UnmarkNotDuplicate)        // Must be before /:id.
+	products.POST("/merge", h.Merge)                              // Must be before /:id to avoid "merge" matching as an ID.
+	products.POST("/bulk-group", h.BulkGroup)                     // Must be before /:id.
+	products.GET("/duplicate-candidates", h.DuplicateCandidates)  // Must be before /:id.
+	products.POST("/not-duplicate-pairs", h.MarkNotDuplicate)     // Must be before /:id.
+	products.DELETE("/not-duplicate-pairs", h.UnmarkNotDuplicate) // Must be before /:id.
 	products.GET("", h.List)
 	products.POST("", h.Create)
 	products.PUT("/:id", h.Update)
@@ -482,9 +484,10 @@ func (h *ProductHandler) Delete(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// After commit: clean up on-disk image files.
-	productDir := filepath.Join(h.Cfg.DataDir, "products", productID)
-	os.RemoveAll(productDir)
+	// After commit: clean up on-disk image files by typed product id.
+	if localStore, err := storage.NewLocal(h.Cfg.DataDir); err == nil {
+		_ = localStore.DeleteProduct(productID)
+	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"deleted":              true,
@@ -585,30 +588,31 @@ func (h *ProductHandler) UploadImage(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "file too large (max 10MB)"})
 	}
 
-	// Generate image ID and create directory.
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to read image"})
+	}
+	scrubbed, err := imaging.StripMetadata(raw, 95)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "image could not be decoded"})
+	}
+
+	// Generate image ID and create storage key.
 	var imageID string
 	err = h.DB.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&imageID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	productDir := filepath.Join(h.Cfg.DataDir, "products", productID)
-	if err := os.MkdirAll(productDir, 0o755); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create image directory"})
-	}
-
-	filename := fmt.Sprintf("%s.%s", imageID, ext)
-	filePath := filepath.Join(productDir, filename)
-	relativePath := filepath.Join("products", productID, filename)
-
-	dst, err := os.Create(filePath)
+	key, err := storage.ProductImageKey(productID, imageID, ext)
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save image"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to prepare image storage"})
 	}
-	defer dst.Close()
-
-	if _, err := io.Copy(dst, file); err != nil {
-		os.Remove(filePath)
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "storage unavailable"})
+	}
+	if err := localStore.WriteFileAtomic(key, scrubbed, 0o644); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save image"})
 	}
 
@@ -628,17 +632,19 @@ func (h *ProductHandler) UploadImage(c echo.Context) error {
 	_, err = h.DB.Exec(
 		`INSERT INTO product_images (id, product_id, image_path, type, caption, is_primary, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		imageID, productID, relativePath, imageType, captionPtr, isPrimary, now,
+		imageID, productID, key, imageType, captionPtr, isPrimary, now,
 	)
 	if err != nil {
-		os.Remove(filePath)
+		if p, perr := localStore.Path(key); perr == nil {
+			_ = os.Remove(p)
+		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
 	return c.JSON(http.StatusCreated, productImageResponse{
 		ID:        imageID,
 		ProductID: productID,
-		ImagePath: relativePath,
+		ImagePath: key,
 		Type:      imageType,
 		Caption:   captionPtr,
 		IsPrimary: isPrimary,
@@ -685,9 +691,14 @@ func (h *ProductHandler) DeleteImage(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	// Delete the file.
-	fullPath := filepath.Join(h.Cfg.DataDir, imagePath)
-	os.Remove(fullPath)
+	// Delete the file through the storage boundary; invalid historical paths
+	// are ignored after the DB row is gone rather than letting a path string
+	// influence filesystem deletion outside DATA_DIR.
+	if localStore, err := storage.NewLocal(h.Cfg.DataDir); err == nil {
+		if fullPath, err := localStore.Path(filepath.ToSlash(imagePath)); err == nil {
+			_ = os.Remove(fullPath)
+		}
+	}
 
 	return c.NoContent(http.StatusNoContent)
 }

@@ -3,6 +3,8 @@
 
 # Data
 data/
+# Accidental literal-quote DATA_DIR mirror.
+/"
 *.db
 *.db-journal
 *.db-shm

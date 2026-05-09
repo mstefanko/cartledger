@@ -69,11 +69,11 @@ type Config struct {
 	// without load-testing data.
 	RateLimitEnabled bool
 	// ImageRetentionDays is the retention window for original receipt image
-	// uploads (files under DATA_DIR/receipts/<uuid>/ NOT prefixed
-	// "processed_"). When > 0, a background janitor deletes original files
-	// whose mtime is older than this many days; processed_* files are kept
-	// forever (they're the only thing the review UI can display). 0 (default)
-	// disables the janitor entirely. A reasonable self-host value is 90.
+	// uploads. When > 0, a background janitor deletes original receipt image
+	// rows/files whose mtime or metadata age is older than this many days;
+	// processed files are kept forever (they're the only thing the review UI
+	// can display). 0 (default) disables the janitor entirely. A reasonable
+	// self-host value is 90.
 	// Env: IMAGE_RETENTION_DAYS.
 	ImageRetentionDays int
 	// ImageRetentionSweepInterval is how often the retention janitor walks
@@ -267,6 +267,13 @@ func load(server bool) (*Config, error) {
 	if err := os.MkdirAll(cfg.BackupDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("create backup dir: %w", err)
 	}
+	slog.Info("config loaded",
+		"data_dir", cfg.DataDir,
+		"db_path", cfg.DBPath(),
+		"backup_dir", cfg.BackupDir(),
+		"image_retention_days", cfg.ImageRetentionDays,
+		"llm_provider", effectiveLLMProviderForLog(cfg.LLMProvider),
+	)
 	return cfg, nil
 }
 
@@ -341,8 +348,8 @@ func (c *Config) ValidateBase() error {
 	var errs []error
 
 	// DATA_DIR must exist (or be creatable) and writable.
-	if c.DataDir == "" {
-		errs = append(errs, errors.New("DATA_DIR: must not be empty"))
+	if err := validateDataDir(c.DataDir); err != nil {
+		errs = append(errs, err)
 	} else if err := ensureWritableDir(c.DataDir); err != nil {
 		errs = append(errs, fmt.Errorf("DATA_DIR: %w", err))
 	}
@@ -360,6 +367,31 @@ func (c *Config) ValidateBase() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func validateDataDir(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return errors.New("DATA_DIR: must not be empty or whitespace-only")
+	}
+	if trimmed != raw {
+		return fmt.Errorf("DATA_DIR: value has leading or trailing whitespace bytes; check .env quoting/spaces (raw %q)", raw)
+	}
+	if strings.HasPrefix(raw, `"`) || strings.HasPrefix(raw, `'`) ||
+		strings.HasSuffix(raw, `"`) || strings.HasSuffix(raw, `'`) {
+		return fmt.Errorf("DATA_DIR: value contains literal quote bytes; remove shell/.env quotes from the value (raw %q)", raw)
+	}
+	if isProduction() && !filepath.IsAbs(raw) {
+		return fmt.Errorf("DATA_DIR: must be an absolute path in production (got %q)", raw)
+	}
+	return nil
+}
+
+func effectiveLLMProviderForLog(provider string) string {
+	if provider == "" {
+		return "auto"
+	}
+	return provider
 }
 
 // DBPath returns the full path to the SQLite database file.

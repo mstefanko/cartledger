@@ -44,6 +44,7 @@ func TestMetricsNewAndClose(t *testing.T) {
 	m.RecordLLMTokens("claude", "claude-sonnet-4-20250514", 10, 5)
 	m.RecordPreprocessFallback("decode_failed")
 	m.storageBytes.WithLabelValues("receipts_original").Set(0)
+	m.storageImageRows.WithLabelValues("missing_active").Set(0)
 
 	m.Close()
 	// Second Close must be a no-op (stopOnce guard).
@@ -60,6 +61,7 @@ func TestMetricsNewAndClose(t *testing.T) {
 		"cartledger_llm_tokens_total":              false,
 		"cartledger_preprocess_fallbacks_total":    false,
 		"cartledger_storage_bytes":                 false,
+		"cartledger_storage_image_rows":            false,
 	}
 	for _, mf := range mfs {
 		if _, ok := required[mf.GetName()]; ok {
@@ -107,9 +109,9 @@ func TestMetricsBackupCollectorsRegistered(t *testing.T) {
 		t.Fatalf("Gather: %v", err)
 	}
 	required := map[string]bool{
-		"cartledger_backup_duration_seconds":      false,
-		"cartledger_backup_size_bytes":            false,
-		"cartledger_backup_missing_images_total":  false,
+		"cartledger_backup_duration_seconds":     false,
+		"cartledger_backup_size_bytes":           false,
+		"cartledger_backup_missing_images_total": false,
 	}
 	for _, mf := range mfs {
 		if _, ok := required[mf.GetName()]; ok {

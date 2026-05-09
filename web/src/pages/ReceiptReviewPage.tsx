@@ -150,16 +150,10 @@ function ReceiptReviewPage() {
     )
   }
 
-  // Parse image paths from the receipt (comma-separated or JSON array)
-  const imagePaths: string[] = (() => {
-    if (!receipt?.image_paths) return []
-    try {
-      const parsed = JSON.parse(receipt.image_paths)
-      if (Array.isArray(parsed)) return parsed as string[]
-    } catch {
-      // Not JSON — treat as comma-separated
-    }
-    return receipt.image_paths.split(',').map((p) => p.trim()).filter(Boolean)
+  const displayImages = (() => {
+    const images = receipt?.images ?? []
+    const processed = images.filter((image) => image.kind === 'processed')
+    return processed.length > 0 ? processed : images.filter((image) => image.kind === 'original')
   })()
 
   return (
@@ -262,12 +256,12 @@ function ReceiptReviewPage() {
           </h2>
           {isReceiptLoading ? (
             <ReceiptImagePending message="Loading receipt image..." />
-          ) : imagePaths.length > 0 ? (
+          ) : displayImages.length > 0 ? (
             <div className="flex flex-col gap-4 overflow-y-auto max-h-[80vh] rounded-lg border border-neutral-200 p-2 bg-neutral-50">
-              {imagePaths.map((path, idx) => (
+              {displayImages.map((image, idx) => (
                 <ReceiptMagnifier
-                  key={idx}
-                  src={`/api/v1/files/${path}`}
+                  key={`${image.kind}-${image.page}`}
+                  src={image.url}
                   alt={`Receipt page ${idx + 1}`}
                 />
               ))}

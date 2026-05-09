@@ -26,13 +26,14 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
+	"github.com/mstefanko/cartledger/internal/storage"
 )
 
 // Sentinel errors surfaced to callers; mapped to HTTP status codes in
 // internal/api/backup.go (409 for ErrAlreadyRunning, 507 for ErrInsufficientSpace).
 var (
-	ErrAlreadyRunning     = errors.New("backup: another backup is already in progress")
-	ErrInsufficientSpace  = errors.New("backup: insufficient disk space for backup")
+	ErrAlreadyRunning    = errors.New("backup: another backup is already in progress")
+	ErrInsufficientSpace = errors.New("backup: insufficient disk space for backup")
 )
 
 // errLockBusy is an internal sentinel returned by acquireFileLock when another
@@ -422,30 +423,64 @@ func (r *Runner) snapshotImageFiles() map[string]struct{} {
 	return out
 }
 
-// countMissingImages walks receipts.image_paths (JSON array or comma-
-// separated string — matching the tolerant parse in the frontend) and
-// product_images.image_path, and counts entries whose referenced file is
-// absent on disk. Absent columns / tables are tolerated silently so the
-// check survives across schema versions — this counter is informational.
+// countMissingImages walks active receipt_images rows and product_images rows,
+// then counts referenced files absent from disk. Historical receipts.image_paths
+// remains a compatibility fallback when receipt_images has not been backfilled.
+// Absent columns / tables are tolerated silently so the check survives across
+// schema versions — this counter is informational.
 // The filesystem snapshot is consulted first (fast-path); we fall back to
 // os.Stat for paths the snapshot's absolute form doesn't match.
 func (r *Runner) countMissingImages(ctx context.Context, present map[string]struct{}) int {
-	var paths []string
+	type imageRef struct {
+		value         string
+		storageKey    bool
+		legacyReceipt bool
+	}
+	var refs []imageRef
 
-	// receipts.image_paths — may be JSON array, comma-delimited, or a single path.
+	var receiptImageRows int
+	receiptImagesTablePresent := false
 	if rows, err := r.db.QueryContext(ctx,
-		`SELECT image_paths FROM receipts WHERE image_paths IS NOT NULL AND image_paths != ''`,
+		`SELECT storage_key FROM receipt_images WHERE deleted_at IS NULL AND storage_key IS NOT NULL AND storage_key != ''`,
 	); err == nil {
+		receiptImagesTablePresent = true
 		for rows.Next() {
-			var raw string
-			if err := rows.Scan(&raw); err != nil || raw == "" {
-				continue
+			var key string
+			if err := rows.Scan(&key); err == nil && key != "" {
+				refs = append(refs, imageRef{value: key, storageKey: true})
+				receiptImageRows++
 			}
-			paths = append(paths, parseImagePaths(raw)...)
 		}
 		rows.Close()
 	} else if !isSchemaMiss(err) {
-		r.log.Debug("backup: receipts image-paths query failed", "err", err)
+		r.log.Debug("backup: receipt_images query failed", "err", err)
+	}
+	if receiptImagesTablePresent && receiptImageRows == 0 {
+		var totalRows int
+		if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipt_images`).Scan(&totalRows); err == nil {
+			receiptImageRows = totalRows
+		}
+	}
+
+	// Compatibility fallback for older DBs or tests that have not run the
+	// receipt_images reconciler yet.
+	if !receiptImagesTablePresent || receiptImageRows == 0 {
+		if rows, err := r.db.QueryContext(ctx,
+			`SELECT image_paths FROM receipts WHERE image_paths IS NOT NULL AND image_paths != ''`,
+		); err == nil {
+			for rows.Next() {
+				var raw string
+				if err := rows.Scan(&raw); err != nil || raw == "" {
+					continue
+				}
+				for _, p := range parseImagePaths(raw) {
+					refs = append(refs, imageRef{value: p, legacyReceipt: true})
+				}
+			}
+			rows.Close()
+		} else if !isSchemaMiss(err) {
+			r.log.Debug("backup: receipts image-paths query failed", "err", err)
+		}
 	}
 
 	// product_images.image_path — one path per row, single column.
@@ -455,7 +490,7 @@ func (r *Runner) countMissingImages(ctx context.Context, present map[string]stru
 		for rows.Next() {
 			var p string
 			if err := rows.Scan(&p); err == nil && p != "" {
-				paths = append(paths, p)
+				refs = append(refs, imageRef{value: p, storageKey: true})
 			}
 		}
 		rows.Close()
@@ -463,15 +498,16 @@ func (r *Runner) countMissingImages(ctx context.Context, present map[string]stru
 		r.log.Debug("backup: product_images image-path query failed", "err", err)
 	}
 
+	if pruned := r.countPrunedOriginals(ctx); pruned > 0 {
+		r.log.Info("backup: pruned receipt originals not counted as missing active images", "pruned_originals", pruned)
+	}
+
 	var missing int
-	for _, p := range paths {
-		// Resolve DB-stored path against DataDir for relative values.
-		resolved := p
-		if !filepath.IsAbs(resolved) {
-			resolved = filepath.Join(r.cfg.DataDir, p)
-		}
-		absResolved, err := filepath.Abs(resolved)
-		if err != nil {
+	for _, ref := range refs {
+		absResolved, ok := r.resolveImageReference(ref.value, ref.storageKey, ref.legacyReceipt)
+		if !ok {
+			missing++
+			r.log.Info("backup: referenced image has invalid storage key", "path", ref.value)
 			continue
 		}
 		if _, ok := present[absResolved]; ok {
@@ -483,10 +519,52 @@ func (r *Runner) countMissingImages(ctx context.Context, present map[string]stru
 		// etc.) are ignored because they don't indicate the file was pruned.
 		if _, err := os.Stat(absResolved); err != nil && os.IsNotExist(err) {
 			missing++
-			r.log.Info("backup: referenced image missing from disk", "path", p)
+			r.log.Info("backup: referenced image missing from disk", "path", ref.value)
 		}
 	}
 	return missing
+}
+
+func (r *Runner) resolveImageReference(value string, storageKey, legacyReceipt bool) (string, bool) {
+	localStore, err := storage.NewLocal(r.cfg.DataDir)
+	if err == nil && storageKey {
+		p, err := localStore.Path(filepath.ToSlash(value))
+		if err != nil {
+			return "", false
+		}
+		abs, err := filepath.Abs(p)
+		return abs, err == nil
+	}
+	if err == nil && legacyReceipt {
+		if ref, rerr := storage.NormalizeLegacyReceiptImageReference(r.cfg.DataDir, "", value); rerr == nil {
+			p, perr := localStore.Path(ref.StorageKey)
+			if perr == nil {
+				abs, aerr := filepath.Abs(p)
+				if aerr == nil {
+					if _, statErr := os.Stat(abs); statErr == nil {
+						return abs, true
+					}
+				}
+			}
+		}
+	}
+	resolved := value
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(r.cfg.DataDir, value)
+	}
+	absResolved, err := filepath.Abs(resolved)
+	return absResolved, err == nil
+}
+
+func (r *Runner) countPrunedOriginals(ctx context.Context) int {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM receipt_images WHERE kind = 'original' AND deleted_at IS NOT NULL`,
+	).Scan(&n)
+	if err != nil && !isSchemaMiss(err) {
+		r.log.Debug("backup: pruned originals query failed", "err", err)
+	}
+	return n
 }
 
 // parseImagePaths accepts the three historical shapes stored in

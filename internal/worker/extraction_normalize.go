@@ -9,6 +9,21 @@ import (
 )
 
 var couponItemRefPattern = regexp.MustCompile(`/(\d{4,})\b`)
+var paymentMaskedLast4Pattern = regexp.MustCompile(`(?i)(?:[x*.#][\s-]*){2,}([0-9]{4})\b`)
+var paymentBareLast4Pattern = regexp.MustCompile(`(?i)\b(?:acct|account|card|pan)\b[^0-9]{0,16}([0-9]{4})\b`)
+var paymentBrandPattern = regexp.MustCompile(`(?i)\b(american express|amex|master\s*card|mastercard|visa|discover|debit|ebt|cash|check)\b`)
+
+// NormalizeExtractedPayment keeps tender metadata conservative. The LLM is
+// good at seeing the card brand, but it sometimes copies nearby auth/sequence
+// numbers as the last 4. When payment_card_raw is present, only trust a last 4
+// that can be parsed from a masked account line in that raw payment section.
+func NormalizeExtractedPayment(extraction *llm.ReceiptExtraction) {
+	if extraction == nil {
+		return
+	}
+	extraction.PaymentCardType = normalizePaymentCardType(extraction.PaymentCardType, extraction.PaymentCardRaw)
+	extraction.PaymentCardLast4 = normalizePaymentCardLast4(extraction.PaymentCardType, extraction.PaymentCardLast4, extraction.PaymentCardRaw)
+}
 
 func NormalizeExtractedItems(items []llm.ExtractedItem) []llm.ExtractedItem {
 	normalized := make([]llm.ExtractedItem, 0, len(items))
@@ -30,6 +45,226 @@ func NormalizeExtractedItems(items []llm.ExtractedItem) []llm.ExtractedItem {
 		normalized = append(normalized, item)
 	}
 	return normalized
+}
+
+func normalizePaymentCardType(cardType, raw *string) *string {
+	modelType := ""
+	if cardType != nil {
+		modelType = canonicalPaymentCardType(*cardType)
+	}
+	rawType := paymentCardTypeFromRaw(raw)
+
+	if rawType != "" && isCardNetwork(rawType) && (modelType == "" || !isCardNetwork(modelType)) {
+		return stringPtr(rawType)
+	}
+	if modelType != "" {
+		return stringPtr(modelType)
+	}
+	if rawType != "" {
+		return stringPtr(rawType)
+	}
+	return nil
+}
+
+func normalizePaymentCardLast4(cardType, modelLast4, raw *string) *string {
+	if cardType == nil || paymentTypeHasNoLast4(*cardType) {
+		return nil
+	}
+
+	if raw != nil && strings.TrimSpace(*raw) != "" {
+		if last4 := paymentLast4FromRaw(*raw); last4 != "" {
+			return stringPtr(last4)
+		}
+		return nil
+	}
+
+	if modelLast4 == nil {
+		return nil
+	}
+	if last4, ok := fourDigitsOnly(*modelLast4); ok {
+		return stringPtr(last4)
+	}
+	return nil
+}
+
+func paymentCardTypeFromRaw(raw *string) string {
+	if raw == nil {
+		return ""
+	}
+	matches := paymentBrandPattern.FindAllString(*raw, -1)
+	for _, preferred := range []string{"Amex", "Visa", "Mastercard", "Discover", "EBT", "Debit", "Cash", "Check"} {
+		for _, match := range matches {
+			if canonicalPaymentCardType(match) == preferred {
+				return preferred
+			}
+		}
+	}
+	return ""
+}
+
+func canonicalPaymentCardType(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "-", " ")
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	switch {
+	case strings.Contains(normalized, "american express") || strings.Contains(normalized, "amex"):
+		return "Amex"
+	case strings.Contains(normalized, "mastercard") || strings.Contains(normalized, "master card"):
+		return "Mastercard"
+	case strings.Contains(normalized, "visa"):
+		return "Visa"
+	case strings.Contains(normalized, "discover"):
+		return "Discover"
+	case strings.Contains(normalized, "ebt"):
+		return "EBT"
+	case strings.Contains(normalized, "debit"):
+		return "Debit"
+	case strings.Contains(normalized, "cash"):
+		return "Cash"
+	case strings.Contains(normalized, "check"):
+		return "Check"
+	default:
+		return ""
+	}
+}
+
+func isCardNetwork(cardType string) bool {
+	switch cardType {
+	case "Visa", "Mastercard", "Amex", "Discover":
+		return true
+	default:
+		return false
+	}
+}
+
+func paymentTypeHasNoLast4(cardType string) bool {
+	switch cardType {
+	case "Cash", "Check":
+		return true
+	default:
+		return false
+	}
+}
+
+func paymentLast4FromRaw(raw string) string {
+	lines := paymentRawLines(raw)
+	if len(lines) == 0 {
+		return ""
+	}
+
+	brandLines := make([]int, 0)
+	for i, line := range lines {
+		if paymentBrandPattern.MatchString(line) {
+			brandLines = append(brandLines, i)
+		}
+	}
+
+	bestLast4 := ""
+	bestScore := -1
+	for i, line := range lines {
+		for _, match := range paymentMaskedLast4Pattern.FindAllStringSubmatch(line, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			score := paymentLast4CandidateScore(line, i, brandLines)
+			if score > bestScore {
+				bestScore = score
+				bestLast4 = match[1]
+			}
+		}
+	}
+	if bestLast4 != "" {
+		return bestLast4
+	}
+
+	for i, line := range lines {
+		if !paymentLineHasAccountLabel(line) && nearestPaymentBrandDistance(i, brandLines) > 1 {
+			continue
+		}
+		match := paymentBareLast4Pattern.FindStringSubmatch(line)
+		if len(match) >= 2 {
+			return match[1]
+		}
+	}
+	return ""
+}
+
+func paymentRawLines(raw string) []string {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+	parts := strings.Split(raw, "\n")
+	lines := make([]string, 0, len(parts))
+	for _, part := range parts {
+		line := strings.TrimSpace(part)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func paymentLast4CandidateScore(line string, index int, brandLines []int) int {
+	score := 10
+	if paymentBrandPattern.MatchString(line) {
+		score += 8
+	}
+	if distance := nearestPaymentBrandDistance(index, brandLines); distance >= 0 {
+		score += maxInt(0, 6-distance)
+	}
+	if paymentLineHasAccountLabel(line) {
+		score += 3
+	}
+	if paymentLineHasExcludedNumberLabel(line) {
+		score -= 6
+	}
+	return score
+}
+
+func nearestPaymentBrandDistance(index int, brandLines []int) int {
+	if len(brandLines) == 0 {
+		return -1
+	}
+	best := -1
+	for _, brandLine := range brandLines {
+		distance := index - brandLine
+		if distance < 0 {
+			distance = -distance
+		}
+		if best == -1 || distance < best {
+			best = distance
+		}
+	}
+	return best
+}
+
+func paymentLineHasAccountLabel(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "acct") ||
+		strings.Contains(lower, "account") ||
+		strings.Contains(lower, "card") ||
+		strings.Contains(lower, "pan")
+}
+
+func paymentLineHasExcludedNumberLabel(line string) bool {
+	lower := strings.ToLower(line)
+	excluded := []string{"aid", "seq", "app", "auth", "approval", "approved", "tran", "trans", "transaction", "ref", "member", "merchant", "store", "phone", "zip", "subtotal", "total", "tax"}
+	for _, term := range excluded {
+		if strings.Contains(lower, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func fourDigitsOnly(value string) (string, bool) {
+	var digits strings.Builder
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	out := digits.String()
+	return out, len(out) == 4
 }
 
 func isDiscountAdjustment(item llm.ExtractedItem) bool {
@@ -192,4 +427,15 @@ func nearlyEqual(a, b float64) bool {
 
 func floatPtr(v float64) *float64 {
 	return &v
+}
+
+func stringPtr(v string) *string {
+	return &v
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

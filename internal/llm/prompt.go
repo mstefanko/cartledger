@@ -25,7 +25,12 @@ Rules:
 - Omit non-grocery items (bag fees, bottle deposits) but include tax/total
 - Per-item confidence score: 0.95+ for clearly readable, 0.7-0.95 for partially obscured, <0.7 for guesses
 - store_number: extract store/location number if printed (often after store name or in header). Return digits only, strip any '#' or 'No.' prefix.
-- payment_card_type and payment_card_last4: extract from payment section at bottom of receipt. For Cash or Check, set card_last4 to null.
+- payment_card_type: extract the card brand/tender from the payment section at bottom of receipt.
+- payment_card_last4: extract ONLY the four trailing digits from a masked payment account line (examples: "XXXXXXXXXXXX1234", "**** **** **** 1234", "CARD ********1234"). Prefer a masked account line directly above, below, or on the same line as the card brand.
+- Do NOT use member numbers, store numbers, phone/zip codes, totals, AID, sequence numbers, app/auth codes, transaction IDs, reference numbers, or approval codes as payment_card_last4.
+- If the card brand is visible but the masked account last 4 is uncertain, set payment_card_type to the brand and payment_card_last4 to null.
+- For Cash or Check, set payment_card_last4 to null.
+- payment_card_raw: transcribe the exact visible payment-section lines around the masked account, card brand, AID/auth/sequence/transaction details. Preserve line breaks and do not invent masking dots.
 - time: extract transaction time if printed (usually near date)
 - items_sold_count: if the receipt prints "Items Sold", "Total number of items sold", or similar, extract that integer; otherwise null
 - If an item has a discount/savings line immediately following it, combine them:

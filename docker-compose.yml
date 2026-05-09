@@ -12,8 +12,6 @@ services:
     environment:
       - PORT=8079
       - DATA_DIR=/data
-      - CARTLEDGER_DB_PATH=/data/cartledger.db
-      - CARTLEDGER_UPLOAD_DIR=/data/receipts
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}      # optional fallback
       - JWT_SECRET=${JWT_SECRET}

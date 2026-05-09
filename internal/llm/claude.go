@@ -53,7 +53,8 @@ var receiptTool = anthropic.ToolParam{
 			"store_number":       map[string]any{"type": []any{"string", "null"}, "description": "digits only, no '#' prefix"},
 			"date":               map[string]any{"type": "string", "description": "YYYY-MM-DD"},
 			"payment_card_type":  map[string]any{"type": []any{"string", "null"}, "enum": []any{"Visa", "Mastercard", "Amex", "Discover", "Debit", "EBT", "Cash", "Check", nil}},
-			"payment_card_last4": map[string]any{"type": []any{"string", "null"}},
+			"payment_card_last4": map[string]any{"type": []any{"string", "null"}, "description": "four trailing digits from a masked payment account line only; null if uncertain"},
+			"payment_card_raw":   map[string]any{"type": []any{"string", "null"}, "description": "exact visible payment-section lines containing masked account, card brand, AID/auth/sequence/transaction details; preserve line breaks"},
 			"time":               map[string]any{"type": []any{"string", "null"}, "description": "HH:MM 24-hour"},
 			"items_sold_count":   map[string]any{"type": []any{"integer", "null"}, "description": "printed count of physical items sold, if present"},
 			"items": map[string]any{
@@ -83,7 +84,7 @@ var receiptTool = anthropic.ToolParam{
 			"total":      map[string]any{"type": "number"},
 			"confidence": map[string]any{"type": "number"},
 		},
-		Required: []string{"store_name", "store_address", "store_city", "store_state", "store_zip", "store_number", "date", "payment_card_type", "payment_card_last4", "time", "items_sold_count", "items", "subtotal", "tax", "total", "confidence"},
+		Required: []string{"store_name", "store_address", "store_city", "store_state", "store_zip", "store_number", "date", "payment_card_type", "payment_card_last4", "payment_card_raw", "time", "items_sold_count", "items", "subtotal", "tax", "total", "confidence"},
 	},
 }
 

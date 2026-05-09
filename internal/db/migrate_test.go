@@ -27,7 +27,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"households", "users", "stores", "products", "product_aliases",
 		"matching_rules", "receipts", "line_items", "product_prices",
 		"shopping_lists", "shopping_list_items", "unit_conversions",
-		"product_images", "product_links",
+		"product_images", "product_links", "receipt_images",
 		"products_fts", "product_aliases_fts",
 		"product_groups",
 	}
@@ -65,6 +65,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"idx_receipts_store", "idx_receipts_date",
 		"idx_matching_rules_priority",
 		"idx_product_images_product",
+		"idx_receipt_images_receipt", "idx_receipt_images_active",
 		"idx_product_links_product", "idx_product_links_source",
 		"idx_products_group",
 	}

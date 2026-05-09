@@ -60,6 +60,76 @@ func TestNormalizeExtractedItems_DoesNotMergeWeightedRows(t *testing.T) {
 	}
 }
 
+func TestNormalizeExtractedPayment_UsesMaskedLast4NearCardBrand(t *testing.T) {
+	extraction := &llm.ReceiptExtraction{
+		PaymentCardType:  strPtr("Visa"),
+		PaymentCardLast4: strPtr("0618"),
+		PaymentCardRaw: strPtr(`XXXXXXXXXXXX0388       H
+AID: A0000000031010
+Seq# 7378     App#: 08257D
+Visa    Resp: APPROVED
+Tran ID#: 507000007378`),
+	}
+
+	NormalizeExtractedPayment(extraction)
+
+	if extraction.PaymentCardType == nil || *extraction.PaymentCardType != "Visa" {
+		t.Fatalf("card type = %v, want Visa", extraction.PaymentCardType)
+	}
+	if extraction.PaymentCardLast4 == nil || *extraction.PaymentCardLast4 != "0388" {
+		t.Fatalf("card last4 = %v, want 0388", extraction.PaymentCardLast4)
+	}
+}
+
+func TestNormalizeExtractedPayment_ClearsUnverifiedLast4ButKeepsBrand(t *testing.T) {
+	extraction := &llm.ReceiptExtraction{
+		PaymentCardType:  strPtr("Visa"),
+		PaymentCardLast4: strPtr("0618"),
+		PaymentCardRaw: strPtr(`AID: A0000000031010
+Seq# 7378     App#: 08257D
+Visa    Resp: APPROVED
+Tran ID#: 507000007378`),
+	}
+
+	NormalizeExtractedPayment(extraction)
+
+	if extraction.PaymentCardType == nil || *extraction.PaymentCardType != "Visa" {
+		t.Fatalf("card type = %v, want Visa", extraction.PaymentCardType)
+	}
+	if extraction.PaymentCardLast4 != nil {
+		t.Fatalf("card last4 = %v, want nil", extraction.PaymentCardLast4)
+	}
+}
+
+func TestNormalizeExtractedPayment_ClearsCashLast4(t *testing.T) {
+	extraction := &llm.ReceiptExtraction{
+		PaymentCardType:  strPtr("cash"),
+		PaymentCardLast4: strPtr("1234"),
+	}
+
+	NormalizeExtractedPayment(extraction)
+
+	if extraction.PaymentCardType == nil || *extraction.PaymentCardType != "Cash" {
+		t.Fatalf("card type = %v, want Cash", extraction.PaymentCardType)
+	}
+	if extraction.PaymentCardLast4 != nil {
+		t.Fatalf("card last4 = %v, want nil", extraction.PaymentCardLast4)
+	}
+}
+
+func TestNormalizeExtractedPayment_PrefersNetworkVisibleInRawOverGenericTender(t *testing.T) {
+	extraction := &llm.ReceiptExtraction{
+		PaymentCardType: strPtr("Debit"),
+		PaymentCardRaw:  strPtr("Visa Resp: APPROVED"),
+	}
+
+	NormalizeExtractedPayment(extraction)
+
+	if extraction.PaymentCardType == nil || *extraction.PaymentCardType != "Visa" {
+		t.Fatalf("card type = %v, want Visa", extraction.PaymentCardType)
+	}
+}
+
 func strPtr(s string) *string {
 	return &s
 }

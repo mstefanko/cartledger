@@ -7,14 +7,17 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -58,8 +61,10 @@ type Metrics struct {
 	preprocessFallbacksTotal *prometheus.CounterVec
 
 	// Storage bytes on disk under DATA_DIR/receipts/ (gauge; sampled
-	// periodically; labeled by type=original|processed).
+	// periodically; labeled by type=receipts_original|receipts_processed|product_images).
 	storageBytes *prometheus.GaugeVec
+	// Storage row health from receipt_images/product_images.
+	storageImageRows *prometheus.GaugeVec
 
 	// Retention deletions: counter of original image files removed by the
 	// retention janitor, labeled by reason ("age" for the normal mtime-based
@@ -89,6 +94,9 @@ type MetricsConfig struct {
 	// DataDir is the DATA_DIR root. The storage-bytes sampler walks
 	// DATA_DIR/receipts/ when this is non-empty.
 	DataDir string
+	// Database enables storage row health gauges for pruned originals and
+	// missing active image rows.
+	Database *sql.DB
 	// Worker whose queue-depth is sampled. nil disables the sampler.
 	Worker QueueDepthReporter
 	// QueueSampleInterval — how often to sample queue depth (default 5s).
@@ -149,9 +157,16 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 	m.storageBytes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "cartledger_storage_bytes",
-			Help: "Total bytes on disk under DATA_DIR/receipts/, by file type (original|processed).",
+			Help: "Total bytes on disk under DATA_DIR image storage, by file type.",
 		},
 		[]string{"type"},
+	)
+	m.storageImageRows = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cartledger_storage_image_rows",
+			Help: "Image metadata row counts by state (pruned_originals|missing_active).",
+		},
+		[]string{"state"},
 	)
 	m.retentionDeletedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -188,6 +203,7 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 		m.llmTokensTotal,
 		m.preprocessFallbacksTotal,
 		m.storageBytes,
+		m.storageImageRows,
 		m.retentionDeletedTotal,
 		m.backupDurationSeconds,
 		m.backupSizeBytes,
@@ -213,7 +229,7 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 	}
 	if cfg.DataDir != "" {
 		m.wg.Add(1)
-		go m.sampleStorageBytes(cfg.DataDir, storageInterval)
+		go m.sampleStorageBytes(cfg.DataDir, cfg.Database, storageInterval)
 	}
 
 	return m, nil
@@ -378,15 +394,14 @@ func (m *Metrics) sampleQueueDepth(w QueueDepthReporter, interval time.Duration)
 // are counted under type=processed; everything else under type=original.
 // Walk errors are logged (Warn) and do NOT update the gauge, so a transient
 // I/O failure leaves the previous sample in place rather than zeroing it.
-func (m *Metrics) sampleStorageBytes(dataDir string, interval time.Duration) {
+func (m *Metrics) sampleStorageBytes(dataDir string, database *sql.DB, interval time.Duration) {
 	defer m.wg.Done()
-	root := filepath.Join(dataDir, "receipts")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sample := func() {
-		var origBytes, procBytes int64
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		var origBytes, procBytes, productBytes int64
+		err := filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, walkErr error) error {
 			// Respect cancellation so Close() doesn't block on a long walk.
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -408,9 +423,13 @@ func (m *Metrics) sampleStorageBytes(dataDir string, interval time.Duration) {
 			}
 			name := d.Name()
 			sz := info.Size()
-			if strings.HasPrefix(name, "processed_") {
+			slashed := filepath.ToSlash(path)
+			switch {
+			case strings.Contains(slashed, "/products/"):
+				productBytes += sz
+			case strings.Contains(slashed, "/receipts/") && (strings.Contains(slashed, "/processed/") || strings.HasPrefix(name, "processed_")):
 				procBytes += sz
-			} else {
+			case strings.Contains(slashed, "/receipts/"):
 				origBytes += sz
 			}
 			return nil
@@ -419,11 +438,17 @@ func (m *Metrics) sampleStorageBytes(dataDir string, interval time.Duration) {
 		// walkErr path above. On a real error other than that, log but
 		// do not zero the gauge.
 		if err != nil && !isMissingPathErr(err) {
-			slog.Warn("metrics: storage walk failed", "root", root, "err", err)
+			slog.Warn("metrics: storage walk failed", "root", dataDir, "err", err)
 			return
 		}
 		m.storageBytes.WithLabelValues("receipts_original").Set(float64(origBytes))
 		m.storageBytes.WithLabelValues("receipts_processed").Set(float64(procBytes))
+		m.storageBytes.WithLabelValues("product_images").Set(float64(productBytes))
+		if database != nil {
+			pruned, missing := storageImageRowCounts(context.Background(), database, dataDir)
+			m.storageImageRows.WithLabelValues("pruned_originals").Set(float64(pruned))
+			m.storageImageRows.WithLabelValues("missing_active").Set(float64(missing))
+		}
 	}
 
 	// Prime immediately.
@@ -440,6 +465,44 @@ func (m *Metrics) sampleStorageBytes(dataDir string, interval time.Duration) {
 	}
 }
 
+func storageImageRowCounts(ctx context.Context, database *sql.DB, dataDir string) (int, int) {
+	var pruned int
+	_ = database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM receipt_images WHERE kind = 'original' AND deleted_at IS NOT NULL`,
+	).Scan(&pruned)
+
+	localStore, err := storage.NewLocal(dataDir)
+	if err != nil {
+		return pruned, 0
+	}
+	var keys []string
+	if rows, err := database.QueryContext(ctx,
+		`SELECT storage_key FROM receipt_images WHERE deleted_at IS NULL
+		 UNION ALL
+		 SELECT image_path FROM product_images WHERE image_path IS NOT NULL AND image_path != ''`,
+	); err == nil {
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err == nil && key != "" {
+				keys = append(keys, filepath.ToSlash(key))
+			}
+		}
+		rows.Close()
+	}
+	var missing int
+	for _, key := range keys {
+		p, err := localStore.Path(key)
+		if err != nil {
+			missing++
+			continue
+		}
+		if _, err := os.Stat(p); err != nil && os.IsNotExist(err) {
+			missing++
+		}
+	}
+	return pruned, missing
+}
+
 // isMissingPathErr is a lightweight check for "root does not exist" errors
 // returned from filepath.WalkDir when DATA_DIR/receipts/ hasn't been
 // created yet (fresh install before any scan).
@@ -450,4 +513,3 @@ func isMissingPathErr(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "no such file") || strings.Contains(msg, "cannot find")
 }
-

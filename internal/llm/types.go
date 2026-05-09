@@ -11,6 +11,7 @@ type ReceiptExtraction struct {
 	Date             string          `json:"date"`
 	PaymentCardType  *string         `json:"payment_card_type"`
 	PaymentCardLast4 *string         `json:"payment_card_last4"`
+	PaymentCardRaw   *string         `json:"payment_card_raw"`
 	Time             *string         `json:"time"`
 	ItemsSoldCount   *int            `json:"items_sold_count"`
 	Items            []ExtractedItem `json:"items"`
