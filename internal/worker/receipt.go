@@ -480,7 +480,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	if err != nil {
 		return fmt.Errorf("marshal extraction: %w", err)
 	}
-	extraction.Items = normalizeExtractedItems(extraction.Items)
+	extraction.Items = NormalizeExtractedItems(extraction.Items)
 
 	now := time.Now().UTC()
 

@@ -126,6 +126,16 @@ export async function repairReceiptPreview(
   )
 }
 
+export async function applyRepairPreview(
+  receiptId: string,
+  preview: RepairPreviewResponse,
+): Promise<{ status: string }> {
+  return post<{ status: string }>(
+    `/receipts/${encodeURIComponent(receiptId)}/apply-repair`,
+    preview,
+  )
+}
+
 export interface ManualLineItemInput {
   raw_name: string
   product_id?: string

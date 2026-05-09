@@ -10,7 +10,7 @@ import (
 
 var couponItemRefPattern = regexp.MustCompile(`/(\d{4,})\b`)
 
-func normalizeExtractedItems(items []llm.ExtractedItem) []llm.ExtractedItem {
+func NormalizeExtractedItems(items []llm.ExtractedItem) []llm.ExtractedItem {
 	normalized := make([]llm.ExtractedItem, 0, len(items))
 	for _, item := range items {
 		if isDiscountAdjustment(item) {

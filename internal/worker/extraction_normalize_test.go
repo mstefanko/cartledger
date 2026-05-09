@@ -12,7 +12,7 @@ func TestNormalizeExtractedItems_AttachesCostcoCouponToReferencedItem(t *testing
 		{RawName: "000343232/1005641", SuggestedName: "Discount/Coupon", Quantity: 1, Unit: strPtr("each"), TotalPrice: -5, LineNumber: 4, Confidence: 0.90},
 	}
 
-	got := normalizeExtractedItems(items)
+	got := NormalizeExtractedItems(items)
 	if len(got) != 1 {
 		t.Fatalf("len(normalized) = %d, want 1", len(got))
 	}
@@ -33,7 +33,7 @@ func TestNormalizeExtractedItems_MergesAdjacentCountableDuplicates(t *testing.T)
 		{RawName: "47826 GREEN GRAPES", SuggestedName: "Green Grapes", Quantity: 1, Unit: strPtr("each"), TotalPrice: 6.39, LineNumber: 11, Confidence: 0.95},
 	}
 
-	got := normalizeExtractedItems(items)
+	got := NormalizeExtractedItems(items)
 	if len(got) != 1 {
 		t.Fatalf("len(normalized) = %d, want 1", len(got))
 	}
@@ -54,7 +54,7 @@ func TestNormalizeExtractedItems_DoesNotMergeWeightedRows(t *testing.T) {
 		{RawName: "22967 ORGNC BS THG", Quantity: 1.31, Unit: strPtr("lb"), TotalPrice: 13.10, LineNumber: 2, Confidence: 0.95},
 	}
 
-	got := normalizeExtractedItems(items)
+	got := NormalizeExtractedItems(items)
 	if len(got) != 2 {
 		t.Fatalf("len(normalized) = %d, want 2", len(got))
 	}

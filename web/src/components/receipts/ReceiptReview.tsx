@@ -7,7 +7,7 @@ import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 // CreateRuleModal replaced by inline batch rule modal
-import { getReceipt, updateLineItem, createLineItem, repairReceiptPreview, acceptSuggestions, confirmReceipt, type CreateLineItemRequest, type ReceiptDetail, type RepairPreviewResponse } from '@/api/receipts'
+import { getReceipt, updateLineItem, createLineItem, repairReceiptPreview, applyRepairPreview, acceptSuggestions, confirmReceipt, type CreateLineItemRequest, type ReceiptDetail, type RepairPreviewResponse } from '@/api/receipts'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { LineItem, Product } from '@/types'
@@ -165,6 +165,17 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     mutationFn: (note: string) => repairReceiptPreview(receiptId, note),
     onSuccess: (preview) => {
       setRepairPreview(preview)
+    },
+  })
+
+  const applyRepairMutation = useMutation({
+    mutationFn: (preview: RepairPreviewResponse) => applyRepairPreview(receiptId, preview),
+    onSuccess: () => {
+      setRepairOpen(false)
+      setRepairNote('')
+      setRepairPreview(null)
+      queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+      queryClient.invalidateQueries({ queryKey: ['receipts'] })
     },
   })
 
@@ -810,10 +821,26 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             <Button
               type="button"
               size="sm"
-              disabled={repairPreviewMutation.isPending || repairNote.trim() === ''}
-              onClick={() => repairPreviewMutation.mutate(repairNote.trim())}
+              disabled={
+                repairPreviewMutation.isPending ||
+                applyRepairMutation.isPending ||
+                repairNote.trim() === ''
+              }
+              onClick={() => {
+                if (repairPreview) {
+                  applyRepairMutation.mutate(repairPreview)
+                  return
+                }
+                repairPreviewMutation.mutate(repairNote.trim())
+              }}
             >
-              {repairPreviewMutation.isPending ? 'Repairing...' : 'Preview Repair'}
+              {applyRepairMutation.isPending
+                ? 'Applying...'
+                : repairPreview
+                  ? 'Apply Repair'
+                  : repairPreviewMutation.isPending
+                    ? 'Repairing...'
+                    : 'Preview Repair'}
             </Button>
           </>
         }
@@ -823,7 +850,10 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             Repair Note
             <textarea
               value={repairNote}
-              onChange={(e) => setRepairNote(e.target.value)}
+              onChange={(e) => {
+                setRepairNote(e.target.value)
+                setRepairPreview(null)
+              }}
               rows={4}
               className="resize-none rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
             />
@@ -831,6 +861,11 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
           {repairPreviewMutation.isError && (
             <p className="text-small text-expensive">
               Repair preview failed.
+            </p>
+          )}
+          {applyRepairMutation.isError && (
+            <p className="text-small text-expensive">
+              Failed to apply repair.
             </p>
           )}
           {repairPreview && (

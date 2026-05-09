@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,6 +166,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.POST("/:id/line-items", h.CreateLineItem)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
 	receipts.POST("/:id/repair-preview", h.RepairPreview)
+	receipts.POST("/:id/apply-repair", h.ApplyRepair)
 	receipts.POST("/:id/accept-suggestions", h.AcceptSuggestions)
 	receipts.POST("/:id/reprocess", h.Reprocess)
 	receipts.PUT("/:id", h.UpdateReceipt)
@@ -1049,6 +1051,231 @@ func (h *ReceiptHandler) RepairPreview(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, extraction)
+}
+
+// ApplyRepair accepts a repair preview and replaces the receipt's extracted
+// line items with the normalized repaired set.
+// POST /api/v1/receipts/:id/apply-repair
+func (h *ReceiptHandler) ApplyRepair(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	var extraction llm.ReceiptExtraction
+	if err := c.Bind(&extraction); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(extraction.Items) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "repair preview has no items"})
+	}
+
+	var storeID *string
+	var receiptDate time.Time
+	var status string
+	err := h.DB.QueryRow(
+		"SELECT store_id, receipt_date, status FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&storeID, &receiptDate, &status)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if status == "reviewed" {
+		return c.JSON(http.StatusConflict, map[string]string{"error": "cannot repair a reviewed receipt"})
+	}
+
+	extraction.Items = worker.NormalizeExtractedItems(extraction.Items)
+	rawJSON, err := json.Marshal(extraction)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid repair preview"})
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	preserved, err := loadPreservedMatches(tx, receiptID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if _, err = tx.Exec("DELETE FROM product_prices WHERE receipt_id = ?", receiptID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clear old prices"})
+	}
+	if _, err = tx.Exec("DELETE FROM line_items WHERE receipt_id = ?", receiptID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clear old line items"})
+	}
+
+	now := time.Now().UTC()
+	for _, item := range extraction.Items {
+		if strings.TrimSpace(item.RawName) == "" {
+			continue
+		}
+		if err := insertRepairedLineItem(tx, receiptID, storeID, receiptDate, item, preserved, now); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to apply repaired items"})
+		}
+	}
+
+	subtotal := decimal.NewFromFloat(extraction.Subtotal).String()
+	tax := decimal.NewFromFloat(extraction.Tax).String()
+	total := decimal.NewFromFloat(extraction.Total).String()
+	_, err = tx.Exec(
+		`UPDATE receipts
+		 SET subtotal = ?, tax = ?, total = ?, items_sold_count = ?, raw_llm_json = ?, status = 'matched'
+		 WHERE id = ?`,
+		subtotal, tax, total, extraction.ItemsSoldCount, string(rawJSON), receiptID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update receipt"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit repair"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "applied"})
+}
+
+type preservedLineMatch struct {
+	ProductID          *string
+	Matched            string
+	SuggestedProductID *string
+}
+
+func loadPreservedMatches(tx *sql.Tx, receiptID string) (map[string]preservedLineMatch, error) {
+	rows, err := tx.Query(
+		`SELECT raw_name, product_id, matched, suggested_product_id
+		 FROM line_items
+		 WHERE receipt_id = ?`,
+		receiptID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	matches := make(map[string]preservedLineMatch)
+	for rows.Next() {
+		var rawName, matched string
+		var productID, suggestedProductID *string
+		if err := rows.Scan(&rawName, &productID, &matched, &suggestedProductID); err != nil {
+			return nil, err
+		}
+		key := matcher.Normalize(rawName)
+		if key == "" {
+			continue
+		}
+		if existing, ok := matches[key]; ok && existing.ProductID != nil {
+			continue
+		}
+		matches[key] = preservedLineMatch{
+			ProductID:          productID,
+			Matched:            matched,
+			SuggestedProductID: suggestedProductID,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, receiptDate time.Time, item llm.ExtractedItem, preserved map[string]preservedLineMatch, now time.Time) error {
+	quantity := decimal.NewFromFloat(item.Quantity)
+	if quantity.IsZero() {
+		quantity = decimal.NewFromInt(1)
+	}
+	countContribution := decimal.NewFromFloat(item.CountContribution)
+	if countContribution.IsZero() {
+		countContribution = deriveCountContribution(quantity, item.Unit)
+	}
+	totalPrice := decimal.NewFromFloat(item.TotalPrice)
+
+	var unitPrice *string
+	if item.UnitPrice != nil {
+		up := decimal.NewFromFloat(*item.UnitPrice).String()
+		unitPrice = &up
+	}
+	var regularPrice, discountAmount *string
+	if item.RegularPrice != nil {
+		rp := decimal.NewFromFloat(*item.RegularPrice).String()
+		regularPrice = &rp
+	}
+	if item.DiscountAmount != nil {
+		da := decimal.NewFromFloat(*item.DiscountAmount).String()
+		discountAmount = &da
+	}
+
+	var productID, suggestedProductID *string
+	matched := "unmatched"
+	if preservedMatch, ok := preserved[matcher.Normalize(item.RawName)]; ok {
+		productID = preservedMatch.ProductID
+		suggestedProductID = preservedMatch.SuggestedProductID
+		if productID != nil {
+			matched = preservedMatch.Matched
+			if matched == "" || matched == "unmatched" {
+				matched = "manual"
+			}
+		}
+	}
+
+	var confidence *float64
+	if item.Confidence > 0 {
+		conf := item.Confidence
+		confidence = &conf
+	}
+
+	var suggestedName, suggestedCategory, suggestedBrand *string
+	if item.SuggestedName != "" {
+		suggestedName = &item.SuggestedName
+	}
+	if item.SuggestedCategory != "" {
+		suggestedCategory = &item.SuggestedCategory
+	}
+	if item.SuggestedBrand != "" {
+		suggestedBrand = &item.SuggestedBrand
+	}
+
+	lineItemID := uuid.New().String()
+	_, err := tx.Exec(
+		`INSERT INTO line_items
+		    (id, receipt_id, product_id, raw_name, quantity, unit, unit_price,
+		     total_price, regular_price, discount_amount, count_contribution,
+		     suggested_name, suggested_category, suggested_brand, suggested_product_id,
+		     matched, confidence, line_number, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		lineItemID, receiptID, productID, item.RawName, quantity.String(), item.Unit, unitPrice,
+		totalPrice.String(), regularPrice, discountAmount, countContribution.String(),
+		suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
+		matched, confidence, item.LineNumber, now,
+	)
+	if err != nil {
+		return err
+	}
+
+	if productID != nil && storeID != nil {
+		unit := "each"
+		if item.Unit != nil && strings.TrimSpace(*item.Unit) != "" {
+			unit = *item.Unit
+		}
+		priceQuantity := quantity
+		if priceQuantity.IsZero() {
+			priceQuantity = decimal.NewFromInt(1)
+		}
+		isSale := regularPrice != nil && discountAmount != nil
+		_, err = tx.Exec(
+			`INSERT INTO product_prices
+			    (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			uuid.New().String(), *productID, *storeID, receiptID, receiptDate,
+			quantity.String(), unit, totalPrice.Div(priceQuantity).String(),
+			regularPrice, discountAmount, isSale, now,
+		)
+	}
+	return err
 }
 
 func (h *ReceiptHandler) receiptImages(receiptID string) ([][]byte, error) {
