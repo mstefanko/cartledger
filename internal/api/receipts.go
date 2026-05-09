@@ -38,19 +38,35 @@ type ReceiptHandler struct {
 // --- Request / Response types ---
 
 type updateLineItemRequest struct {
-	ProductID *string `json:"product_id"`
-	Quantity  *string `json:"quantity"`
-	Unit      *string `json:"unit"`
-	Price     *string `json:"price"`
+	ProductID  *string `json:"product_id"`
+	Quantity   *string `json:"quantity"`
+	Unit       *string `json:"unit"`
+	Price      *string `json:"price"`
+	TotalPrice *string `json:"total_price"`
 }
 
 type manualLineItemRequest struct {
 	RawName    string  `json:"raw_name"`
-	ProductID  *string `json:"product_id"`  // optional: user picked from autocomplete
-	Quantity   *string `json:"quantity"`    // decimal string; defaults to "1"
+	ProductID  *string `json:"product_id"` // optional: user picked from autocomplete
+	Quantity   *string `json:"quantity"`   // decimal string; defaults to "1"
 	Unit       *string `json:"unit"`
 	UnitPrice  *string `json:"unit_price"`
 	TotalPrice string  `json:"total_price"` // required
+}
+
+type createLineItemRequest struct {
+	RawName           string  `json:"raw_name"`
+	ProductID         *string `json:"product_id"`
+	Quantity          *string `json:"quantity"`
+	Unit              *string `json:"unit"`
+	UnitPrice         *string `json:"unit_price"`
+	TotalPrice        string  `json:"total_price"`
+	LineNumber        *int    `json:"line_number"`
+	CountContribution *string `json:"count_contribution"`
+}
+
+type repairPreviewRequest struct {
+	Note string `json:"note"`
 }
 
 type manualReceiptRequest struct {
@@ -86,6 +102,7 @@ type lineItemResponse struct {
 	TotalPrice           string   `json:"total_price"`
 	RegularPrice         *string  `json:"regular_price,omitempty"`
 	DiscountAmount       *string  `json:"discount_amount,omitempty"`
+	CountContribution    string   `json:"count_contribution"`
 	Matched              string   `json:"matched"`
 	Confidence           *float64 `json:"confidence,omitempty"`
 	LineNumber           *int     `json:"line_number,omitempty"`
@@ -96,26 +113,37 @@ type lineItemResponse struct {
 	SuggestionType       *string  `json:"suggestion_type,omitempty"`
 }
 
+type receiptWarningResponse struct {
+	Code     string  `json:"code"`
+	Severity string  `json:"severity"`
+	Message  string  `json:"message"`
+	Expected *string `json:"expected,omitempty"`
+	Actual   *string `json:"actual,omitempty"`
+}
+
 type receiptDetailResponse struct {
-	ID          string             `json:"id"`
-	HouseholdID string            `json:"household_id"`
-	StoreID     *string            `json:"store_id,omitempty"`
-	StoreName   *string            `json:"store_name,omitempty"`
-	ScannedBy   *string            `json:"scanned_by,omitempty"`
-	ReceiptDate string             `json:"receipt_date"`
-	Subtotal    *string            `json:"subtotal,omitempty"`
-	Tax         *string            `json:"tax,omitempty"`
-	Total       *string            `json:"total,omitempty"`
-	Status      string             `json:"status"`
-	LLMProvider *string            `json:"llm_provider,omitempty"`
-	CardType    *string            `json:"card_type,omitempty"`
-	CardLast4   *string            `json:"card_last4,omitempty"`
-	ReceiptTime *string            `json:"receipt_time,omitempty"`
-	ImagePaths   *string            `json:"image_paths,omitempty"`
-	RawLLMJSON   *string            `json:"raw_llm_json,omitempty"`
-	CreatedAt    string             `json:"created_at"`
-	ErrorMessage *string            `json:"error_message,omitempty"`
-	LineItems    []lineItemResponse `json:"line_items"`
+	ID                 string                   `json:"id"`
+	HouseholdID        string                   `json:"household_id"`
+	StoreID            *string                  `json:"store_id,omitempty"`
+	StoreName          *string                  `json:"store_name,omitempty"`
+	ScannedBy          *string                  `json:"scanned_by,omitempty"`
+	ReceiptDate        string                   `json:"receipt_date"`
+	Subtotal           *string                  `json:"subtotal,omitempty"`
+	Tax                *string                  `json:"tax,omitempty"`
+	Total              *string                  `json:"total,omitempty"`
+	Status             string                   `json:"status"`
+	LLMProvider        *string                  `json:"llm_provider,omitempty"`
+	CardType           *string                  `json:"card_type,omitempty"`
+	CardLast4          *string                  `json:"card_last4,omitempty"`
+	ReceiptTime        *string                  `json:"receipt_time,omitempty"`
+	ItemsSoldCount     *int                     `json:"items_sold_count,omitempty"`
+	AccountedItemCount string                   `json:"accounted_item_count"`
+	ImagePaths         *string                  `json:"image_paths,omitempty"`
+	RawLLMJSON         *string                  `json:"raw_llm_json,omitempty"`
+	CreatedAt          string                   `json:"created_at"`
+	ErrorMessage       *string                  `json:"error_message,omitempty"`
+	Warnings           []receiptWarningResponse `json:"warnings"`
+	LineItems          []lineItemResponse       `json:"line_items"`
 }
 
 // uploadBodyLimit caps the request body for multipart receipt uploads.
@@ -134,7 +162,9 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.POST("/manual", h.CreateManual)
 	receipts.GET("", h.List)
 	receipts.GET("/:id", h.Get)
+	receipts.POST("/:id/line-items", h.CreateLineItem)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
+	receipts.POST("/:id/repair-preview", h.RepairPreview)
 	receipts.POST("/:id/accept-suggestions", h.AcceptSuggestions)
 	receipts.POST("/:id/reprocess", h.Reprocess)
 	receipts.PUT("/:id", h.UpdateReceipt)
@@ -493,13 +523,23 @@ func (h *ReceiptHandler) Reprocess(c echo.Context) error {
 	// only to flip back to "error" a moment later.
 	if h.Guard != nil {
 		if err := llm.CheckBudget(h.Guard.DB(), householdID, h.Guard.Budget()); err != nil {
+			msg := "LLM monthly budget exhausted; raise LLM_MONTHLY_TOKEN_BUDGET or wait until next month"
+			_, _ = h.DB.Exec(
+				"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ? AND household_id = ?",
+				msg, receiptID, householdID,
+			)
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{
-				"error": "LLM monthly budget exhausted; raise LLM_MONTHLY_TOKEN_BUDGET or wait until next month",
+				"error": msg,
 			})
 		}
 		if h.Guard.Breaker() != nil && h.Guard.Breaker().IsOpen() {
+			msg := "Receipt extraction is paused because the AI service is rate-limiting requests. Wait a few minutes, then retry extraction."
+			_, _ = h.DB.Exec(
+				"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ? AND household_id = ?",
+				msg, receiptID, householdID,
+			)
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{
-				"error": "LLM temporarily unavailable (circuit breaker open); try again in a minute",
+				"error": msg,
 			})
 		}
 	}
@@ -609,7 +649,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	err := h.DB.QueryRow(
 		`SELECT r.id, r.household_id, r.store_id, s.name, r.scanned_by, r.receipt_date,
 		        r.subtotal, r.tax, r.total, r.status, r.llm_provider,
-		        r.card_type, r.card_last4, r.receipt_time,
+		        r.card_type, r.card_last4, r.receipt_time, r.items_sold_count,
 		        r.image_paths, r.raw_llm_json, r.created_at, r.error_message
 		 FROM receipts r
 		 LEFT JOIN stores s ON r.store_id = s.id
@@ -619,7 +659,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		&resp.ID, &resp.HouseholdID, &resp.StoreID, &resp.StoreName,
 		&resp.ScannedBy, &receiptDate, &subtotal, &tax, &total,
 		&resp.Status, &resp.LLMProvider,
-		&resp.CardType, &resp.CardLast4, &resp.ReceiptTime,
+		&resp.CardType, &resp.CardLast4, &resp.ReceiptTime, &resp.ItemsSoldCount,
 		&resp.ImagePaths, &resp.RawLLMJSON, &createdAt, &resp.ErrorMessage,
 	)
 	if err == sql.ErrNoRows {
@@ -648,7 +688,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	rows, err := h.DB.Query(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
-		        li.regular_price, li.discount_amount,
+		        li.regular_price, li.discount_amount, li.count_contribution,
 		        li.matched, li.confidence, li.line_number,
 		        li.suggested_name, li.suggested_category,
 		        li.suggested_product_id, sp.name
@@ -667,12 +707,12 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	resp.LineItems = make([]lineItemResponse, 0)
 	for rows.Next() {
 		var li lineItemResponse
-		var quantity, totalPrice decimal.Decimal
+		var quantity, totalPrice, countContribution decimal.Decimal
 		var unitPrice *decimal.Decimal
 		if err := rows.Scan(
 			&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
 			&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
-			&li.RegularPrice, &li.DiscountAmount,
+			&li.RegularPrice, &li.DiscountAmount, &countContribution,
 			&li.Matched, &li.Confidence, &li.LineNumber,
 			&li.SuggestedName, &li.SuggestedCategory,
 			&li.SuggestedProductID, &li.SuggestedProductName,
@@ -681,6 +721,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		}
 		li.Quantity = quantity.String()
 		li.TotalPrice = totalPrice.String()
+		li.CountContribution = countContribution.String()
 		if unitPrice != nil {
 			s := unitPrice.String()
 			li.UnitPrice = &s
@@ -704,7 +745,334 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
+	accounted, warnings := receiptReviewWarnings(resp.ItemsSoldCount, resp.LineItems)
+	resp.AccountedItemCount = accounted
+	resp.Warnings = warnings
+
 	return c.JSON(http.StatusOK, resp)
+}
+
+func receiptReviewWarnings(itemsSoldCount *int, lineItems []lineItemResponse) (string, []receiptWarningResponse) {
+	accounted := decimal.Zero
+	for _, item := range lineItems {
+		count, err := decimal.NewFromString(item.CountContribution)
+		if err != nil {
+			continue
+		}
+		accounted = accounted.Add(count)
+	}
+
+	warnings := make([]receiptWarningResponse, 0)
+	if itemsSoldCount != nil {
+		expected := decimal.NewFromInt(int64(*itemsSoldCount))
+		if !accounted.Equal(expected) {
+			expectedStr := expected.String()
+			actualStr := accounted.String()
+			warnings = append(warnings, receiptWarningResponse{
+				Code:     "item_count_mismatch",
+				Severity: "warning",
+				Message:  fmt.Sprintf("Receipt says %s items sold, but this scan accounts for %s.", expectedStr, actualStr),
+				Expected: &expectedStr,
+				Actual:   &actualStr,
+			})
+		}
+	}
+
+	return accounted.String(), warnings
+}
+
+// CreateLineItem adds a manual line item to an existing receipt.
+// POST /api/v1/receipts/:id/line-items
+func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	var req createLineItemRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.RawName = strings.TrimSpace(req.RawName)
+	if req.RawName == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "raw_name is required"})
+	}
+	totalPrice, err := decimal.NewFromString(req.TotalPrice)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "total_price must be a decimal"})
+	}
+
+	quantity := decimal.NewFromInt(1)
+	if req.Quantity != nil && strings.TrimSpace(*req.Quantity) != "" {
+		quantity, err = decimal.NewFromString(*req.Quantity)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "quantity must be a decimal"})
+		}
+	}
+	var unitPrice *string
+	if req.UnitPrice != nil && strings.TrimSpace(*req.UnitPrice) != "" {
+		if _, err := decimal.NewFromString(*req.UnitPrice); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "unit_price must be a decimal"})
+		}
+		unitPrice = req.UnitPrice
+	}
+
+	countContribution := deriveCountContribution(quantity, req.Unit)
+	if req.CountContribution != nil && strings.TrimSpace(*req.CountContribution) != "" {
+		countContribution, err = decimal.NewFromString(*req.CountContribution)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "count_contribution must be a decimal"})
+		}
+	}
+
+	var storeID *string
+	var receiptDate time.Time
+	err = h.DB.QueryRow(
+		"SELECT store_id, receipt_date FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&storeID, &receiptDate)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var productID *string
+	matched := "unmatched"
+	if req.ProductID != nil && strings.TrimSpace(*req.ProductID) != "" {
+		var exists int
+		err := h.DB.QueryRow(
+			"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+			*req.ProductID, householdID,
+		).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "product_id not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		productID = req.ProductID
+		matched = "manual"
+	}
+
+	lineNumber := 1
+	if req.LineNumber != nil && *req.LineNumber > 0 {
+		lineNumber = *req.LineNumber
+	} else {
+		_ = h.DB.QueryRow(
+			"SELECT COALESCE(MAX(line_number), 0) + 1 FROM line_items WHERE receipt_id = ?",
+			receiptID,
+		).Scan(&lineNumber)
+	}
+
+	itemID := uuid.New().String()
+	now := time.Now().UTC()
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
+		`INSERT INTO line_items
+		    (id, receipt_id, product_id, raw_name, quantity, unit, unit_price,
+		     total_price, matched, line_number, count_contribution, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		itemID, receiptID, productID, req.RawName, quantity.String(), req.Unit, unitPrice,
+		totalPrice.String(), matched, lineNumber, countContribution.String(), now,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
+	}
+
+	if productID != nil && storeID != nil {
+		normalized := matcher.Normalize(req.RawName)
+		var aliasExists int
+		_ = tx.QueryRow(
+			"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
+			*productID, normalized,
+		).Scan(&aliasExists)
+		if aliasExists == 0 {
+			_, _ = tx.Exec(
+				"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+				uuid.New().String(), *productID, normalized, *storeID, now,
+			)
+		}
+
+		unitStr := "each"
+		if req.Unit != nil && strings.TrimSpace(*req.Unit) != "" {
+			unitStr = *req.Unit
+		}
+		priceQuantity := quantity
+		if priceQuantity.IsZero() {
+			priceQuantity = decimal.NewFromInt(1)
+		}
+		_, _ = tx.Exec(
+			`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, is_sale, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
+			uuid.New().String(), *productID, *storeID, receiptID,
+			receiptDate, quantity.String(), unitStr, totalPrice.Div(priceQuantity).String(), now,
+		)
+		_, _ = tx.Exec(
+			"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
+			receiptDate, now, *productID,
+		)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	lineItem, err := h.lineItemResponse(receiptID, itemID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	return c.JSON(http.StatusCreated, lineItem)
+}
+
+func deriveCountContribution(quantity decimal.Decimal, unit *string) decimal.Decimal {
+	unitStr := ""
+	if unit != nil {
+		unitStr = strings.ToLower(strings.TrimSpace(*unit))
+	}
+	switch unitStr {
+	case "", "each", "ea", "pack", "ct", "count", "gal", "qt", "pt":
+		if quantity.GreaterThan(decimal.Zero) && quantity.Equal(quantity.Round(0)) {
+			return quantity
+		}
+	}
+	return decimal.NewFromInt(1)
+}
+
+func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemResponse, error) {
+	var li lineItemResponse
+	var quantity, totalPrice, countContribution decimal.Decimal
+	var unitPrice *decimal.Decimal
+	err := h.DB.QueryRow(
+		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
+		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
+		        li.regular_price, li.discount_amount, li.count_contribution,
+		        li.matched, li.confidence, li.line_number,
+		        li.suggested_name, li.suggested_category,
+		        li.suggested_product_id, sp.name
+		 FROM line_items li
+		 LEFT JOIN products p ON li.product_id = p.id
+		 LEFT JOIN products sp ON li.suggested_product_id = sp.id
+		 WHERE li.receipt_id = ? AND li.id = ?`,
+		receiptID, itemID,
+	).Scan(
+		&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
+		&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
+		&li.RegularPrice, &li.DiscountAmount, &countContribution,
+		&li.Matched, &li.Confidence, &li.LineNumber,
+		&li.SuggestedName, &li.SuggestedCategory,
+		&li.SuggestedProductID, &li.SuggestedProductName,
+	)
+	if err != nil {
+		return li, err
+	}
+	li.Quantity = quantity.String()
+	li.TotalPrice = totalPrice.String()
+	li.CountContribution = countContribution.String()
+	if unitPrice != nil {
+		s := unitPrice.String()
+		li.UnitPrice = &s
+	}
+	if li.Matched == "unmatched" && li.SuggestedName != nil {
+		if li.SuggestedProductID != nil {
+			st := "existing_match"
+			li.SuggestionType = &st
+		} else {
+			st := "new_product"
+			li.SuggestionType = &st
+		}
+	} else if li.Matched == "cross_store_match" && li.SuggestedProductID != nil {
+		st := "cross_store_match"
+		li.SuggestionType = &st
+	}
+	return li, nil
+}
+
+// RepairPreview asks the LLM for a contextual, non-destructive repair proposal.
+// POST /api/v1/receipts/:id/repair-preview
+func (h *ReceiptHandler) RepairPreview(c echo.Context) error {
+	if h.Guard == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "receipt repair is not available"})
+	}
+
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	var req repairPreviewRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.Note = strings.TrimSpace(req.Note)
+	if req.Note == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "note is required"})
+	}
+
+	var rawJSON sql.NullString
+	err := h.DB.QueryRow(
+		"SELECT raw_llm_json FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&rawJSON)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	images, err := h.receiptImages(receiptID)
+	if err != nil {
+		return c.JSON(http.StatusGone, map[string]string{"error": "receipt images are no longer on disk"})
+	}
+
+	currentJSON := "{}"
+	if rawJSON.Valid && strings.TrimSpace(rawJSON.String) != "" {
+		currentJSON = rawJSON.String
+	}
+
+	extraction, err := h.Guard.RepairForHousehold(householdID, images, currentJSON, req.Note)
+	if err != nil {
+		switch {
+		case errors.Is(err, llm.ErrBudgetExceeded):
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "LLM monthly budget exhausted"})
+		case errors.Is(err, llm.ErrCircuitOpen):
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "receipt extraction is temporarily rate-limited"})
+		case errors.Is(err, llm.ErrUnsupportedRepair):
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "receipt repair is not supported by this LLM provider"})
+		default:
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to repair receipt"})
+		}
+	}
+
+	return c.JSON(http.StatusOK, extraction)
+}
+
+func (h *ReceiptHandler) receiptImages(receiptID string) ([][]byte, error) {
+	imageDir := filepath.Join(h.Cfg.DataDir, "receipts", receiptID)
+	entries, err := os.ReadDir(imageDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var images [][]byte
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "processed_") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(imageDir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, data)
+	}
+	if len(images) == 0 {
+		return nil, fmt.Errorf("no receipt images found")
+	}
+	return images, nil
 }
 
 // UpdateLineItem updates a line item on a receipt.
@@ -748,6 +1116,10 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 	if req.Price != nil {
 		setClauses = append(setClauses, "total_price = ?")
 		args = append(args, *req.Price)
+	}
+	if req.TotalPrice != nil {
+		setClauses = append(setClauses, "total_price = ?")
+		args = append(args, *req.TotalPrice)
 	}
 
 	if len(setClauses) == 0 {
@@ -818,10 +1190,10 @@ type suggestionEditInput struct {
 }
 
 type acceptSuggestionsResponse struct {
-	CreatedCount    int              `json:"created_count"`
-	MatchedCount    int              `json:"matched_count"`
-	ProductsCreated []productBrief   `json:"products_created"`
-	ProductsMatched []productBrief   `json:"products_matched"`
+	CreatedCount    int            `json:"created_count"`
+	MatchedCount    int            `json:"matched_count"`
+	ProductsCreated []productBrief `json:"products_created"`
+	ProductsMatched []productBrief `json:"products_matched"`
 }
 
 type productBrief struct {

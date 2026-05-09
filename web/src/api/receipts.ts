@@ -38,6 +38,27 @@ export async function updateLineItem(
   )
 }
 
+export interface CreateLineItemRequest {
+  raw_name: string
+  product_id?: string
+  quantity?: string
+  unit?: string
+  unit_price?: string
+  total_price: string
+  line_number?: number
+  count_contribution?: string
+}
+
+export async function createLineItem(
+  receiptId: string,
+  data: CreateLineItemRequest,
+): Promise<LineItem> {
+  return post<LineItem>(
+    `/receipts/${encodeURIComponent(receiptId)}/line-items`,
+    data,
+  )
+}
+
 export async function acceptSuggestions(
   receiptId: string,
   data: AcceptSuggestionsRequest,
@@ -70,6 +91,38 @@ export async function reprocessReceipt(
 ): Promise<{ id: string; status: string }> {
   return post<{ id: string; status: string }>(
     `/receipts/${encodeURIComponent(receiptId)}/reprocess`,
+  )
+}
+
+export interface RepairPreviewItem {
+  raw_name: string
+  suggested_name: string
+  quantity: number
+  unit: string | null
+  unit_price: number | null
+  total_price: number
+  regular_price: number | null
+  discount_amount: number | null
+  line_number: number
+}
+
+export interface RepairPreviewResponse {
+  date: string
+  time: string | null
+  items_sold_count: number | null
+  items: RepairPreviewItem[]
+  subtotal: number
+  tax: number
+  total: number
+}
+
+export async function repairReceiptPreview(
+  receiptId: string,
+  note: string,
+): Promise<RepairPreviewResponse> {
+  return post<RepairPreviewResponse>(
+    `/receipts/${encodeURIComponent(receiptId)}/repair-preview`,
+    { note },
   )
 }
 

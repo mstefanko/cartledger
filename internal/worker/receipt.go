@@ -35,6 +35,39 @@ var packPattern = regexp.MustCompile(`(?i)\d+\s*(PK|CT|COUNT|PACK)\b`)
 // suggestion is too weak to write into user-visible data.
 const backfillMinConfidence = 0.5
 
+func extractionErrorMessage(err error, now time.Time) (string, bool) {
+	switch {
+	case errors.Is(err, llm.ErrBudgetExceeded):
+		return "LLM budget exceeded for this month; edit receipt manually or raise LLM_MONTHLY_TOKEN_BUDGET", true
+	case errors.Is(err, llm.ErrCircuitOpen):
+		return "Receipt extraction is paused because the AI service is rate-limiting requests. Wait a few minutes, then retry extraction.", true
+	case llm.IsRateLimit(err):
+		retryAfter := llm.RateLimitRetryAfter(err, now)
+		if retryAfter > 0 {
+			return fmt.Sprintf("Receipt extraction is temporarily rate-limited by the AI service. Wait %s, then retry extraction.", humanRetryAfter(retryAfter)), true
+		}
+		return "Receipt extraction is temporarily rate-limited by the AI service. Wait a minute, then retry extraction.", true
+	default:
+		return "", false
+	}
+}
+
+func humanRetryAfter(d time.Duration) string {
+	seconds := int(d.Round(time.Second).Seconds())
+	if seconds <= 1 {
+		return "1 second"
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%d seconds", seconds)
+	}
+
+	minutes := (seconds + 59) / 60
+	if minutes == 1 {
+		return "about 1 minute"
+	}
+	return fmt.Sprintf("about %d minutes", minutes)
+}
+
 // ReceiptJob represents a receipt processing job submitted to the worker pool.
 type ReceiptJob struct {
 	ReceiptID   string
@@ -426,20 +459,14 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	if err != nil {
 		// Budget + breaker errors are terminal for THIS receipt — mark the
 		// row with a specific error_message so the user understands why
-		// the receipt stalled. Other errors fall through to the generic
+		// the receipt stalled. Provider rate limits get the same treatment
+		// so the UI can distinguish them from unknown processing failures.
+		// Other errors fall through to the generic
 		// "status='error'" path in runJob.
-		if errors.Is(err, llm.ErrBudgetExceeded) {
+		if msg, ok := extractionErrorMessage(err, time.Now()); ok {
 			_, _ = w.db.Exec(
 				"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
-				"LLM budget exceeded for this month; edit receipt manually or raise LLM_MONTHLY_TOKEN_BUDGET",
-				job.ReceiptID,
-			)
-			return fmt.Errorf("llm extraction: %w", err)
-		}
-		if errors.Is(err, llm.ErrCircuitOpen) {
-			_, _ = w.db.Exec(
-				"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
-				"LLM temporarily unavailable (circuit breaker open)",
+				msg,
 				job.ReceiptID,
 			)
 			return fmt.Errorf("llm extraction: %w", err)
@@ -453,6 +480,7 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	if err != nil {
 		return fmt.Errorf("marshal extraction: %w", err)
 	}
+	extraction.Items = normalizeExtractedItems(extraction.Items)
 
 	now := time.Now().UTC()
 
@@ -531,12 +559,12 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	_, err = tx.Exec(
 		`UPDATE receipts SET store_id = ?, receipt_date = ?, receipt_time = ?,
 		 subtotal = ?, tax = ?, total = ?,
-		 card_type = ?, card_last4 = ?,
+		 card_type = ?, card_last4 = ?, items_sold_count = ?,
 		 raw_llm_json = ?, llm_provider = ?, status = 'processing'
 		 WHERE id = ?`,
 		nilIfEmpty(storeID), receiptDate, extraction.Time,
 		subtotal.String(), tax.String(), total.String(),
-		extraction.PaymentCardType, extraction.PaymentCardLast4,
+		extraction.PaymentCardType, extraction.PaymentCardLast4, extraction.ItemsSoldCount,
 		rawJSONStr, provider, job.ReceiptID,
 	)
 	if err != nil {
@@ -603,6 +631,10 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		quantity := decimal.NewFromFloat(item.Quantity)
 		if quantity.IsZero() {
 			quantity = decimal.NewFromInt(1)
+		}
+		countContribution := decimal.NewFromFloat(item.CountContribution)
+		if countContribution.IsZero() {
+			countContribution = decimal.NewFromInt(1)
 		}
 		totalPrice := decimal.NewFromFloat(item.TotalPrice)
 
@@ -671,11 +703,11 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		}
 
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
-			regularPrice, discountAmount,
+			regularPrice, discountAmount, countContribution.String(),
 			suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
 			matched, confidence, lineNum, now,
 		)

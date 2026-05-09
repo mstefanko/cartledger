@@ -55,6 +55,7 @@ var receiptTool = anthropic.ToolParam{
 			"payment_card_type":  map[string]any{"type": []any{"string", "null"}, "enum": []any{"Visa", "Mastercard", "Amex", "Discover", "Debit", "EBT", "Cash", "Check", nil}},
 			"payment_card_last4": map[string]any{"type": []any{"string", "null"}},
 			"time":               map[string]any{"type": []any{"string", "null"}, "description": "HH:MM 24-hour"},
+			"items_sold_count":   map[string]any{"type": []any{"integer", "null"}, "description": "printed count of physical items sold, if present"},
 			"items": map[string]any{
 				"type": "array",
 				"items": map[string]any{
@@ -82,7 +83,7 @@ var receiptTool = anthropic.ToolParam{
 			"total":      map[string]any{"type": "number"},
 			"confidence": map[string]any{"type": "number"},
 		},
-		Required: []string{"store_name", "store_address", "store_city", "store_state", "store_zip", "store_number", "date", "payment_card_type", "payment_card_last4", "time", "items", "subtotal", "tax", "total", "confidence"},
+		Required: []string{"store_name", "store_address", "store_city", "store_state", "store_zip", "store_number", "date", "payment_card_type", "payment_card_last4", "time", "items_sold_count", "items", "subtotal", "tax", "total", "confidence"},
 	},
 }
 
@@ -123,6 +124,14 @@ func (c *ClaudeClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, erro
 // token-usage log line (slog.Info "claude: token usage") is preserved so that
 // operators who already scrape it are unaffected.
 func (c *ClaudeClient) ExtractReceiptWithUsage(images [][]byte) (*ReceiptExtraction, int64, int64, error) {
+	return c.extractReceiptWithPrompt(images, receiptExtractionPrompt, true)
+}
+
+func (c *ClaudeClient) RepairReceiptWithUsage(images [][]byte, currentJSON, note string) (*ReceiptExtraction, int64, int64, error) {
+	return c.extractReceiptWithPrompt(images, receiptRepairPrompt(currentJSON, note), true)
+}
+
+func (c *ClaudeClient) extractReceiptWithPrompt(images [][]byte, prompt string, useTool bool) (*ReceiptExtraction, int64, int64, error) {
 	if len(images) == 0 {
 		return nil, 0, 0, fmt.Errorf("at least one image is required")
 	}
@@ -136,17 +145,21 @@ func (c *ClaudeClient) ExtractReceiptWithUsage(images [][]byte) (*ReceiptExtract
 		contentBlocks = append(contentBlocks, anthropic.NewImageBlockBase64(mediaType, b64))
 	}
 
-	contentBlocks = append(contentBlocks, anthropic.NewTextBlock(receiptExtractionPrompt))
+	contentBlocks = append(contentBlocks, anthropic.NewTextBlock(prompt))
 
-	resp, err := c.client.Messages.New(context.Background(), anthropic.MessageNewParams{
+	params := anthropic.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: 4096,
 		Messages: []anthropic.MessageParam{
 			anthropic.NewUserMessage(contentBlocks...),
 		},
-		Tools:      []anthropic.ToolUnionParam{{OfTool: &receiptTool}},
-		ToolChoice: anthropic.ToolChoiceParamOfTool("extract_receipt"),
-	})
+	}
+	if useTool {
+		params.Tools = []anthropic.ToolUnionParam{{OfTool: &receiptTool}}
+		params.ToolChoice = anthropic.ToolChoiceParamOfTool("extract_receipt")
+	}
+
+	resp, err := c.client.Messages.New(context.Background(), params)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("claude API call failed: %w", err)
 	}
@@ -179,6 +192,21 @@ func (c *ClaudeClient) ExtractReceiptWithUsage(images [][]byte) (*ReceiptExtract
 			}
 			return &extraction, inputTokens, outputTokens, nil
 		}
+	}
+
+	if !useTool {
+		var text strings.Builder
+		for _, block := range resp.Content {
+			if block.Type == "text" {
+				text.WriteString(block.Text)
+			}
+		}
+		jsonStr := extractJSON(text.String())
+		var extraction ReceiptExtraction
+		if err := json.Unmarshal([]byte(jsonStr), &extraction); err != nil {
+			return nil, inputTokens, outputTokens, fmt.Errorf("failed to parse repair JSON: %w", err)
+		}
+		return &extraction, inputTokens, outputTokens, nil
 	}
 
 	return nil, inputTokens, outputTokens, fmt.Errorf("no extract_receipt tool_use block in response")

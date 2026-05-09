@@ -8,6 +8,7 @@ import { Modal } from '@/components/ui/Modal'
 import type { Receipt } from '@/types'
 import type { BadgeVariant } from '@/components/ui/Badge'
 import { ApiClientError } from '@/api/client'
+import { formatDateOnly } from '@/lib/dates'
 
 const statusConfig: Record<Receipt['status'], { label: string; variant: BadgeVariant }> = {
   pending: { label: 'Pending', variant: 'warning' },
@@ -72,8 +73,7 @@ function ReceiptsPage() {
   }, [receipts])
 
   function formatDate(dateStr: string): string {
-    const date = new Date(dateStr)
-    return date.toLocaleDateString(undefined, {
+    return formatDateOnly(dateStr, {
       year: 'numeric',
       month: 'short',
       day: 'numeric',

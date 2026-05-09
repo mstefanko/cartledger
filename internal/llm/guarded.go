@@ -2,10 +2,7 @@ package llm
 
 import (
 	"database/sql"
-	"errors"
 	"log/slog"
-
-	anthropic "github.com/anthropics/anthropic-sdk-go"
 )
 
 // GuardedExtractor wraps an LLM client with two per-instance safeguards:
@@ -97,12 +94,34 @@ func (g *GuardedExtractor) ExtractForHousehold(householdID string, images [][]by
 	return extraction, nil
 }
 
+func (g *GuardedExtractor) RepairForHousehold(householdID string, images [][]byte, currentJSON, note string) (*ReceiptExtraction, error) {
+	if err := CheckBudget(g.db, householdID, g.budget); err != nil {
+		return nil, err
+	}
+
+	allow, isProbe := g.breaker.Allow()
+	if !allow {
+		return nil, ErrCircuitOpen
+	}
+
+	extraction, inputTokens, outputTokens, err := callRepairWithUsage(g.client, images, currentJSON, note)
+	if err != nil {
+		g.classifyAndReport(err, isProbe)
+		return nil, err
+	}
+
+	g.breaker.OnSuccess()
+	if recErr := RecordMonthlyUsage(g.db, householdID, CurrentYearMonth(), inputTokens, outputTokens); recErr != nil {
+		slog.Warn("llm: failed to record monthly usage", "household_id", householdID, "err", recErr)
+	}
+	return extraction, nil
+}
+
 // classifyAndReport inspects err and advances breaker state accordingly.
 // A 429 from Anthropic (anthropic.Error with StatusCode 429) counts toward
 // tripping the breaker; anything else is OnOtherError.
 func (g *GuardedExtractor) classifyAndReport(err error, _ bool) {
-	var apiErr *anthropic.Error
-	if errors.As(err, &apiErr) && apiErr.StatusCode == 429 {
+	if IsRateLimit(err) {
 		g.breaker.OnRateLimit()
 		slog.Warn("llm: Anthropic rate limit (429)", "breaker_state", g.breaker.State())
 		return
@@ -117,6 +136,14 @@ type tokenAwareClient interface {
 	ExtractReceiptWithUsage(images [][]byte) (*ReceiptExtraction, int64, int64, error)
 }
 
+type repairAwareClient interface {
+	RepairReceipt(images [][]byte, currentJSON, note string) (*ReceiptExtraction, error)
+}
+
+type repairTokenAwareClient interface {
+	RepairReceiptWithUsage(images [][]byte, currentJSON, note string) (*ReceiptExtraction, int64, int64, error)
+}
+
 // callWithUsage invokes the client and returns token counts when possible.
 // Falls back to zero counts for non-token-aware clients (e.g. mock).
 func callWithUsage(c Client, images [][]byte) (*ReceiptExtraction, int64, int64, error) {
@@ -125,4 +152,15 @@ func callWithUsage(c Client, images [][]byte) (*ReceiptExtraction, int64, int64,
 	}
 	extraction, err := c.ExtractReceipt(images)
 	return extraction, 0, 0, err
+}
+
+func callRepairWithUsage(c Client, images [][]byte, currentJSON, note string) (*ReceiptExtraction, int64, int64, error) {
+	if ta, ok := c.(repairTokenAwareClient); ok {
+		return ta.RepairReceiptWithUsage(images, currentJSON, note)
+	}
+	if ra, ok := c.(repairAwareClient); ok {
+		extraction, err := ra.RepairReceipt(images, currentJSON, note)
+		return extraction, 0, 0, err
+	}
+	return nil, 0, 0, ErrUnsupportedRepair
 }

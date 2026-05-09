@@ -44,6 +44,7 @@ interface EditableTableProps<TData> {
   onSelectionChange?: (next: Set<string>) => void
   /** Required when `selection` is used — returns the stable row id. */
   getRowId?: (row: TData) => string
+  enableSorting?: boolean
 }
 
 function EditableTable<TData>({
@@ -55,6 +56,7 @@ function EditableTable<TData>({
   selection,
   onSelectionChange,
   getRowId,
+  enableSorting = true,
 }: EditableTableProps<TData>) {
   const selectable = selection !== undefined && onSelectionChange !== undefined && getRowId !== undefined
 
@@ -102,6 +104,7 @@ function EditableTable<TData>({
     columns,
     state: { sorting },
     onSortingChange: setSorting,
+    enableSorting,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
   })
@@ -195,13 +198,14 @@ function EditableTable<TData>({
         const isActive = activeCell !== null && activeCell[0] === rowIndex && activeCell[1] === colIndex
         const cellEditing = isActive && isEditing
         const cellValue = String(cell.getValue() ?? '')
+        const dataRowIndex = row.index
 
         if (meta?.editable && meta.cellType === 'autocomplete') {
           const displayValue = meta.getDisplayValue
             ? meta.getDisplayValue(cell.getValue())
             : cellValue
           const suggestedValue = meta.getSuggestedValue
-            ? meta.getSuggestedValue(rowIndex)
+            ? meta.getSuggestedValue(dataRowIndex)
             : null
           return (
             <td
@@ -213,7 +217,7 @@ function EditableTable<TData>({
                 value={cellValue}
                 displayValue={displayValue}
                 suggestedValue={suggestedValue}
-                rowIndex={rowIndex}
+                rowIndex={dataRowIndex}
                 columnId={cell.column.id}
                 isActive={isActive}
                 isEditing={cellEditing}
@@ -241,7 +245,7 @@ function EditableTable<TData>({
             >
               <EditableCell
                 value={cellValue}
-                rowIndex={rowIndex}
+                rowIndex={dataRowIndex}
                 columnId={cell.column.id}
                 cellType={(meta.cellType === 'number' ? 'number' : 'text')}
                 isActive={isActive}
@@ -318,7 +322,7 @@ function EditableTable<TData>({
               {headerGroup.headers.map((header) => (
                 <th
                   key={header.id}
-                  onClick={header.column.getToggleSortingHandler()}
+                  onClick={header.column.getCanSort() ? header.column.getToggleSortingHandler() : undefined}
                   className={[
                     'h-[36px] px-2 py-1 text-caption font-semibold text-neutral-600 text-left border-b border-neutral-200 bg-neutral-50 select-none',
                     header.column.getCanSort() ? 'cursor-pointer hover:text-neutral-900' : '',

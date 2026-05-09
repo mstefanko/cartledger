@@ -12,9 +12,8 @@ function SetupPage() {
   const navigate = useNavigate()
   const { setAuth } = useAuth()
 
-  // The one-time bootstrap token is printed to the server logs whenever setup
-  // is needed. Without it, POST /setup returns 401 — so we require it to be
-  // present in the query string.
+  // The bootstrap token is optional for current servers, but older setup URLs
+  // may still include it. Forward it when present for compatibility.
   const [searchParams] = useSearchParams()
   const bootstrapToken = searchParams.get('bootstrap') ?? ''
 
@@ -35,11 +34,6 @@ function SetupPage() {
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    if (!bootstrapToken) {
-      // Mutation would fail with 401 anyway; short-circuit with a clearer
-      // message.
-      return
-    }
     mutation.mutate({
       household_name: householdName,
       user_name: userName,
@@ -48,17 +42,12 @@ function SetupPage() {
     })
   }
 
-  const missingTokenMessage = !bootstrapToken
-    ? 'Setup requires the bootstrap URL printed in the server logs. A fresh URL is logged whenever no users exist.'
-    : null
-
   const errorMessage =
-    missingTokenMessage ??
-    (mutation.error instanceof ApiClientError
+    mutation.error instanceof ApiClientError
       ? mutation.error.message
       : mutation.error
         ? 'Something went wrong. Please try again.'
-        : null)
+        : null
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-white px-4">
@@ -115,7 +104,7 @@ function SetupPage() {
           <Button
             type="submit"
             fullWidth
-            disabled={mutation.isPending || !bootstrapToken}
+            disabled={mutation.isPending}
           >
             {mutation.isPending ? 'Setting up...' : 'Create Household'}
           </Button>

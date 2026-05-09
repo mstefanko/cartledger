@@ -39,10 +39,11 @@ server is running, the server prints a one-time URL to stderr:
 
     http://localhost:8079/setup?bootstrap=<random-token>
 
-The `/setup` endpoint now **requires** the `?bootstrap=` token (or the
-`X-Bootstrap-Token` header). The token is reused if the server restarts before
-setup completes, then marked consumed after setup succeeds. If all users are
-later cleared, a fresh token is generated and logged again.
+The `/setup` endpoint accepts the `?bootstrap=` token (or the
+`X-Bootstrap-Token` header) when present, but the browser owner-setup form can
+submit without it while no users exist. The token is reused if the server
+restarts before setup completes, then marked consumed after setup succeeds. If
+all users are later cleared, a fresh token is generated and logged again.
 
 ### Added
 - **Image retention janitor** (`internal/imaging/retention.go`): when

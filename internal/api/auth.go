@@ -130,18 +130,15 @@ func (h *AuthHandler) ensureBootstrapForEmptyUsers() error {
 // Setup handles owner setup: creates household + first user in a single transaction.
 // POST /api/v1/setup
 //
-// A one-time bootstrap token (printed to stderr whenever users is empty) is
-// REQUIRED. The client may pass it as either:
+// A one-time bootstrap token (printed to stderr whenever users is empty) may
+// be passed as either:
 //   - query parameter: ?bootstrap=<token>
 //   - header: X-Bootstrap-Token: <token>
 //
-// Without a matching token the request is rejected with 401, even when the
-// users table is empty — this prevents a race where a public /setup endpoint
-// would otherwise be first-come-first-serve before the operator pastes the
-// URL.
+// The token is optional for the owner setup form itself. Setup is still limited
+// by the transaction's users-count check: once any user exists, this endpoint
+// returns 409 and all future users must join by invite.
 func (h *AuthHandler) Setup(c echo.Context) error {
-	// Validate the bootstrap token FIRST so we don't waste bcrypt CPU on a
-	// rejected request.
 	candidate := c.QueryParam("bootstrap")
 	if candidate == "" {
 		candidate = c.Request().Header.Get("X-Bootstrap-Token")
@@ -150,8 +147,8 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 		slog.Warn("bootstrap token ensure failed", "err", err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	if h.Bootstrap == nil || !h.Bootstrap.Check(candidate) {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or missing bootstrap token"})
+	if candidate != "" && h.Bootstrap != nil && !h.Bootstrap.Check(candidate) {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid bootstrap token"})
 	}
 
 	var req setupRequest
@@ -208,7 +205,7 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 
 	// The Setup path is gated on "users table is empty" — so the user we're
 	// creating here is definitionally the first user and gets is_admin=1.
-	// The /join path does NOT promote; only the bootstrap-gated /setup does.
+	// The /join path does NOT promote.
 	_, err = tx.Exec(
 		"INSERT INTO users (id, household_id, email, name, password_hash, is_admin, created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
 		userID, householdID, req.Email, req.UserName, passwordHash, now, auth.SQLiteDateTime(now),
@@ -225,8 +222,10 @@ func (h *AuthHandler) Setup(c echo.Context) error {
 	// if the DB update fails we still succeed the setup — the in-memory token
 	// is already cleared, and the next /setup call would fail on "users
 	// already exist" anyway.
-	if err := h.Bootstrap.MarkConsumed(h.DB); err != nil {
-		slog.Warn("bootstrap token consume failed (harmless — users row already exists)", "err", err)
+	if h.Bootstrap != nil {
+		if err := h.Bootstrap.MarkConsumed(h.DB); err != nil {
+			slog.Warn("bootstrap token consume failed (harmless — users row already exists)", "err", err)
+		}
 	}
 
 	token, err := auth.CreateAuthToken(h.Cfg.JWTSecret, userID, householdID)

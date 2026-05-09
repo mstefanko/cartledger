@@ -1,5 +1,7 @@
 package llm
 
+import "fmt"
+
 const receiptExtractionPrompt = `Extract all items from this grocery receipt image and call the extract_receipt tool with the results.
 
 Rules:
@@ -25,9 +27,32 @@ Rules:
 - store_number: extract store/location number if printed (often after store name or in header). Return digits only, strip any '#' or 'No.' prefix.
 - payment_card_type and payment_card_last4: extract from payment section at bottom of receipt. For Cash or Check, set card_last4 to null.
 - time: extract transaction time if printed (usually near date)
+- items_sold_count: if the receipt prints "Items Sold", "Total number of items sold", or similar, extract that integer; otherwise null
 - If an item has a discount/savings line immediately following it, combine them:
   - regular_price = the original/higher price
   - discount_amount = the savings amount (positive number)
   - total_price = the final price paid (regular_price - discount_amount)
+- Coupon, savings, discount, member price, or instant savings rows are NOT products. Attach them to the affected item when possible.
+- For Costco-style coupon references like "000343232/1005641 5.00-", the number after "/" points to the item number that received the discount.
 - If no discount applies to an item, set regular_price and discount_amount to null
+- Preserve printed item order for real product items only.
 - total_price MUST always be the actual amount charged for the item`
+
+func receiptRepairPrompt(currentJSON, note string) string {
+	return fmt.Sprintf(`Review this grocery receipt image and repair the existing structured extraction.
+
+Current extraction JSON:
+%s
+
+User repair note:
+%s
+
+Rules:
+- Return a full corrected extraction object using the same schema as extract_receipt.
+- Preserve existing correct items.
+- Fix only issues supported by the image or the user note.
+- Coupon, savings, discount, member price, or instant savings rows are adjustments, not products.
+- If the receipt prints an items sold count, include items_sold_count.
+- Return corrected real product items in printed order.
+- Return ONLY the JSON object, no markdown fences or explanation.`, currentJSON, note)
+}

@@ -100,6 +100,9 @@ export interface Receipt {
   card_type: string | null
   card_last4: string | null
   receipt_time: string | null
+  items_sold_count?: number | null
+  accounted_item_count?: string
+  warnings?: ReceiptWarning[]
   created_at: string
   // Populated when status='error' — the worker's most recent failure reason.
   // Cleared on successful reprocess (see POST /receipts/:id/reprocess).
@@ -121,6 +124,7 @@ export interface LineItem {
   confidence: number | null
   regular_price: string | null
   discount_amount: string | null
+  count_contribution: string
   line_number: number | null
   suggested_name: string | null
   suggested_category: string | null
@@ -128,6 +132,14 @@ export interface LineItem {
   suggested_product_name: string | null
   suggestion_type: 'existing_match' | 'new_product' | 'cross_store_match' | null
   created_at: string
+}
+
+export interface ReceiptWarning {
+  code: string
+  severity: 'warning' | 'error' | 'info'
+  message: string
+  expected?: string
+  actual?: string
 }
 
 export interface AcceptSuggestionsRequest {

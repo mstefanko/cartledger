@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect, type FormEvent } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
@@ -7,7 +7,7 @@ import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 // CreateRuleModal replaced by inline batch rule modal
-import { getReceipt, updateLineItem, acceptSuggestions, confirmReceipt, type ReceiptDetail } from '@/api/receipts'
+import { getReceipt, updateLineItem, createLineItem, repairReceiptPreview, acceptSuggestions, confirmReceipt, type CreateLineItemRequest, type ReceiptDetail, type RepairPreviewResponse } from '@/api/receipts'
 import { listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { LineItem, Product } from '@/types'
@@ -16,9 +16,78 @@ interface ReceiptReviewProps {
   receiptId: string
 }
 
+const SCAN_PROGRESS_STAGES = [
+  { label: 'Reading receipt image...', duration: 12_000 },
+  { label: 'Extracting line items and prices...', duration: 30_000 },
+  { label: 'Identifying store and date...', duration: 15_000 },
+  { label: 'Matching products...', duration: 20_000 },
+  { label: 'Almost done...', duration: 120_000 },
+]
+
+function ScanProgress() {
+  const [stageIndex, setStageIndex] = useState(0)
+  const [barWidth, setBarWidth] = useState(0)
+
+  useEffect(() => {
+    let elapsed = 0
+    let currentStage = 0
+    const interval = window.setInterval(() => {
+      elapsed += 500
+
+      let cumulativeDuration = 0
+      for (let i = 0; i < SCAN_PROGRESS_STAGES.length; i++) {
+        cumulativeDuration += SCAN_PROGRESS_STAGES[i]!.duration
+        if (elapsed < cumulativeDuration) {
+          currentStage = i
+          break
+        }
+        if (i === SCAN_PROGRESS_STAGES.length - 1) currentStage = i
+      }
+      setStageIndex(currentStage)
+
+      const totalDuration = SCAN_PROGRESS_STAGES.reduce((sum, stage) => sum + stage.duration, 0)
+      const linear = Math.min(elapsed / totalDuration, 0.95)
+      const eased = 1 - Math.pow(1 - linear, 2)
+      setBarWidth(Math.round(eased * 100))
+    }, 500)
+    return () => window.clearInterval(interval)
+  }, [])
+
+  return (
+    <div
+      role="status"
+      className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-neutral-200 bg-neutral-50 px-6 py-12 text-center"
+    >
+      <div className="h-12 w-12 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
+      <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
+        Scanning receipt
+      </p>
+      <div className="mt-6 w-full max-w-sm">
+        <div className="h-2 overflow-hidden rounded-full bg-neutral-200">
+          <div
+            className="h-full rounded-full bg-brand transition-all duration-500 ease-out"
+            style={{ width: `${barWidth}%` }}
+          />
+        </div>
+        <p className="mt-3 text-small text-neutral-400 animate-pulse">
+          {SCAN_PROGRESS_STAGES[stageIndex]?.label ?? 'Processing...'}
+        </p>
+      </div>
+    </div>
+  )
+}
+
 /** Row data for the editable table — extends LineItem with resolved product name */
 interface LineItemRow extends LineItem {
   product_name: string
+}
+
+const emptyNewRow: CreateLineItemRequest = {
+  raw_name: '',
+  quantity: '1',
+  unit: 'each',
+  total_price: '',
+  count_contribution: '1',
 }
 
 function ReceiptReview({ receiptId }: ReceiptReviewProps) {
@@ -41,6 +110,15 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     queryFn: () => listProducts({ search: productSearch }),
     enabled: productSearch.length > 0,
   })
+
+  // --- Manual add row modal ---
+  const [addRowOpen, setAddRowOpen] = useState(false)
+  const [newRow, setNewRow] = useState<CreateLineItemRequest>(emptyNewRow)
+
+  // --- Contextual repair note modal ---
+  const [repairOpen, setRepairOpen] = useState(false)
+  const [repairNote, setRepairNote] = useState('')
+  const [repairPreview, setRepairPreview] = useState<RepairPreviewResponse | null>(null)
 
   // --- Mutations ---
   const matchMutation = useMutation({
@@ -71,6 +149,22 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+    },
+  })
+
+  const createLineItemMutation = useMutation({
+    mutationFn: (data: CreateLineItemRequest) => createLineItem(receiptId, data),
+    onSuccess: () => {
+      setNewRow(emptyNewRow)
+      setAddRowOpen(false)
+      queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+    },
+  })
+
+  const repairPreviewMutation = useMutation({
+    mutationFn: (note: string) => repairReceiptPreview(receiptId, note),
+    onSuccess: (preview) => {
+      setRepairPreview(preview)
     },
   })
 
@@ -229,6 +323,32 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       })
     },
     [rows, matchMutation, queryClient],
+  )
+
+  const updateNewRow = useCallback(
+    (field: keyof CreateLineItemRequest, value: string) => {
+      setNewRow((prev) => ({
+        ...prev,
+        [field]: field === 'line_number' ? (value ? Number(value) : undefined) : value,
+      }))
+    },
+    [],
+  )
+
+  const handleAddRowSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      createLineItemMutation.mutate({
+        ...newRow,
+        raw_name: newRow.raw_name.trim(),
+        total_price: newRow.total_price.trim(),
+        quantity: newRow.quantity?.trim() || undefined,
+        unit: newRow.unit?.trim() || undefined,
+        unit_price: newRow.unit_price?.trim() || undefined,
+        count_contribution: newRow.count_contribution?.trim() || undefined,
+      })
+    },
+    [createLineItemMutation, newRow],
   )
 
   // --- Table columns ---
@@ -435,6 +555,10 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     )
   }
 
+  if ((receipt.status === 'pending' || receipt.status === 'processing') && receipt.line_items.length === 0) {
+    return <ScanProgress />
+  }
+
   return (
     <div className="flex flex-col gap-4">
       {/* Status bar */}
@@ -514,6 +638,41 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         </div>
       </div>
 
+      {receipt.warnings && receipt.warnings.length > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex flex-col gap-1">
+              {receipt.warnings.map((warning) => (
+                <p key={warning.code} className="text-body text-amber-900">
+                  {warning.message}
+                </p>
+              ))}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => setAddRowOpen(true)}
+              >
+                Add Row
+              </Button>
+              <Button
+                type="button"
+                variant="outlined"
+                size="sm"
+                onClick={() => {
+                  setRepairPreview(null)
+                  setRepairOpen(true)
+                }}
+              >
+                Repair Scan
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Editable line items table */}
       <EditableTable<LineItemRow>
         columns={columns}
@@ -521,6 +680,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         onCellUpdate={handleCellUpdate}
         getRowClassName={getRowClassName}
         virtualizeRows={rows.length > 50}
+        enableSorting={false}
       />
 
       {/* Raw JSON modal */}
@@ -534,6 +694,172 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             ? JSON.stringify(JSON.parse(receipt.raw_llm_json), null, 2)
             : 'No raw JSON available'}
         </pre>
+      </Modal>
+
+      <Modal
+        open={addRowOpen}
+        onClose={() => {
+          setAddRowOpen(false)
+          setNewRow(emptyNewRow)
+        }}
+        title="Add Line Item"
+        footer={
+          <>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                setAddRowOpen(false)
+                setNewRow(emptyNewRow)
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              form="add-line-item-form"
+              size="sm"
+              disabled={
+                createLineItemMutation.isPending ||
+                newRow.raw_name.trim() === '' ||
+                newRow.total_price.trim() === ''
+              }
+            >
+              {createLineItemMutation.isPending ? 'Adding...' : 'Add Row'}
+            </Button>
+          </>
+        }
+      >
+        <form id="add-line-item-form" onSubmit={handleAddRowSubmit} className="grid grid-cols-2 gap-3">
+          <label className="col-span-2 flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Receipt Text
+            <input
+              value={newRow.raw_name}
+              onChange={(e) => updateNewRow('raw_name', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+              autoFocus
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Qty
+            <input
+              value={newRow.quantity ?? ''}
+              onChange={(e) => updateNewRow('quantity', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Unit
+            <input
+              value={newRow.unit ?? ''}
+              onChange={(e) => updateNewRow('unit', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Price
+            <input
+              value={newRow.total_price}
+              onChange={(e) => updateNewRow('total_price', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Count
+            <input
+              value={newRow.count_contribution ?? ''}
+              onChange={(e) => updateNewRow('count_contribution', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          <label className="col-span-2 flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Line
+            <input
+              type="number"
+              value={newRow.line_number ?? ''}
+              onChange={(e) => updateNewRow('line_number', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          {createLineItemMutation.isError && (
+            <p className="col-span-2 text-small text-expensive">
+              Failed to add row.
+            </p>
+          )}
+        </form>
+      </Modal>
+
+      <Modal
+        open={repairOpen}
+        onClose={() => setRepairOpen(false)}
+        title="Repair Scan"
+        footer={
+          <>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                setRepairOpen(false)
+                setRepairPreview(null)
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={repairPreviewMutation.isPending || repairNote.trim() === ''}
+              onClick={() => repairPreviewMutation.mutate(repairNote.trim())}
+            >
+              {repairPreviewMutation.isPending ? 'Repairing...' : 'Preview Repair'}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Repair Note
+            <textarea
+              value={repairNote}
+              onChange={(e) => setRepairNote(e.target.value)}
+              rows={4}
+              className="resize-none rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          {repairPreviewMutation.isError && (
+            <p className="text-small text-expensive">
+              Repair preview failed.
+            </p>
+          )}
+          {repairPreview && (
+            <div className="max-h-72 overflow-auto rounded-lg border border-neutral-200">
+              <table className="w-full table-fixed border-collapse">
+                <thead className="bg-neutral-50">
+                  <tr>
+                    <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Line</th>
+                    <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Item</th>
+                    <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Qty</th>
+                    <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Price</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {repairPreview.items.map((item, index) => (
+                    <tr key={`${item.line_number}-${item.raw_name}-${index}`} className="border-t border-neutral-200">
+                      <td className="px-2 py-1 text-caption text-neutral-600">{item.line_number}</td>
+                      <td className="px-2 py-1 text-caption text-neutral-900 truncate">{item.raw_name}</td>
+                      <td className="px-2 py-1 text-caption text-neutral-600">{item.quantity}</td>
+                      <td className="px-2 py-1 text-caption tabular-nums text-neutral-900">
+                        ${Number(item.total_price).toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </Modal>
 
       {/* Cross-store match confirmation modal */}

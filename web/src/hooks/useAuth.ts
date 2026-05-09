@@ -20,6 +20,7 @@ interface AuthContextValue {
   // Retained for call-site back-compat; always null in cookie mode.
   token: string | null
   needsSetup: boolean
+  authError: string | null
   isAuthenticated: boolean
   isLoading: boolean
   login: (data: LoginRequest) => Promise<void>
@@ -40,6 +41,7 @@ interface AuthProviderProps {
 function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null)
   const [needsSetup, setNeedsSetup] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
@@ -50,9 +52,14 @@ function AuthProvider({ children }: AuthProviderProps) {
         // /status is public (no auth); tells us whether to route to /setup.
         const status = await getStatus()
         if (cancelled) return
+        setAuthError(null)
         setNeedsSetup(status.needs_setup)
       } catch {
-        // Status endpoint unavailable — assume no setup needed
+        if (!cancelled) {
+          setAuthError('Unable to reach CartLedger. Check that the server is running, then reload.')
+          setIsLoading(false)
+        }
+        return
       }
 
       // Probe /profile with the cookie (if any). 200 => authenticated;
@@ -83,6 +90,7 @@ function AuthProvider({ children }: AuthProviderProps) {
 
   const setAuth = useCallback((newUser: User) => {
     setUser(newUser)
+    setAuthError(null)
     setNeedsSetup(false)
   }, [])
 
@@ -107,6 +115,7 @@ function AuthProvider({ children }: AuthProviderProps) {
     user,
     token: null,
     needsSetup,
+    authError,
     isAuthenticated: user !== null,
     isLoading,
     login,

@@ -120,8 +120,9 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	//                                            retry-click storm from blowing
 	//                                            the per-household budget)
 	protected.Use(rateLimiter.ProtectedMethodMiddleware(map[string]string{
-		"/api/v1/receipts/scan":          TierWorkerSubmit,
-		"/api/v1/receipts/:id/reprocess": TierWorkerSubmit,
+		"/api/v1/receipts/scan":               TierWorkerSubmit,
+		"/api/v1/receipts/:id/reprocess":      TierWorkerSubmit,
+		"/api/v1/receipts/:id/repair-preview": TierWorkerSubmit,
 	}))
 
 	// --- Health / readiness / liveness probes (all public, no auth) ---
@@ -368,11 +369,30 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 			fsHandler.ServeHTTP(c.Response(), c.Request())
 			return nil
 		}
+		if redirect, err := shouldRedirectSPAToSetup(database, path); err != nil {
+			slog.Warn("setup redirect check failed", "err", err)
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		} else if redirect {
+			return c.Redirect(http.StatusFound, "/setup")
+		}
 		// SPA fallback: serve index.html for client-side routing
 		return c.HTMLBlob(http.StatusOK, indexHTML)
 	})
 
 	return e, rateLimiter
+}
+
+func shouldRedirectSPAToSetup(db *sql.DB, path string) (bool, error) {
+	path = strings.Trim(path, "/")
+	if path == "setup" || strings.HasPrefix(path, "setup/") {
+		return false, nil
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+		return false, err
+	}
+	return count == 0, nil
 }
 
 // containsDotDot checks for path traversal attempts.

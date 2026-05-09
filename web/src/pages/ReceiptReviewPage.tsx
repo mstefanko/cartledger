@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
@@ -6,9 +6,22 @@ import { getReceipt, deleteReceipt, reprocessReceipt, type ReceiptDetail } from 
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 import { ApiClientError } from '@/api/client'
+import { formatDateOnly } from '@/lib/dates'
 
 const LENS_SIZE = 280
 const ZOOM = 0.75
+
+function ReceiptImagePending({ message }: { message: string }) {
+  return (
+    <div
+      role="status"
+      className="flex h-64 flex-col items-center justify-center rounded-lg border border-neutral-200 bg-neutral-50 px-4 text-center"
+    >
+      <div className="h-10 w-10 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
+      <p className="mt-4 text-body text-neutral-500">{message}</p>
+    </div>
+  )
+}
 
 function ReceiptMagnifier({ src, alt }: { src: string; alt: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -76,11 +89,22 @@ function ReceiptReviewPage() {
   const [showDelete, setShowDelete] = useState(false)
   const [showImage, setShowImage] = useState(false)
 
-  const { data: receipt } = useQuery<ReceiptDetail>({
+  const { data: receipt, isLoading: isReceiptLoading } = useQuery<ReceiptDetail>({
     queryKey: ['receipt', id],
     queryFn: () => getReceipt(id!),
     enabled: !!id,
   })
+
+  const isExtracting = receipt?.status === 'pending' || receipt?.status === 'processing'
+
+  useEffect(() => {
+    if (!id || !isExtracting) return
+    const interval = window.setInterval(() => {
+      void queryClient.invalidateQueries({ queryKey: ['receipt', id] })
+      void queryClient.invalidateQueries({ queryKey: ['receipts'] })
+    }, 3_000)
+    return () => window.clearInterval(interval)
+  }, [id, isExtracting, queryClient])
 
   const deleteMutation = useMutation({
     mutationFn: () => deleteReceipt(id!),
@@ -161,7 +185,7 @@ function ReceiptReviewPage() {
         <div className="flex items-center gap-3 text-sm text-neutral-500 mb-4">
           {receipt.receipt_date && (
             <span>
-              {new Date(receipt.receipt_date).toLocaleDateString(undefined, {
+              {formatDateOnly(receipt.receipt_date, {
                 year: 'numeric',
                 month: 'short',
                 day: 'numeric',
@@ -216,15 +240,6 @@ function ReceiptReviewPage() {
         </div>
       )}
 
-      {receipt?.status === 'processing' && (
-        <div
-          role="status"
-          className="mb-4 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700"
-        >
-          Processing... this usually takes a few seconds.
-        </div>
-      )}
-
       {/* Mobile: toggle to show/hide receipt image */}
       <div className="lg:hidden mb-3">
         <button
@@ -245,7 +260,9 @@ function ReceiptReviewPage() {
           <h2 className="font-display text-feature font-semibold text-neutral-900">
             Receipt Image
           </h2>
-          {imagePaths.length > 0 ? (
+          {isReceiptLoading ? (
+            <ReceiptImagePending message="Loading receipt image..." />
+          ) : imagePaths.length > 0 ? (
             <div className="flex flex-col gap-4 overflow-y-auto max-h-[80vh] rounded-lg border border-neutral-200 p-2 bg-neutral-50">
               {imagePaths.map((path, idx) => (
                 <ReceiptMagnifier
@@ -256,6 +273,8 @@ function ReceiptReviewPage() {
               ))}
               <p className="text-xs text-neutral-400 text-center pb-1">Hover to magnify</p>
             </div>
+          ) : isExtracting ? (
+            <ReceiptImagePending message="Preparing receipt image..." />
           ) : (
             <div className="flex items-center justify-center h-64 rounded-lg border border-neutral-200 bg-neutral-50">
               <p className="text-body text-neutral-400">

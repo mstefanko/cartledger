@@ -25,9 +25,8 @@ import (
 //     may have already copied the URL) or generates a fresh one and inserts.
 //     If a previous token was consumed but the users table is empty again
 //     (for example after auth data was cleared), a new token replaces it.
-//  2. Validate: the Setup handler calls Check(token) before doing anything
-//     else. Returns false if users already exist, token is missing, or the
-//     token doesn't match.
+//  2. Validate: the Setup handler accepts the browser setup form without a
+//     token while users is empty. If a token is supplied, it must match.
 //  3. Consume: on successful setup, MarkConsumed() clears the in-memory
 //     token and marks the DB row consumed. Any further /setup request is
 //     rejected because users > 0 (and the in-memory token is gone).

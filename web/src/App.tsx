@@ -27,7 +27,7 @@ import ReviewPage from '@/pages/ReviewPage'
 import type { ReactNode } from 'react'
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
-  const { isAuthenticated, needsSetup, isLoading } = useAuth()
+  const { isAuthenticated, needsSetup, authError, isLoading } = useAuth()
 
   if (isLoading) {
     return (
@@ -35,6 +35,10 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
         <p className="text-body text-neutral-400">Loading...</p>
       </div>
     )
+  }
+
+  if (authError) {
+    return <AuthErrorScreen message={authError} />
   }
 
   if (needsSetup) {
@@ -49,7 +53,7 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
 }
 
 function PublicRoute({ children }: { children: ReactNode }) {
-  const { isAuthenticated, needsSetup, isLoading } = useAuth()
+  const { isAuthenticated, needsSetup, authError, isLoading } = useAuth()
   const location = useLocation()
 
   if (isLoading) {
@@ -58,6 +62,10 @@ function PublicRoute({ children }: { children: ReactNode }) {
         <p className="text-body text-neutral-400">Loading...</p>
       </div>
     )
+  }
+
+  if (authError) {
+    return <AuthErrorScreen message={authError} />
   }
 
   // If setup is needed, only allow the setup page.
@@ -74,6 +82,26 @@ function PublicRoute({ children }: { children: ReactNode }) {
   }
 
   return <>{children}</>
+}
+
+function AuthErrorScreen({ message }: { message: string }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-white px-4">
+      <div className="w-full max-w-md text-center">
+        <h1 className="font-display text-section font-bold text-neutral-900 tracking-tight">
+          CartLedger is offline
+        </h1>
+        <p className="mt-2 text-body text-neutral-400">{message}</p>
+        <button
+          type="button"
+          className="mt-6 inline-flex h-10 items-center justify-center rounded-md bg-primary-600 px-4 text-body font-semibold text-white hover:bg-primary-700"
+          onClick={() => window.location.reload()}
+        >
+          Reload
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function AdminRoute({ children }: { children: ReactNode }) {

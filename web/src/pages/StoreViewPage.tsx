@@ -1,6 +1,7 @@
 import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { getStoreSummary } from '@/api/analytics'
+import { formatDateOnly } from '@/lib/dates'
 
 function formatAddress(store: { address: string | null; city: string | null; state: string | null; zip: string | null }) {
   const parts = [store.address, store.city, store.state].filter(Boolean)
@@ -140,11 +141,11 @@ function StoreViewPage() {
               >
                 <div>
                   <p className="text-body text-neutral-900">
-                    {new Date(trip.date).toLocaleDateString('en-US', {
+                    {formatDateOnly(trip.date, {
                       weekday: 'short',
                       month: 'short',
                       day: 'numeric',
-                    })}
+                    }, 'en-US')}
                   </p>
                   <p className="text-small text-neutral-400">{trip.item_count} items</p>
                 </div>

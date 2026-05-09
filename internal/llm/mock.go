@@ -35,3 +35,7 @@ func (m *MockClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error)
 
 	return &extraction, nil
 }
+
+func (m *MockClient) RepairReceipt(images [][]byte, _, _ string) (*ReceiptExtraction, error) {
+	return m.ExtractReceipt(images)
+}

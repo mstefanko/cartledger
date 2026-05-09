@@ -109,3 +109,52 @@ func TestSetupPromotesFirstUserToAdmin(t *testing.T) {
 		t.Errorf("setup response should not report is_admin=false for first user")
 	}
 }
+
+func TestSetupAllowsFirstUserWithoutBootstrapToken(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer database.Close()
+	if err := db.RunMigrations(database); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	cfg := &config.Config{DataDir: dir, JWTSecret: "test-secret"}
+	bootstrap, err := LoadOrGenerateBootstrapToken(database)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateBootstrapToken: %v", err)
+	}
+	h := &AuthHandler{DB: database, Cfg: cfg, Bootstrap: bootstrap}
+
+	body, _ := json.Marshal(setupRequest{
+		HouseholdName: "HH",
+		UserName:      "First",
+		Email:         "first@example.com",
+		Password:      "password123",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/setup", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e := echo.New()
+	c := e.NewContext(req, rec)
+
+	if err := h.Setup(c); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	var isAdmin bool
+	if err := database.QueryRow(
+		"SELECT is_admin FROM users WHERE email = ?", "first@example.com",
+	).Scan(&isAdmin); err != nil {
+		t.Fatalf("scan first user: %v", err)
+	}
+	if !isAdmin {
+		t.Fatalf("first user is_admin = false, want true")
+	}
+}

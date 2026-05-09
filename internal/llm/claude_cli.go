@@ -42,6 +42,14 @@ func (c *CLIClient) Provider() string {
 // API call through the Claude CLI. No tools needed — eliminates the Read
 // tool round-trip that was causing 3-minute processing times.
 func (c *CLIClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error) {
+	return c.extractReceiptWithPrompt(images, receiptExtractionPrompt)
+}
+
+func (c *CLIClient) RepairReceipt(images [][]byte, currentJSON, note string) (*ReceiptExtraction, error) {
+	return c.extractReceiptWithPrompt(images, receiptRepairPrompt(currentJSON, note))
+}
+
+func (c *CLIClient) extractReceiptWithPrompt(images [][]byte, instruction string) (*ReceiptExtraction, error) {
 	if len(images) == 0 {
 		return nil, fmt.Errorf("at least one image is required")
 	}
@@ -54,7 +62,7 @@ func (c *CLIClient) ExtractReceipt(images [][]byte) (*ReceiptExtraction, error) 
 		fmt.Fprintf(&prompt, "[Receipt image %d (%s, %d bytes original)]\ndata:%s;base64,%s\n\n",
 			i+1, mediaType, len(img), mediaType, b64)
 	}
-	fmt.Fprintf(&prompt, "%s\n\nReturn ONLY the JSON object, no markdown fences or explanation.", receiptExtractionPrompt)
+	fmt.Fprintf(&prompt, "%s\n\nReturn ONLY the JSON object, no markdown fences or explanation.", instruction)
 
 	// Spawn claude CLI: no tools needed (base64 image is in the prompt),
 	// low effort for structured extraction, stdin for large prompts.

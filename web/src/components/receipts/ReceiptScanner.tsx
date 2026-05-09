@@ -1,10 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { scanReceipt } from '@/api/receipts'
-import { getWebSocket } from '@/api/ws'
 import { Button } from '@/components/ui/Button'
-import type { Receipt, WSMessage } from '@/types'
+import type { Receipt } from '@/types'
 
 const MAX_IMAGES = 5
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
@@ -17,17 +16,7 @@ interface ImageEntry {
   previewUrl: string
 }
 
-type ScannerPhase = 'capture' | 'preparing' | 'uploading' | 'processing' | 'timeout' | 'error'
-
-// Processing stage labels shown during the "processing" phase
-const PROCESSING_STAGES = [
-  { label: 'Starting AI engine...', duration: 8_000 },
-  { label: 'Reading receipt image...', duration: 12_000 },
-  { label: 'Extracting line items and prices...', duration: 30_000 },
-  { label: 'Identifying store and date...', duration: 15_000 },
-  { label: 'Matching products...', duration: 20_000 },
-  { label: 'Almost done...', duration: 120_000 },
-]
+type ScannerPhase = 'capture' | 'preparing' | 'uploading' | 'error'
 
 /**
  * Resize an image to fit within maxDim x maxDim while preserving aspect ratio.
@@ -109,59 +98,12 @@ function validateFile(file: File): string | null {
   return null
 }
 
-/** Indeterminate progress bar that fills over time. */
-function ProgressBar({ stages }: { stages: typeof PROCESSING_STAGES }) {
-  const [stageIndex, setStageIndex] = useState(0)
-  const [barWidth, setBarWidth] = useState(0)
-
-  useEffect(() => {
-    let elapsed = 0
-    let currentStage = 0
-    const interval = setInterval(() => {
-      elapsed += 500
-      // Advance stage based on cumulative duration
-      let cumulativeDuration = 0
-      for (let i = 0; i < stages.length; i++) {
-        cumulativeDuration += stages[i]!.duration
-        if (elapsed < cumulativeDuration) {
-          currentStage = i
-          break
-        }
-        if (i === stages.length - 1) currentStage = i
-      }
-      setStageIndex(currentStage)
-
-      // Calculate total progress (eased — slows down toward the end)
-      const totalDuration = stages.reduce((sum, s) => sum + s.duration, 0)
-      const linear = Math.min(elapsed / totalDuration, 0.95) // never hit 100% until real completion
-      const eased = 1 - Math.pow(1 - linear, 2) // ease-out
-      setBarWidth(Math.round(eased * 100))
-    }, 500)
-    return () => clearInterval(interval)
-  }, [stages])
-
-  return (
-    <div className="w-full max-w-xs mx-auto mt-6">
-      <div className="h-2 rounded-full bg-neutral-200 overflow-hidden">
-        <div
-          className="h-full rounded-full bg-brand transition-all duration-500 ease-out"
-          style={{ width: `${barWidth}%` }}
-        />
-      </div>
-      <p className="mt-3 text-small text-neutral-400 animate-pulse">
-        {stages[stageIndex]?.label ?? 'Processing...'}
-      </p>
-    </div>
-  )
-}
-
 function ReceiptScanner() {
   const navigate = useNavigate()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [images, setImages] = useState<ImageEntry[]>([])
   const [phase, setPhase] = useState<ScannerPhase>('capture')
   const [error, setError] = useState<string | null>(null)
-  const pendingReceiptId = useRef<string | null>(null)
 
   // Clean up object URLs on unmount
   useEffect(() => {
@@ -171,68 +113,10 @@ function ReceiptScanner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Listen for WebSocket receipt.processed event
-  useEffect(() => {
-    const ws = getWebSocket()
-    if (!ws || phase !== 'processing') return
-
-    function handleMessage(event: MessageEvent) {
-      let message: WSMessage
-      try {
-        message = JSON.parse(event.data as string) as WSMessage
-      } catch {
-        return
-      }
-
-      if (message.type === 'receipt.complete' && pendingReceiptId.current) {
-        const payload = message.payload as { receipt_id?: string }
-        if (payload.receipt_id === pendingReceiptId.current) {
-          navigate(`/receipts/${pendingReceiptId.current}`)
-        }
-      }
-    }
-
-    ws.addEventListener('message', handleMessage)
-    return () => {
-      ws.removeEventListener('message', handleMessage)
-    }
-  }, [phase, navigate])
-
-  // Poll receipt status as fallback (WS may not deliver)
-  useEffect(() => {
-    if (phase !== 'processing' || !pendingReceiptId.current) return
-    const receiptId = pendingReceiptId.current
-    const interval = setInterval(async () => {
-      try {
-        const resp = await import('@/api/receipts').then((mod) => mod.getReceipt(receiptId))
-        if (resp.status !== 'pending' && resp.status !== 'processing') {
-          navigate(`/receipts/${receiptId}`)
-        }
-      } catch {
-        // Ignore fetch errors, keep polling
-      }
-    }, 3_000)
-    return () => clearInterval(interval)
-  }, [phase, navigate])
-
-  // 3-minute timeout for processing phase
-  useEffect(() => {
-    if (phase !== 'processing') return
-    const timer = setTimeout(() => {
-      setPhase('timeout')
-    }, 180_000)
-    return () => clearTimeout(timer)
-  }, [phase])
-
   const uploadMutation = useMutation<Receipt, Error, File[]>({
     mutationFn: scanReceipt,
     onSuccess: (receipt) => {
-      pendingReceiptId.current = receipt.id
-      if (receipt.status !== 'pending') {
-        navigate(`/receipts/${receipt.id}`)
-      } else {
-        setPhase('processing')
-      }
+      navigate(`/receipts/${receipt.id}`)
     },
     onError: (err) => {
       setError(err.message || 'Upload failed. Please try again.')
@@ -311,44 +195,6 @@ function ReceiptScanner() {
     setError(null)
     setPhase('capture')
   }, [])
-
-  // --- Timeout state ---
-  if (phase === 'timeout') {
-    return (
-      <div className="flex flex-col items-center justify-center py-16 text-center">
-        <div className="flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
-          <svg className="h-8 w-8 text-amber-800" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        </div>
-        <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
-          Processing is taking longer than expected
-        </p>
-        <p className="mt-2 text-body text-neutral-400">
-          The receipt may still be processing in the background. You can check back on the Receipts page.
-        </p>
-        <Link
-          to="/receipts"
-          className="mt-6 inline-flex items-center gap-2 text-body font-medium text-brand hover:underline"
-        >
-          Go to Receipts
-        </Link>
-      </div>
-    )
-  }
-
-  // --- Processing state (with progress bar) ---
-  if (phase === 'processing') {
-    return (
-      <div className="flex flex-col items-center justify-center py-16 text-center">
-        <div className="h-12 w-12 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
-        <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
-          Scanning receipt
-        </p>
-        <ProgressBar stages={PROCESSING_STAGES} />
-      </div>
-    )
-  }
 
   // --- Preparing state (resizing images) ---
   if (phase === 'preparing') {
