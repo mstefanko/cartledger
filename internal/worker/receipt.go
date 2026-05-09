@@ -88,6 +88,7 @@ type ReceiptWorker struct {
 	// Shutdown coordination.
 	wg          sync.WaitGroup // tracks in-flight processJob calls
 	mu          sync.Mutex     // guards accepting flag
+	queued      sync.Map       // receipt_id -> struct{} for buffered/in-flight dedupe
 	accepting   bool           // true when Submit is allowed
 	shutdown    atomic.Bool    // true once Shutdown was called (idempotent guard)
 	shutdownRes chan struct{}  // closed once Shutdown has fully completed
@@ -136,6 +137,11 @@ var ErrWorkerShuttingDown = fmt.Errorf("receipt worker is shutting down")
 // deterministic and user-actionable (re-upload the receipt).
 var ErrImagesGone = fmt.Errorf("receipt images no longer on disk")
 
+// ErrReceiptAlreadyQueued is returned when a receipt is already buffered or
+// in-flight. Treating duplicate submits as an idempotent success at the API
+// edge prevents double LLM spend from concurrent retry clicks.
+var ErrReceiptAlreadyQueued = fmt.Errorf("receipt already queued")
+
 // Resubmit re-enqueues an existing receipt for background processing. Unlike
 // Submit, this is for user-initiated retries: it reconstructs the ReceiptJob
 // by locating the receipt's image directory under <DataDir>/receipts/<id>
@@ -143,7 +149,7 @@ var ErrImagesGone = fmt.Errorf("receipt images no longer on disk")
 //
 // Returns:
 //   - ErrImagesGone if the image directory is missing.
-//   - ErrQueueFull / ErrWorkerShuttingDown propagated from Submit.
+//   - ErrReceiptAlreadyQueued / ErrQueueFull / ErrWorkerShuttingDown propagated from Submit.
 //
 // The caller (API handler) is responsible for flipping status='pending' and
 // clearing error_message before calling Resubmit; that ordering lets us fail
@@ -184,11 +190,15 @@ func (w *ReceiptWorker) Submit(job ReceiptJob) error {
 	if !w.accepting {
 		return ErrWorkerShuttingDown
 	}
+	if _, loaded := w.queued.LoadOrStore(job.ReceiptID, struct{}{}); loaded {
+		return ErrReceiptAlreadyQueued
+	}
 	select {
 	case w.jobs <- job:
 		w.wg.Add(1)
 		return nil
 	default:
+		w.queued.Delete(job.ReceiptID)
 		return ErrQueueFull
 	}
 }
@@ -199,6 +209,7 @@ func (w *ReceiptWorker) Submit(job ReceiptJob) error {
 func (w *ReceiptWorker) process() {
 	for job := range w.jobs {
 		w.runJob(job)
+		w.queued.Delete(job.ReceiptID)
 		w.wg.Done()
 	}
 }
@@ -267,6 +278,7 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 		// via this drain, we must Done it ourselves.
 		for job := range w.jobs {
 			requeued++
+			w.queued.Delete(job.ReceiptID)
 			w.markPending(job.ReceiptID)
 			w.wg.Done()
 		}
@@ -290,6 +302,7 @@ func (w *ReceiptWorker) Shutdown(ctx context.Context) error {
 					return ctx.Err()
 				}
 				requeued++
+				w.queued.Delete(job.ReceiptID)
 				w.markPending(job.ReceiptID)
 				w.wg.Done()
 			default:
@@ -357,6 +370,8 @@ func (w *ReceiptWorker) RequeuePending(ctx context.Context) (int, error) {
 			// rows stay 'pending' for the next boot.
 			slog.Warn("worker: requeue stopped — queue full", "resubmitted", resubmitted, "remaining", len(pending)-resubmitted)
 			return resubmitted, nil
+		case errors.Is(err, ErrReceiptAlreadyQueued):
+			slog.Debug("worker: requeue skipped — already queued", "receipt_id", r.id)
 		case errors.Is(err, ErrWorkerShuttingDown):
 			// Shouldn't happen at startup, but handle defensively.
 			slog.Warn("worker: requeue stopped — shutting down", "resubmitted", resubmitted)

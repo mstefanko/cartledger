@@ -80,6 +80,7 @@ func (h *PasswordHandler) processResetRequest(email string) {
 	var userID, name string
 	err := h.DB.QueryRow("SELECT id, name FROM users WHERE email = ?", email).Scan(&userID, &name)
 	if err == sql.ErrNoRows {
+		_ = auth.CheckPassword(dummyPasswordHash, email)
 		return
 	}
 	if err != nil {

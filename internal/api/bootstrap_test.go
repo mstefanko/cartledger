@@ -53,6 +53,28 @@ func TestLoadOrGenerateBootstrapTokenRefreshesConsumedTokenWhenNoUsers(t *testin
 	}
 }
 
+func TestLoadOrGenerateBootstrapTokenPreservesUnconsumedTokenAcrossRestart(t *testing.T) {
+	database := newBootstrapTestDB(t)
+
+	bootstrap, err := LoadOrGenerateBootstrapToken(database)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateBootstrapToken: %v", err)
+	}
+	firstToken := bootstrap.Token()
+	if firstToken == "" {
+		t.Fatalf("expected first bootstrap token")
+	}
+
+	restartedBootstrap, err := LoadOrGenerateBootstrapToken(database)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateBootstrapToken after restart: %v", err)
+	}
+	restartedToken := restartedBootstrap.Token()
+	if restartedToken != firstToken {
+		t.Fatalf("restart token = %q, want preserved token %q", restartedToken, firstToken)
+	}
+}
+
 func TestEnsureForEmptyUsersActivatesAfterUsersAreCleared(t *testing.T) {
 	database := newBootstrapTestDB(t)
 	if _, err := database.Exec(

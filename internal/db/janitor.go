@@ -42,8 +42,11 @@ func (j *Janitor) Start(ctx context.Context) {
 }
 
 func (j *Janitor) runOnce(ctx context.Context) {
-	tokens, tokenErr := j.deleteExpired(ctx, "DELETE FROM user_tokens WHERE expires_at < CURRENT_TIMESTAMP")
-	invites, inviteErr := j.deleteExpired(ctx, "DELETE FROM invite_links WHERE expires_at < CURRENT_TIMESTAMP AND consumed_at IS NULL")
+	passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	tokens, tokenErr := j.deleteExpired(passCtx, "DELETE FROM user_tokens WHERE expires_at < CURRENT_TIMESTAMP")
+	invites, inviteErr := j.deleteExpired(passCtx, "DELETE FROM invite_links WHERE expires_at < CURRENT_TIMESTAMP AND consumed_at IS NULL")
 	if tokenErr != nil {
 		j.log.Warn("janitor: expired user token cleanup failed", "err", tokenErr)
 	}

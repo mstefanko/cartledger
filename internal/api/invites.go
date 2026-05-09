@@ -237,6 +237,7 @@ func (h *InvitesHandler) createInvite(householdID, inviterID, email string, ttl 
 }
 
 func (h *InvitesHandler) createInviteInTx(tx *sql.Tx, householdID, inviterID, email string, ttl time.Duration) (inviteResponse, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
 	token, err := auth.GenerateToken()
 	if err != nil {
 		return inviteResponse{}, err

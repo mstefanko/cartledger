@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -28,6 +31,8 @@ const (
 	// CreateAuthToken in jwt.go). Keep these in sync.
 	SessionCookieMaxAge = 30 * 24 * time.Hour
 )
+
+var ErrInvalidSession = errors.New("invalid session")
 
 // isTLSRequest reports whether the request should be treated as HTTPS for the
 // purpose of cookie Secure flag + __Host- prefix selection. Prefers the
@@ -130,7 +135,11 @@ func extractToken(c echo.Context, allowQueryToken bool) (token, source string) {
 //
 // On success the middleware sets user_id and household_id on the echo context.
 // On failure it returns 401 with {"error":"invalid or expired token"}.
-func JWTMiddleware(secret string) echo.MiddlewareFunc {
+func JWTMiddleware(secret string, databases ...*sql.DB) echo.MiddlewareFunc {
+	var db *sql.DB
+	if len(databases) > 0 {
+		db = databases[0]
+	}
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			tok, _ := extractToken(c, false)
@@ -143,6 +152,17 @@ func JWTMiddleware(secret string) echo.MiddlewareFunc {
 			if err != nil {
 				return c.JSON(http.StatusUnauthorized, map[string]string{
 					"error": "invalid or expired token",
+				})
+			}
+			if err := ValidateSession(c.Request().Context(), db, claims); err != nil {
+				if errors.Is(err, ErrInvalidSession) {
+					return c.JSON(http.StatusUnauthorized, map[string]string{
+						"error": "invalid or expired token",
+					})
+				}
+				slog.Warn("auth: session validation failed", "user_id", claims.UserID, "err", err)
+				return c.JSON(http.StatusInternalServerError, map[string]string{
+					"error": "database error",
 				})
 			}
 			c.Set(ContextKeyUserID, claims.UserID)
@@ -161,7 +181,11 @@ func JWTMiddleware(secret string) echo.MiddlewareFunc {
 // Cookie header). A deprecation warning is logged whenever the query fallback
 // is actually used so operators can track whether it's still needed before
 // removing it in a future release.
-func AuthenticateWithQueryToken(c echo.Context, secret string) (*Claims, error) {
+func AuthenticateWithQueryToken(c echo.Context, secret string, databases ...*sql.DB) (*Claims, error) {
+	var db *sql.DB
+	if len(databases) > 0 {
+		db = databases[0]
+	}
 	tok, src := extractToken(c, true)
 	if tok == "" {
 		return nil, echo.NewHTTPError(http.StatusUnauthorized, "missing token")
@@ -176,7 +200,62 @@ func AuthenticateWithQueryToken(c echo.Context, secret string) (*Claims, error) 
 	if err != nil {
 		return nil, echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
 	}
+	if err := ValidateSession(c.Request().Context(), db, claims); err != nil {
+		if errors.Is(err, ErrInvalidSession) {
+			return nil, echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+		}
+		slog.Warn("auth: query-token session validation failed", "user_id", claims.UserID, "err", err)
+		return nil, echo.NewHTTPError(http.StatusInternalServerError, "database error")
+	}
 	return claims, nil
+}
+
+// ValidateSession rejects JWTs issued before the user's password was last
+// changed. Passing nil db preserves legacy validation for tests or callers
+// that only need signature/expiry validation.
+func ValidateSession(ctx context.Context, db *sql.DB, claims *Claims) error {
+	if db == nil {
+		return nil
+	}
+	if claims == nil || claims.UserID == "" || claims.HouseholdID == "" || claims.IssuedAt == nil {
+		return ErrInvalidSession
+	}
+
+	var changedAt sql.NullString
+	err := db.QueryRowContext(
+		ctx,
+		"SELECT password_changed_at FROM users WHERE id = ? AND household_id = ?",
+		claims.UserID, claims.HouseholdID,
+	).Scan(&changedAt)
+	if err == sql.ErrNoRows {
+		return ErrInvalidSession
+	}
+	if err != nil {
+		return fmt.Errorf("lookup password_changed_at: %w", err)
+	}
+	if !changedAt.Valid || strings.TrimSpace(changedAt.String) == "" {
+		return nil
+	}
+
+	passwordChangedAt, err := parseSessionTime(changedAt.String)
+	if err != nil {
+		return ErrInvalidSession
+	}
+	if passwordChangedAt.After(claims.IssuedAt.Time) {
+		return ErrInvalidSession
+	}
+	return nil
+}
+
+func parseSessionTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if t, err := time.Parse(sqliteDateTimeFormat, value); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05.999999999", value); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339Nano, value)
 }
 
 // RequireAdmin returns a middleware that checks `users.is_admin` for the

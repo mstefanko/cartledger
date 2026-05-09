@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -141,6 +142,27 @@ func TestInviteCreateValidateAndJoin(t *testing.T) {
 	}
 	if consumed == "" {
 		t.Fatalf("consumed_at is empty")
+	}
+}
+
+func TestCreateInviteNormalizesEmailAtInsert(t *testing.T) {
+	fx := newInviteFixture(t)
+	h := &InvitesHandler{
+		DB:  fx.DB,
+		Cfg: &config.Config{AppBaseURL: "http://example.test"},
+	}
+
+	invite, err := h.createInvite("hh", "admin", " New@Example.COM ", 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("createInvite: %v", err)
+	}
+
+	var stored string
+	if err := fx.DB.QueryRow("SELECT email FROM invite_links WHERE id = ?", invite.ID).Scan(&stored); err != nil {
+		t.Fatalf("query invite email: %v", err)
+	}
+	if stored != "new@example.com" {
+		t.Fatalf("stored email = %q, want normalized email", stored)
 	}
 }
 

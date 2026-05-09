@@ -553,21 +553,37 @@ func (h *ReceiptHandler) Reprocess(c echo.Context) error {
 	//
 	// If Resubmit fails, we roll the row back to 'error' so List/Get
 	// accurately reflect the failed retry.
-	_, err = h.DB.Exec(
-		"UPDATE receipts SET status = 'pending', error_message = NULL WHERE id = ? AND household_id = ?",
-		receiptID, householdID,
+	res, err := h.DB.Exec(
+		"UPDATE receipts SET status = 'pending', error_message = NULL WHERE id = ? AND household_id = ? AND status = ?",
+		receiptID, householdID, status,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if n != 1 {
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error": "receipt status changed; refresh and try again",
+		})
 	}
 
 	// 5. Re-enqueue via the worker. Resubmit re-reads image paths from disk
 	// so we never require the user to re-upload.
 	if err := h.Worker.Resubmit(receiptID, householdID); err != nil {
+		if errors.Is(err, worker.ErrReceiptAlreadyQueued) {
+			return c.JSON(http.StatusAccepted, map[string]string{
+				"id":     receiptID,
+				"status": "pending",
+			})
+		}
 		// Roll back the status flip.
+		msg := reprocessErrorMessage(err)
 		_, _ = h.DB.Exec(
-			"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
-			err.Error(), receiptID,
+			"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ? AND household_id = ?",
+			msg, receiptID, householdID,
 		)
 		switch {
 		case errors.Is(err, worker.ErrImagesGone):
@@ -591,6 +607,17 @@ func (h *ReceiptHandler) Reprocess(c echo.Context) error {
 		"id":     receiptID,
 		"status": "pending",
 	})
+}
+
+func reprocessErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, worker.ErrImagesGone):
+		return "receipt images are no longer on disk; please re-upload the receipt"
+	case errors.Is(err, worker.ErrQueueFull), errors.Is(err, worker.ErrWorkerShuttingDown):
+		return "server busy, please try again later"
+	default:
+		return "failed to enqueue receipt"
+	}
 }
 
 // List returns all receipts for the authenticated household.

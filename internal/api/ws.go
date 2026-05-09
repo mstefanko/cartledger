@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -63,6 +64,7 @@ func newUpgrader(allowedOrigins []string) websocket.Upgrader {
 type WSHandler struct {
 	Hub       *ws.Hub
 	Cfg       *config.Config
+	DB        *sql.DB
 	JWTSecret string
 
 	upgrader websocket.Upgrader
@@ -70,10 +72,11 @@ type WSHandler struct {
 
 // NewWSHandler builds a WSHandler with the configured Origin allow-list
 // captured into the upgrader.
-func NewWSHandler(hub *ws.Hub, cfg *config.Config) *WSHandler {
+func NewWSHandler(hub *ws.Hub, cfg *config.Config, db *sql.DB) *WSHandler {
 	return &WSHandler{
 		Hub:       hub,
 		Cfg:       cfg,
+		DB:        db,
 		JWTSecret: cfg.JWTSecret,
 		upgrader:  newUpgrader(cfg.AllowedOrigins),
 	}
@@ -83,7 +86,7 @@ func NewWSHandler(hub *ws.Hub, cfg *config.Config) *WSHandler {
 // via the multi-source token reader (cookie first, then Bearer/X-API-Key,
 // then ?token= query fallback with a deprecation warning).
 func (h *WSHandler) HandleWS(c echo.Context) error {
-	claims, err := auth.AuthenticateWithQueryToken(c, h.JWTSecret)
+	claims, err := auth.AuthenticateWithQueryToken(c, h.JWTSecret, h.DB)
 	if err != nil {
 		// echo.NewHTTPError path — translate to JSON for browser-facing clients.
 		if he, ok := err.(*echo.HTTPError); ok {

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -31,6 +32,21 @@ func (b *blockingLLM) ExtractReceipt(images [][]byte) (*llm.ReceiptExtraction, e
 	}
 	<-b.start
 	return b.inner.ExtractReceipt(images)
+}
+
+func TestSubmitDedupesBufferedReceipt(t *testing.T) {
+	w := NewReceiptWorker(0, nil, nil, nil, nil, nil, &config.Config{})
+	job := ReceiptJob{ReceiptID: "receipt-1", HouseholdID: "hh", ImageDir: "/tmp/receipt-1"}
+
+	if err := w.Submit(job); err != nil {
+		t.Fatalf("first Submit: %v", err)
+	}
+	if err := w.Submit(job); !errors.Is(err, ErrReceiptAlreadyQueued) {
+		t.Fatalf("second Submit err = %v, want ErrReceiptAlreadyQueued", err)
+	}
+	if depth := w.QueueDepth(); depth != 1 {
+		t.Fatalf("queue depth = %d, want 1", depth)
+	}
 }
 
 // TestShutdown_DrainsBufferedJobs exercises the wg-accounting invariant that

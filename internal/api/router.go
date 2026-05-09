@@ -107,7 +107,7 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	// and user_id on the context, which the per-method rate limiter reads
 	// below — so JWTMiddleware MUST be first.
 	protected := v1.Group("")
-	protected.Use(auth.JWTMiddleware(cfg.JWTSecret))
+	protected.Use(auth.JWTMiddleware(cfg.JWTSecret, database))
 	// Global catch-all for any authenticated traffic — protects against
 	// cheap-but-high-volume endpoints slipping past narrower buckets.
 	protected.Use(rateLimiter.Middleware(TierGlobal))
@@ -280,7 +280,7 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	// Expected layout: <DataDir>/receipts/<receipt_uuid>/<image_file>
 	absBase, baseErr := filepath.Abs(filepath.Join(cfg.DataDir, "receipts"))
 	v1.GET("/files/*", func(c echo.Context) error {
-		claims, err := auth.AuthenticateWithQueryToken(c, cfg.JWTSecret)
+		claims, err := auth.AuthenticateWithQueryToken(c, cfg.JWTSecret, database)
 		if err != nil {
 			return err
 		}
@@ -347,7 +347,7 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 
 	// WebSocket endpoint — auth handled inside the handler (multi-source
 	// reader: cookie, Bearer, X-API-Key, or ?token= fallback).
-	wsHandler := NewWSHandler(hub, cfg)
+	wsHandler := NewWSHandler(hub, cfg, database)
 	v1.GET("/ws", wsHandler.HandleWS)
 
 	// --- Static file serving (catch-all for SPA) ---
