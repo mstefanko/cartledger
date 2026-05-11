@@ -22,8 +22,8 @@ import (
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/storage"
-	"github.com/mstefanko/cartledger/internal/units"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -235,8 +235,11 @@ func (w *ReceiptWorker) runJob(job ReceiptJob) {
 		slog.Error("worker: failed to process receipt", "receipt_id", job.ReceiptID, "err", err)
 		// Update receipt status to error.
 		_, _ = w.db.Exec(
-			"UPDATE receipts SET status = 'error' WHERE id = ?",
-			job.ReceiptID,
+			`UPDATE receipts
+			 SET status = 'error',
+			     error_message = COALESCE(NULLIF(error_message, ''), ?)
+			 WHERE id = ?`,
+			receiptErrorMessage(err), job.ReceiptID,
 		)
 		w.hub.Broadcast(ws.Message{
 			Type:      ws.EventReceiptComplete,
@@ -248,6 +251,29 @@ func (w *ReceiptWorker) runJob(job ReceiptJob) {
 			},
 		})
 	}
+}
+
+func receiptErrorMessage(err error) string {
+	if err == nil {
+		return "receipt processing failed"
+	}
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if msg == "" {
+		return "receipt processing failed"
+	}
+	const maxRunes = 700
+	runes := []rune(msg)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "..."
+	}
+	return msg
+}
+
+func emptyLineItemsMessage(extraction *llm.ReceiptExtraction) string {
+	if extraction != nil && extraction.ItemsSoldCount != nil && *extraction.ItemsSoldCount > 0 {
+		return fmt.Sprintf("AI read %d items sold but could not extract any line items. The photo may be too blurry, angled, or partially cut off for reliable item OCR. Try Repair Scan, add rows manually, or upload a clearer photo.", *extraction.ItemsSoldCount)
+	}
+	return "AI could not extract any line items from this receipt. The photo may be too blurry, angled, or partially cut off for reliable item OCR. Try Repair Scan, add rows manually, or upload a clearer photo."
 }
 
 // Shutdown stops accepting new submissions, waits for in-flight jobs to finish
@@ -717,6 +743,20 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	if err != nil {
 		return fmt.Errorf("update receipt: %w", err)
 	}
+	if len(extraction.Items) == 0 {
+		msg := emptyLineItemsMessage(extraction)
+		_, err = tx.Exec(
+			"UPDATE receipts SET status = 'error', error_message = ? WHERE id = ?",
+			msg, job.ReceiptID,
+		)
+		if err != nil {
+			return fmt.Errorf("mark empty extraction error: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit empty extraction error: %w", err)
+		}
+		return fmt.Errorf("llm extraction returned no line items: %s", msg)
+	}
 
 	// 5. "Each" overload detection: identify items that look like multi-packs sold as quantity=1.
 	// Build a map of flagged item indices and their confidence caps.
@@ -898,42 +938,8 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 				}
 			}
 
-			// Insert product_prices entry.
-			unit := "each"
-			if item.Unit != nil {
-				unit = *item.Unit
-			}
-			up := totalPrice.Div(quantity)
-
-			isSale := regularPrice != nil && discountAmount != nil
-			priceID := uuid.New().String()
-			_, err = tx.Exec(
-				`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				priceID, *productID, storeID, job.ReceiptID,
-				receiptDate, quantity.String(), unit, up.String(),
-				regularPrice, discountAmount, isSale, now,
-			)
-			if err != nil {
-				return fmt.Errorf("insert product price: %w", err)
-			}
-
-			// Normalize price to standard unit (per oz, per fl_oz, per each).
-			normalizedPrice, normalizedUnit, normErr := units.NormalizePrice(totalPrice, quantity, unit, *productID, tx)
-			if normErr == nil {
-				_, _ = tx.Exec(
-					`UPDATE product_prices SET normalized_price = ?, normalized_unit = ? WHERE id = ?`,
-					normalizedPrice.String(), normalizedUnit, priceID,
-				)
-			}
-
-			// Update product purchase stats.
-			_, err = tx.Exec(
-				"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
-				receiptDate, now, *productID,
-			)
-			if err != nil {
-				return fmt.Errorf("update product stats: %w", err)
+			if err := prices.RecordProductPriceFromLineItem(context.Background(), tx, lineItemID); err != nil {
+				return fmt.Errorf("record product price: %w", err)
 			}
 		}
 	}

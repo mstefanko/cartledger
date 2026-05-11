@@ -96,6 +96,44 @@ func insertInflPrice(t *testing.T, ah *AnalyticsHandler, householdID, storeID, p
 	}
 }
 
+func insertInflPriceWithUnit(t *testing.T, ah *AnalyticsHandler, householdID, storeID, productID, daysOffset, unit, unitPrice, normalizedPrice, normalizedUnit, qty string) {
+	t.Helper()
+	d := ah.DB
+	var receiptID string
+	if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+		t.Fatalf("gen receipt id: %v", err)
+	}
+	var receiptDate string
+	if err := d.QueryRow("SELECT date('now', ?)", daysOffset).Scan(&receiptDate); err != nil {
+		t.Fatalf("compute date: %v", err)
+	}
+	if _, err := d.Exec(
+		"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
+		receiptID, householdID, storeID, receiptDate,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	var normPriceVal interface{}
+	if normalizedPrice == "" {
+		normPriceVal = nil
+	} else {
+		normPriceVal = normalizedPrice
+	}
+	var normUnitVal interface{}
+	if normalizedUnit == "" {
+		normUnitVal = nil
+	} else {
+		normUnitVal = normalizedUnit
+	}
+	if _, err := d.Exec(
+		`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price, normalized_unit)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		productID, storeID, receiptID, receiptDate, qty, unit, unitPrice, normPriceVal, normUnitVal,
+	); err != nil {
+		t.Fatalf("insert product_prices: %v", err)
+	}
+}
+
 // seedStapleProduct seeds enough purchases for a product to appear in qStaplesList
 // (requires distinct_dates >= 2, cadence <= 60d) AND to have prices in all three
 // windows: W_current [now-30,now), W_3mo [now-120,now-90), W_6mo [now-210,now-180).
@@ -339,6 +377,43 @@ func TestInflation_NullNormalizedPriceFallback(t *testing.T) {
 	}
 	if resp.Change3moPct == nil {
 		t.Error("expected change_3mo_pct non-nil when unit_price fallback used")
+	}
+}
+
+func TestInflation_FiltersMixedEffectiveUnitsPerProduct(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newInflHousehold(t, ah, "InflMixedUnits")
+	for _, name := range []string{"Coffee", "Cereal", "Crackers"} {
+		productID := insertInflProduct(t, ah, householdID, name)
+		insertInflPriceWithUnit(t, ah, householdID, storeID, productID, "-10 days", "each", "3.20", "0.10", "oz", "1")
+		insertInflPriceWithUnit(t, ah, householdID, storeID, productID, "-50 days", "each", "3.20", "0.10", "oz", "1")
+		insertInflPriceWithUnit(t, ah, householdID, storeID, productID, "-95 days", "each", "3.20", "0.10", "oz", "1")
+		insertInflPriceWithUnit(t, ah, householdID, storeID, productID, "-140 days", "each", "3.20", "0.10", "oz", "1")
+		insertInflPriceWithUnit(t, ah, householdID, storeID, productID, "-190 days", "each", "3.20", "0.10", "oz", "1")
+		insertInflPriceWithUnit(t, ah, householdID, storeID, productID, "-200 days", "each", "3.20", "0.10", "oz", "1")
+	}
+
+	mixedID := insertInflProduct(t, ah, householdID, "Outlier Package")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-10 days", "each", "3.20", "0.10", "oz", "1")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-12 days", "each", "99.00", "", "", "1")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-50 days", "each", "3.20", "0.10", "oz", "1")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-95 days", "each", "3.20", "0.10", "oz", "1")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-140 days", "each", "3.20", "0.10", "oz", "1")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-190 days", "each", "3.20", "0.10", "oz", "1")
+	insertInflPriceWithUnit(t, ah, householdID, storeID, mixedID, "-200 days", "each", "3.20", "0.10", "oz", "1")
+
+	resp := callInflation(t, ah, householdID)
+
+	if resp.Suppressed {
+		t.Fatalf("expected suppressed=false, reason=%v", resp.SuppressionReason)
+	}
+	if resp.Change3moPct == nil {
+		t.Fatal("expected change_3mo_pct non-nil")
+	}
+	if *resp.Change3moPct < -0.01 || *resp.Change3moPct > 0.01 {
+		t.Fatalf("expected mixed raw-unit outlier to be ignored, got change_3mo_pct=%f", *resp.Change3moPct)
 	}
 }
 

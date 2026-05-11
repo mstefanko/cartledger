@@ -54,6 +54,14 @@ export async function getProductDetail(id: string): Promise<ProductDetail> {
   return get<ProductDetail>(`/products/${encodeURIComponent(id)}/detail`)
 }
 
+export async function previewProductPriceRecompute(id: string): Promise<{ affected_count: number }> {
+  return get<{ affected_count: number }>(`/products/${encodeURIComponent(id)}/recompute-prices/preview`)
+}
+
+export async function recomputeProductPrices(id: string): Promise<{ updated_count: number }> {
+  return post<{ updated_count: number }>(`/products/${encodeURIComponent(id)}/recompute-prices`, {})
+}
+
 export async function uploadProductImage(productId: string, file: File, type?: string, caption?: string): Promise<ProductImage> {
   const formData = new FormData()
   formData.append('image', file)

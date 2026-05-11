@@ -123,6 +123,8 @@ export interface LineItem {
   receipt_id: string
   product_id: string | null
   product_name: string | null
+  product_pack_quantity?: number | null
+  product_pack_unit?: string | null
   category: string | null
   raw_name: string
   quantity: string
@@ -130,10 +132,14 @@ export interface LineItem {
   unit_price: string | null
   total_price: string
   matched: 'unmatched' | 'auto' | 'manual' | 'rule'
+  review_status: 'pending' | 'accepted'
   confidence: number | null
   regular_price: string | null
   discount_amount: string | null
   count_contribution: string
+  pack_quantity_override: string | null
+  pack_unit_override: string | null
+  pack_override_source: string | null
   line_number: number | null
   suggested_name: string | null
   suggested_category: string | null
@@ -278,13 +284,18 @@ export interface GroupSuggestion {
 // --- Product Detail Types ---
 
 export interface PriceHistoryEntry {
+  id: string
+  receipt_id: string
   date: string
+  receipt_date?: string
   store_name: string
   store_id: string
   quantity: string
   unit: string
   unit_price: string
   total_price: string
+  normalized_price?: string | null
+  normalized_unit?: string | null
   regular_price: string | null
   discount_amount: string | null
   is_sale: boolean
@@ -433,6 +444,22 @@ export interface UpdateLineItemRequest {
   unit?: string
   unit_price?: string
   total_price?: string
+  pack_quantity_override?: string
+  pack_unit_override?: string
+  pack_override_source?: 'user' | 'import'
+  review_status?: 'pending' | 'accepted'
+}
+
+export interface UpdateReceiptRequest {
+  status?: 'matched' | 'reviewed'
+  store_id?: string
+  receipt_date?: string
+  receipt_time?: string
+  subtotal?: string
+  tax?: string
+  total?: string
+  card_type?: string
+  card_last4?: string
 }
 
 // --- Matching Types ---

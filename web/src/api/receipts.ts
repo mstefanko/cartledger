@@ -3,15 +3,18 @@ import type {
   Receipt,
   LineItem,
   UpdateLineItemRequest,
+  UpdateReceiptRequest,
   AcceptSuggestionsRequest,
   AcceptSuggestionsResponse,
 } from '@/types'
+import type { ReceiptUploadPage } from '@/lib/receiptUpload'
 
-export async function scanReceipt(images: File[]): Promise<Receipt> {
+export async function scanReceipt(pages: ReceiptUploadPage[]): Promise<Receipt> {
   const formData = new FormData()
-  for (const image of images) {
-    formData.append('images', image)
+  for (const page of pages) {
+    formData.append('images', page.file)
   }
+  formData.append('page_sources', JSON.stringify(pages.map((page) => page.source)))
   return postMultipart<Receipt>('/receipts/scan', formData)
 }
 
@@ -59,6 +62,21 @@ export async function createLineItem(
   )
 }
 
+export interface CreateLineItemsResponse {
+  created_count: number
+  status: string
+}
+
+export async function createLineItems(
+  receiptId: string,
+  items: ManualLineItemInput[],
+): Promise<CreateLineItemsResponse> {
+  return post<CreateLineItemsResponse>(
+    `/receipts/${encodeURIComponent(receiptId)}/line-items/bulk`,
+    { items },
+  )
+}
+
 export async function acceptSuggestions(
   receiptId: string,
   data: AcceptSuggestionsRequest,
@@ -79,6 +97,16 @@ export async function confirmReceipt(
   return put<{ status: string }>(
     `/receipts/${encodeURIComponent(receiptId)}`,
     { status: 'reviewed' },
+  )
+}
+
+export async function updateReceipt(
+  receiptId: string,
+  data: UpdateReceiptRequest,
+): Promise<{ status: string }> {
+  return put<{ status: string }>(
+    `/receipts/${encodeURIComponent(receiptId)}`,
+    data,
   )
 }
 

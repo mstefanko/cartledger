@@ -46,6 +46,10 @@ restarts before setup completes, then marked consumed after setup succeeds. If
 all users are later cleared, a fresh token is generated and logged again.
 
 ### Added
+- Receipt scanner PDF uploads: the browser accepts scanner-app PDFs, renders
+  each page to JPEG, and uploads those generated page images through the
+  existing image pipeline. Raw PDFs are not retained; the API still accepts
+  JPEG/PNG image payloads only and now enforces a 10-page scan cap.
 - **Image retention janitor** (`internal/imaging/retention.go`): when
   `IMAGE_RETENTION_DAYS > 0`, a background goroutine sweeps
   `DATA_DIR/receipts/<uuid>/` every `IMAGE_RETENTION_SWEEP_INTERVAL`

@@ -4,7 +4,7 @@ Self-hosted app to track grocery receipts, compare prices, and build smart shopp
 
 ## Features
 
-- Receipt scanning via Claude or Gemini AI
+- Receipt scanning via Claude or Gemini AI from JPEG, PNG, or scanner PDF uploads
 - Price tracking and history with analytics dashboard
 - Smart product matching (fuzzy + rule-based)
 - Shopping lists with price estimates and "Buy Again"
@@ -13,6 +13,11 @@ Self-hosted app to track grocery receipts, compare prices, and build smart shopp
 - Multi-user support with JWT auth
 - PWA support
 - Real-time updates via WebSocket
+
+Receipt PDFs are converted in the browser into JPEG receipt pages before upload.
+CartLedger stores and reprocesses those generated page images; raw PDFs are not
+retained by default. A receipt scan can include up to 10 pages, with each
+selected source file capped at 10 MB.
 
 ## Tech Stack
 

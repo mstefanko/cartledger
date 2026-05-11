@@ -1,7 +1,12 @@
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Star } from 'lucide-react'
+import { updateLineItem } from '@/api/receipts'
 import { Badge } from '@/components/ui/Badge'
-import type { CompareAppearance, CompareProduct, CompareReceipt } from '@/api/comparison'
+import { Button } from '@/components/ui/Button'
+import { Modal } from '@/components/ui/Modal'
+import type { CompareAppearance, CompareLineChoice, CompareProduct, CompareReceipt } from '@/api/comparison'
 
 interface ComparisonGridProps {
   receipts: CompareReceipt[]
@@ -50,9 +55,11 @@ function productDetailPath(product: CompareProduct): string {
 function ComparisonCell({
   appearance,
   isBest,
+  onSetSize,
 }: {
   appearance?: CompareAppearance
   isBest: boolean
+  onSetSize: (appearance: CompareAppearance) => void
 }) {
   if (!appearance) {
     return (
@@ -91,9 +98,14 @@ function ComparisonCell({
           {unitPrice}
         </div>
       ) : (
-        <Badge variant="warning" className="mt-2">
-          size unknown
-        </Badge>
+        <button
+          type="button"
+          className="mt-2"
+          onClick={() => onSetSize(appearance)}
+          aria-label={`Set package size for ${appearance.raw_name}`}
+        >
+          <Badge variant="warning">size unknown</Badge>
+        </button>
       )}
       <div className="mt-1 line-clamp-2 break-words text-small text-neutral-400">
         {appearance.raw_name}
@@ -103,72 +115,210 @@ function ComparisonCell({
 }
 
 export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
+  const queryClient = useQueryClient()
+  const [editing, setEditing] = useState<CompareAppearance | null>(null)
+  const [linePicker, setLinePicker] = useState<CompareAppearance | null>(null)
+  const [packQuantity, setPackQuantity] = useState('')
+  const [packUnit, setPackUnit] = useState('')
+
+  const saveSizeMutation = useMutation({
+    mutationFn: () => {
+      if (!editing) throw new Error('missing line item')
+      return updateLineItem(editing.receipt_id, editing.line_item_id, {
+        pack_quantity_override: packQuantity,
+        pack_unit_override: packUnit,
+        pack_override_source: 'user',
+      })
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['receipts', 'compare'] })
+      queryClient.invalidateQueries({ queryKey: ['receipt'] })
+      queryClient.invalidateQueries({ queryKey: ['product-detail'] })
+      setEditing(null)
+      setLinePicker(null)
+      setPackQuantity('')
+      setPackUnit('')
+    },
+  })
+
+  const openSizeEditorForLine = (appearance: CompareAppearance, line?: CompareLineChoice) => {
+    setEditing({
+      ...appearance,
+      line_item_id: line?.line_item_id ?? appearance.line_item_id,
+      raw_name: line?.raw_name ?? appearance.raw_name,
+      quantity: line?.quantity ?? appearance.quantity,
+      unit: line?.unit ?? appearance.unit,
+      total_price: line?.total_price ?? appearance.total_price,
+      unit_price: line?.unit_price ?? appearance.unit_price,
+    })
+    setPackQuantity('')
+    setPackUnit('')
+  }
+
+  const openSizeEditor = (appearance: CompareAppearance) => {
+    if (appearance.lines && appearance.lines.length > 1) {
+      setLinePicker(appearance)
+      return
+    }
+    openSizeEditorForLine(appearance)
+  }
+
   return (
-    <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
-      <table className="min-w-full border-collapse">
-        <thead className="bg-neutral-50">
-          <tr>
-            <th className="sticky left-0 z-20 min-w-[190px] max-w-[220px] bg-neutral-50 px-3 py-2 text-left text-caption font-semibold text-neutral-600 border-b border-r border-neutral-200">
-              Product
-            </th>
-            {receipts.map((receipt) => (
-              <th
-                key={receipt.id}
-                className="min-w-[168px] px-3 py-2 text-left border-b border-neutral-200"
-              >
-                <ReceiptColumnHeader receipt={receipt} />
+    <>
+      <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
+        <table className="min-w-full border-collapse">
+          <thead className="bg-neutral-50">
+            <tr>
+              <th className="sticky left-0 z-20 min-w-[190px] max-w-[220px] bg-neutral-50 px-3 py-2 text-left text-caption font-semibold text-neutral-600 border-b border-r border-neutral-200">
+                Product
               </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {products.map((product) => {
-            const appearancesByReceipt = new Map(
-              product.appearances.map((appearance) => [appearance.receipt_id, appearance]),
-            )
-            return (
-              <tr key={product.comparison_key} className="align-top">
-                <th className="sticky left-0 z-10 min-w-[190px] max-w-[220px] bg-white px-3 py-3 text-left border-b border-r border-neutral-200">
-                  <div className="flex min-w-0 flex-col gap-1">
-                    <Link
-                      to={productDetailPath(product)}
-                      className="break-words text-body-medium font-semibold text-neutral-900 hover:text-brand"
-                    >
-                      {product.name}
-                    </Link>
-                    {product.category && (
-                      <Badge variant="neutral" className="w-fit">
-                        {product.category}
-                      </Badge>
-                    )}
-                    <span className="text-small text-neutral-400">
-                      {product.appearances.length} receipt
-                      {product.appearances.length === 1 ? '' : 's'}
-                    </span>
-                  </div>
+              {receipts.map((receipt) => (
+                <th
+                  key={receipt.id}
+                  className="min-w-[168px] px-3 py-2 text-left border-b border-neutral-200"
+                >
+                  <ReceiptColumnHeader receipt={receipt} />
                 </th>
-                {receipts.map((receipt) => {
-                  const appearance = appearancesByReceipt.get(receipt.id)
-                  return (
-                    <td
-                      key={receipt.id}
-                      className="min-w-[168px] px-3 py-3 text-left border-b border-neutral-200"
-                    >
-                      <ComparisonCell
-                        appearance={appearance}
-                        isBest={
-                          !!appearance &&
-                          product.best_appearance_id === appearance.line_item_id
-                        }
-                      />
-                    </td>
-                  )
-                })}
-              </tr>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {products.map((product) => {
+              const appearancesByReceipt = new Map(
+                product.appearances.map((appearance) => [appearance.receipt_id, appearance]),
+              )
+              return (
+                <tr key={product.comparison_key} className="align-top">
+                  <th className="sticky left-0 z-10 min-w-[190px] max-w-[220px] bg-white px-3 py-3 text-left border-b border-r border-neutral-200">
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <Link
+                        to={productDetailPath(product)}
+                        className="break-words text-body-medium font-semibold text-neutral-900 hover:text-brand"
+                      >
+                        {product.name}
+                      </Link>
+                      {product.category && (
+                        <Badge variant="neutral" className="w-fit">
+                          {product.category}
+                        </Badge>
+                      )}
+                      <span className="text-small text-neutral-400">
+                        {product.appearances.length} receipt
+                        {product.appearances.length === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                  </th>
+                  {receipts.map((receipt) => {
+                    const appearance = appearancesByReceipt.get(receipt.id)
+                    return (
+                      <td
+                        key={receipt.id}
+                        className="min-w-[168px] px-3 py-3 text-left border-b border-neutral-200"
+                      >
+                        <ComparisonCell
+                          appearance={appearance}
+                          isBest={
+                            !!appearance &&
+                            product.best_appearance_id === appearance.line_item_id
+                          }
+                          onSetSize={openSizeEditor}
+                        />
+                      </td>
+                    )
+                  })}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <Modal
+        open={linePicker !== null}
+        onClose={() => setLinePicker(null)}
+        title="Choose Line"
+      >
+        <div className="space-y-3">
+          {(linePicker?.lines ?? []).map((line) => {
+            const size = line.quantity
+              ? `${line.quantity}${line.unit ? ` ${formatUnit(line.unit)}` : ''}`
+              : null
+            return (
+              <button
+                key={line.line_item_id}
+                type="button"
+                className="w-full rounded-lg border border-neutral-200 px-3 py-2 text-left hover:border-brand hover:bg-neutral-50"
+                onClick={() => {
+                  if (!linePicker) return
+                  openSizeEditorForLine(linePicker, line)
+                  setLinePicker(null)
+                }}
+              >
+                <span className="block text-body-medium text-neutral-900">{line.raw_name}</span>
+                <span className="mt-1 block text-caption text-neutral-500">
+                  {[size, formatCurrency(line.total_price)].filter(Boolean).join(' · ')}
+                </span>
+              </button>
             )
           })}
-        </tbody>
-      </table>
-    </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        title="Set Package Size"
+        footer={(
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setEditing(null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => saveSizeMutation.mutate()}
+              disabled={!packQuantity.trim() || !packUnit.trim() || saveSizeMutation.isPending}
+            >
+              {saveSizeMutation.isPending ? 'Saving...' : 'Save for this receipt'}
+            </Button>
+          </>
+        )}
+      >
+        <div className="space-y-4">
+          <div>
+            <p className="text-body-medium text-neutral-900">{editing?.raw_name}</p>
+            <p className="text-caption text-neutral-400">
+              {editing ? `${formatCurrency(editing.total_price)} on this receipt` : ''}
+            </p>
+          </div>
+          <div className="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] gap-2">
+            <label className="block">
+              <span className="mb-1 block text-small font-medium text-neutral-400">Quantity</span>
+              <input
+                type="number"
+                min="0"
+                step="any"
+                value={packQuantity}
+                onChange={(e) => setPackQuantity(e.target.value)}
+                className="w-full px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                placeholder="32"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-small font-medium text-neutral-400">Unit</span>
+              <input
+                type="text"
+                value={packUnit}
+                onChange={(e) => setPackUnit(e.target.value)}
+                className="w-full px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                placeholder="oz"
+              />
+            </label>
+          </div>
+          <p className="text-caption text-neutral-400">
+            Saves an override for this line item only.
+          </p>
+        </div>
+      </Modal>
+    </>
   )
 }

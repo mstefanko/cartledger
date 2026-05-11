@@ -93,14 +93,49 @@ type productTrendResponse struct {
 	AvgPrice      float64      `json:"avg_price"`
 }
 
+func finalizeProductTrendStats(resp *productTrendResponse) {
+	history := resp.PriceHistory
+	if len(history) == 0 {
+		return
+	}
+
+	if len(history) >= 2 {
+		first := history[0].NormalizedPrice
+		last := history[len(history)-1].NormalizedPrice
+		if first > 0 {
+			resp.PercentChange = math.Round(((last-first)/first)*10000) / 100
+		}
+	}
+
+	resp.MinPrice = history[0].NormalizedPrice
+	resp.MinStore = history[0].Store
+	resp.MaxPrice = history[0].NormalizedPrice
+	resp.MaxStore = history[0].Store
+	var sum float64
+	for _, point := range history {
+		sum += point.NormalizedPrice
+		if point.NormalizedPrice < resp.MinPrice {
+			resp.MinPrice = point.NormalizedPrice
+			resp.MinStore = point.Store
+		}
+		if point.NormalizedPrice > resp.MaxPrice {
+			resp.MaxPrice = point.NormalizedPrice
+			resp.MaxStore = point.Store
+		}
+	}
+	resp.MinPrice = math.Round(resp.MinPrice*100) / 100
+	resp.MaxPrice = math.Round(resp.MaxPrice*100) / 100
+	resp.AvgPrice = math.Round((sum/float64(len(history)))*100) / 100
+}
+
 type productTrendItem struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Category      *string  `json:"category,omitempty"`
-	LatestPrice   float64  `json:"latest_price"`
-	AvgPrice      float64  `json:"avg_price"`
-	PercentChange float64  `json:"percent_change"`
-	LastPurchased *string  `json:"last_purchased,omitempty"`
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	Category      *string `json:"category,omitempty"`
+	LatestPrice   float64 `json:"latest_price"`
+	AvgPrice      float64 `json:"avg_price"`
+	PercentChange float64 `json:"percent_change"`
+	LastPurchased *string `json:"last_purchased,omitempty"`
 }
 
 type productTrendsResponse struct {
@@ -115,10 +150,10 @@ type storePriceLeader struct {
 }
 
 type storeRecentTrip struct {
-	ReceiptID   string  `json:"receipt_id"`
-	Date        string  `json:"date"`
-	Total       float64 `json:"total"`
-	ItemCount   int     `json:"item_count"`
+	ReceiptID string  `json:"receipt_id"`
+	Date      string  `json:"date"`
+	Total     float64 `json:"total"`
+	ItemCount int     `json:"item_count"`
 }
 
 type storeSummaryStore struct {
@@ -247,13 +282,45 @@ func (h *AnalyticsHandler) ProductTrend(c echo.Context) error {
 
 	// Price history (last 6 months).
 	rows, err := h.DB.Query(
-		`SELECT pp.receipt_date,
-		        COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price,
-		        s.name, pp.is_sale
-		 FROM product_prices pp
-		 JOIN stores s ON pp.store_id = s.id
-		 WHERE pp.product_id = ? AND pp.receipt_date >= ?
-		 ORDER BY pp.receipt_date ASC`,
+		`WITH priced AS (
+		     SELECT pp.receipt_date,
+		            pp.created_at,
+		            pp.id,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN CAST(pp.normalized_price AS REAL)
+		              ELSE CAST(pp.unit_price AS REAL)
+		            END AS price,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN pp.normalized_unit
+		              ELSE pp.unit
+		            END AS price_unit,
+		            s.name AS store_name,
+		            pp.is_sale
+		      FROM product_prices pp
+		      JOIN stores s ON pp.store_id = s.id
+		      WHERE pp.product_id = ? AND pp.receipt_date >= ?
+		   ),
+		   unit_counts AS (
+		     SELECT price_unit, COUNT(*) AS n
+		     FROM priced
+		     GROUP BY price_unit
+		   ),
+		   dominant AS (
+		     SELECT price_unit
+		     FROM unit_counts
+		     ORDER BY n DESC, price_unit ASC
+		     LIMIT 1
+		   )
+		   SELECT receipt_date, price, store_name, is_sale
+		   FROM priced
+		   WHERE price_unit = (SELECT price_unit FROM dominant)
+		   ORDER BY receipt_date ASC, created_at ASC, id ASC`,
 		productID, sixMonthsAgo,
 	)
 	if err != nil {
@@ -278,42 +345,7 @@ func (h *AnalyticsHandler) ProductTrend(c echo.Context) error {
 	resp := productTrendResponse{
 		PriceHistory: history,
 	}
-
-	// Percent change: first vs last in the window.
-	if len(history) >= 2 {
-		first := history[0].NormalizedPrice
-		last := history[len(history)-1].NormalizedPrice
-		if first > 0 {
-			resp.PercentChange = math.Round(((last-first)/first)*10000) / 100
-		}
-	}
-
-	// Min/max/avg with store names.
-	h.DB.QueryRow(
-		`SELECT COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price, s.name
-		 FROM product_prices pp
-		 JOIN stores s ON pp.store_id = s.id
-		 WHERE pp.product_id = ? AND pp.receipt_date >= ?
-		 ORDER BY price ASC LIMIT 1`,
-		productID, sixMonthsAgo,
-	).Scan(&resp.MinPrice, &resp.MinStore)
-
-	h.DB.QueryRow(
-		`SELECT COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price, s.name
-		 FROM product_prices pp
-		 JOIN stores s ON pp.store_id = s.id
-		 WHERE pp.product_id = ? AND pp.receipt_date >= ?
-		 ORDER BY price DESC LIMIT 1`,
-		productID, sixMonthsAgo,
-	).Scan(&resp.MaxPrice, &resp.MaxStore)
-
-	h.DB.QueryRow(
-		`SELECT AVG(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)))
-		 FROM product_prices pp
-		 WHERE pp.product_id = ? AND pp.receipt_date >= ?`,
-		productID, sixMonthsAgo,
-	).Scan(&resp.AvgPrice)
-	resp.AvgPrice = math.Round(resp.AvgPrice*100) / 100
+	finalizeProductTrendStats(&resp)
 
 	return c.JSON(http.StatusOK, resp)
 }
@@ -361,34 +393,87 @@ func (h *AnalyticsHandler) ProductsWithTrends(c echo.Context) error {
 	).Scan(&total)
 
 	query := fmt.Sprintf(`
+		WITH priced AS (
+		    SELECT pp.product_id,
+		           pp.receipt_date,
+		           pp.created_at,
+		           pp.id,
+		           CASE
+		             WHEN pp.normalized_price IS NOT NULL
+		              AND pp.normalized_unit IS NOT NULL
+		              AND TRIM(pp.normalized_unit) <> ''
+		             THEN CAST(pp.normalized_price AS REAL)
+		             ELSE CAST(pp.unit_price AS REAL)
+		           END AS price,
+		           CASE
+		             WHEN pp.normalized_price IS NOT NULL
+		              AND pp.normalized_unit IS NOT NULL
+		              AND TRIM(pp.normalized_unit) <> ''
+		             THEN pp.normalized_unit
+		             ELSE pp.unit
+		           END AS price_unit
+		    FROM product_prices pp
+		),
+		unit_counts AS (
+		    SELECT product_id, price_unit, COUNT(*) AS n
+		    FROM priced
+		    GROUP BY product_id, price_unit
+		),
+		dominant_units AS (
+		    SELECT product_id, price_unit
+		    FROM (
+		        SELECT product_id, price_unit,
+		               ROW_NUMBER() OVER (
+		                   PARTITION BY product_id
+		                   ORDER BY n DESC, price_unit ASC
+		               ) AS rn
+		        FROM unit_counts
+		    )
+		    WHERE rn = 1
+		),
+		filtered AS (
+		    SELECT pr.*
+		    FROM priced pr
+		    JOIN dominant_units du ON du.product_id = pr.product_id
+		                          AND du.price_unit = pr.price_unit
+		),
+		latest_ranked AS (
+		    SELECT product_id, price,
+		           ROW_NUMBER() OVER (
+		               PARTITION BY product_id
+		               ORDER BY receipt_date DESC, created_at DESC, id DESC
+		           ) AS rn
+		    FROM filtered
+		),
+		latest AS (
+		    SELECT product_id, price FROM latest_ranked WHERE rn = 1
+		),
+		first_ranked AS (
+		    SELECT product_id, price,
+		           ROW_NUMBER() OVER (
+		               PARTITION BY product_id
+		               ORDER BY receipt_date ASC, created_at ASC, id ASC
+		           ) AS rn
+		    FROM filtered
+		),
+		firsts AS (
+		    SELECT product_id, price FROM first_ranked WHERE rn = 1
+		),
+		stats AS (
+		    SELECT product_id, AVG(price) AS avg_price
+		    FROM filtered
+		    GROUP BY product_id
+		)
 		SELECT p.id, p.name, p.category, p.last_purchased_at,
 		       COALESCE(latest.price, 0) as latest_price,
 		       COALESCE(stats.avg_price, 0) as avg_price,
-		       CASE WHEN COALESCE(stats.first_price, 0) > 0
-		            THEN ROUND(((COALESCE(latest.price, 0) - stats.first_price) / stats.first_price) * 100, 2)
+		       CASE WHEN COALESCE(firsts.price, 0) > 0
+		            THEN ROUND(((COALESCE(latest.price, 0) - firsts.price) / firsts.price) * 100, 2)
 		            ELSE 0 END as percent_change
 		FROM products p
-		LEFT JOIN (
-		    SELECT pp.product_id,
-		           MAX(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL))) as price
-		    FROM product_prices pp
-		    WHERE pp.receipt_date = (
-		        SELECT MAX(pp2.receipt_date)
-		        FROM product_prices pp2
-		        WHERE pp2.product_id = pp.product_id
-		    )
-		    GROUP BY pp.product_id
-		) latest ON latest.product_id = p.id
-		LEFT JOIN (
-		    SELECT pp.product_id,
-		           AVG(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL))) as avg_price,
-		           (SELECT COALESCE(CAST(pp3.normalized_price AS REAL), CAST(pp3.unit_price AS REAL))
-		            FROM product_prices pp3
-		            WHERE pp3.product_id = pp.product_id
-		            ORDER BY pp3.receipt_date ASC LIMIT 1) as first_price
-		    FROM product_prices pp
-		    GROUP BY pp.product_id
-		) stats ON stats.product_id = p.id
+		LEFT JOIN latest ON latest.product_id = p.id
+		LEFT JOIN firsts ON firsts.product_id = p.id
+		LEFT JOIN stats ON stats.product_id = p.id
 		WHERE p.household_id = ?
 		ORDER BY %s
 		LIMIT ? OFFSET ?`, orderClause)
@@ -467,14 +552,51 @@ func (h *AnalyticsHandler) StoreSummary(c echo.Context) error {
 
 	// Price leaders: top 5 cheapest products at this store (by avg normalized price).
 	leaderRows, err := h.DB.Query(
-		`SELECT pp.product_id, p.name,
-		        AVG(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL))) as avg_price
-		 FROM product_prices pp
-		 JOIN products p ON p.id = pp.product_id
-		 WHERE pp.store_id = ? AND p.household_id = ? AND p.is_non_product = 0
-		 GROUP BY pp.product_id
-		 ORDER BY avg_price ASC
-		 LIMIT 5`,
+		`WITH priced AS (
+		     SELECT pp.product_id,
+		            p.name,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN CAST(pp.normalized_price AS REAL)
+		              ELSE CAST(pp.unit_price AS REAL)
+		            END AS price,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN pp.normalized_unit
+		              ELSE pp.unit
+		            END AS price_unit
+		      FROM product_prices pp
+		      JOIN products p ON p.id = pp.product_id
+		      WHERE pp.store_id = ? AND p.household_id = ? AND p.is_non_product = 0
+		   ),
+		   unit_counts AS (
+		     SELECT product_id, price_unit, COUNT(*) AS n
+		     FROM priced
+		     GROUP BY product_id, price_unit
+		   ),
+		   dominant_units AS (
+		     SELECT product_id, price_unit
+		     FROM (
+		       SELECT product_id, price_unit,
+		              ROW_NUMBER() OVER (
+		                PARTITION BY product_id
+		                ORDER BY n DESC, price_unit ASC
+		              ) AS rn
+		       FROM unit_counts
+		     )
+		     WHERE rn = 1
+		   )
+		   SELECT pr.product_id, pr.name, AVG(pr.price) as avg_price
+		   FROM priced pr
+		   JOIN dominant_units du ON du.product_id = pr.product_id
+		                         AND du.price_unit = pr.price_unit
+		   GROUP BY pr.product_id, pr.name
+		   ORDER BY avg_price ASC
+		   LIMIT 5`,
 		storeID, householdID,
 	)
 	if err == nil {
@@ -577,28 +699,56 @@ func (h *AnalyticsHandler) Deals(c echo.Context) error {
 	}
 
 	rows, err := h.DB.Query(
-		`SELECT p.id, p.name, s.name,
-		        COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) as latest_price,
-		        stats.avg_price, latest_pp.is_sale
-		 FROM products p
-		 JOIN product_prices latest_pp ON latest_pp.product_id = p.id
-		   AND latest_pp.receipt_date = (
-		       SELECT MAX(pp2.receipt_date)
-		       FROM product_prices pp2
-		       WHERE pp2.product_id = p.id
-		   )
-		 JOIN stores s ON latest_pp.store_id = s.id
-		 JOIN (
-		     SELECT product_id,
-		            AVG(COALESCE(CAST(normalized_price AS REAL), CAST(unit_price AS REAL))) as avg_price
-		     FROM product_prices
-		     GROUP BY product_id
+		`WITH priced AS (
+		     SELECT p.id AS product_id,
+		            p.name AS product_name,
+		            s.name AS store_name,
+		            pp.receipt_date,
+		            pp.created_at,
+		            pp.id AS price_id,
+		            pp.is_sale,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN CAST(pp.normalized_price AS REAL)
+		              ELSE CAST(pp.unit_price AS REAL)
+		            END AS price,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN pp.normalized_unit
+		              ELSE pp.unit
+		            END AS price_unit
+		      FROM products p
+		      JOIN product_prices pp ON pp.product_id = p.id
+		      JOIN stores s ON pp.store_id = s.id
+		      WHERE p.household_id = ? AND p.is_non_product = 0
+		   ),
+		   latest AS (
+		     SELECT *,
+		            ROW_NUMBER() OVER (
+		              PARTITION BY product_id
+		              ORDER BY receipt_date DESC, created_at DESC, price_id DESC
+		            ) AS rn
+		     FROM priced
+		   ),
+		   stats AS (
+		     SELECT product_id, price_unit, AVG(price) AS avg_price, COUNT(*) AS n
+		     FROM priced
+		     GROUP BY product_id, price_unit
 		     HAVING COUNT(*) >= 2
-		 ) stats ON stats.product_id = p.id
-		 WHERE p.household_id = ? AND p.is_non_product = 0
-		   AND COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) < stats.avg_price * 0.85
-		 ORDER BY (1.0 - COALESCE(CAST(latest_pp.normalized_price AS REAL), CAST(latest_pp.unit_price AS REAL)) / stats.avg_price) DESC
-		 LIMIT ? OFFSET ?`,
+		   )
+		   SELECT latest.product_id, latest.product_name, latest.store_name,
+		          latest.price as latest_price, stats.avg_price, latest.is_sale
+		   FROM latest
+		   JOIN stats ON stats.product_id = latest.product_id
+		             AND stats.price_unit = latest.price_unit
+		   WHERE latest.rn = 1
+		     AND latest.price < stats.avg_price * 0.85
+		   ORDER BY (1.0 - latest.price / stats.avg_price) DESC
+		   LIMIT ? OFFSET ?`,
 		householdID, limit, offset,
 	)
 	if err != nil {
@@ -647,14 +797,46 @@ func (h *AnalyticsHandler) GroupTrend(c echo.Context) error {
 
 	// Price history for all group members (last 6 months).
 	rows, err := h.DB.Query(
-		`SELECT pp.receipt_date,
-		        COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price,
-		        s.name, pp.is_sale
-		 FROM product_prices pp
-		 JOIN products p ON pp.product_id = p.id
-		 JOIN stores s ON pp.store_id = s.id
-		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?
-		 ORDER BY pp.receipt_date ASC`,
+		`WITH priced AS (
+		     SELECT pp.receipt_date,
+		            pp.created_at,
+		            pp.id,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN CAST(pp.normalized_price AS REAL)
+		              ELSE CAST(pp.unit_price AS REAL)
+		            END AS price,
+		            CASE
+		              WHEN pp.normalized_price IS NOT NULL
+		               AND pp.normalized_unit IS NOT NULL
+		               AND TRIM(pp.normalized_unit) <> ''
+		              THEN pp.normalized_unit
+		              ELSE pp.unit
+		            END AS price_unit,
+		            s.name AS store_name,
+		            pp.is_sale
+		      FROM product_prices pp
+		      JOIN products p ON pp.product_id = p.id
+		      JOIN stores s ON pp.store_id = s.id
+		      WHERE p.product_group_id = ? AND pp.receipt_date >= ?
+		   ),
+		   unit_counts AS (
+		     SELECT price_unit, COUNT(*) AS n
+		     FROM priced
+		     GROUP BY price_unit
+		   ),
+		   dominant AS (
+		     SELECT price_unit
+		     FROM unit_counts
+		     ORDER BY n DESC, price_unit ASC
+		     LIMIT 1
+		   )
+		   SELECT receipt_date, price, store_name, is_sale
+		   FROM priced
+		   WHERE price_unit = (SELECT price_unit FROM dominant)
+		   ORDER BY receipt_date ASC, created_at ASC, id ASC`,
 		groupID, sixMonthsAgo,
 	)
 	if err != nil {
@@ -679,45 +861,7 @@ func (h *AnalyticsHandler) GroupTrend(c echo.Context) error {
 	resp := productTrendResponse{
 		PriceHistory: history,
 	}
-
-	// Percent change: first vs last in the window.
-	if len(history) >= 2 {
-		first := history[0].NormalizedPrice
-		last := history[len(history)-1].NormalizedPrice
-		if first > 0 {
-			resp.PercentChange = math.Round(((last-first)/first)*10000) / 100
-		}
-	}
-
-	// Min/max/avg with store names.
-	h.DB.QueryRow(
-		`SELECT COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price, s.name
-		 FROM product_prices pp
-		 JOIN products p ON pp.product_id = p.id
-		 JOIN stores s ON pp.store_id = s.id
-		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?
-		 ORDER BY price ASC LIMIT 1`,
-		groupID, sixMonthsAgo,
-	).Scan(&resp.MinPrice, &resp.MinStore)
-
-	h.DB.QueryRow(
-		`SELECT COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) as price, s.name
-		 FROM product_prices pp
-		 JOIN products p ON pp.product_id = p.id
-		 JOIN stores s ON pp.store_id = s.id
-		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?
-		 ORDER BY price DESC LIMIT 1`,
-		groupID, sixMonthsAgo,
-	).Scan(&resp.MaxPrice, &resp.MaxStore)
-
-	h.DB.QueryRow(
-		`SELECT AVG(COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)))
-		 FROM product_prices pp
-		 JOIN products p ON pp.product_id = p.id
-		 WHERE p.product_group_id = ? AND pp.receipt_date >= ?`,
-		groupID, sixMonthsAgo,
-	).Scan(&resp.AvgPrice)
-	resp.AvgPrice = math.Round(resp.AvgPrice*100) / 100
+	finalizeProductTrendStats(&resp)
 
 	return c.JSON(http.StatusOK, resp)
 }
@@ -1293,64 +1437,75 @@ type priceMovesResponse struct {
 // considered noise and excluded.
 const priceMoveThresholdPct = 10.0
 
-// qPriceMoves is the SQL for computing average unit price per product in two
-// rolling windows. All date boundaries are passed as ? parameters — plan
-// Invariant: date windows are computed in Go (time.Now().UTC()), never via
-// SQLite DATE('now', ...). WHERE adds r.status IN ('pending','matched','reviewed')
-// and p.is_non_product = 0 per plan Invariants 3 and 5. HAVING requires
-// COUNT(DISTINCT DATE(receipt_date)) >= 3 for a meaningful price trajectory.
-// Price values use COALESCE(normalized_price, unit_price): spreadsheet-imported
-// rows and unmatched inserts populate unit_price but leave normalized_price NULL,
-// so this fallback ensures those rows participate in price-move detection.
-// NOTE: the query returns all products with a calculable pct_change; the
-// priceMoveThresholdPct (10%) filter is applied in Go after scanning rows.
-// Parameter order: cutoff30 (x7 SELECT), householdID, cutoff90, today,
-// cutoff30 (x7 HAVING).
+// qPriceMoves computes average comparable price per product in two rolling
+// windows. When a row has both normalized_price and normalized_unit, that pair is
+// treated as authoritative; otherwise the raw unit_price/unit pair is used so
+// spreadsheet-imported rows still participate. Grouping by the effective unit
+// prevents mixed "$/each" and "$/oz" histories from producing false moves.
+// Parameter order: householdID, cutoff90, today, cutoff30 (x7 SELECT),
+// cutoff30 (x3 HAVING).
 const qPriceMoves = `
+WITH priced AS (
+    SELECT
+        p.id AS product_id,
+        p.name,
+        CASE
+            WHEN pp.normalized_price IS NOT NULL
+             AND pp.normalized_unit IS NOT NULL
+             AND TRIM(pp.normalized_unit) <> ''
+            THEN pp.normalized_unit
+            ELSE pp.unit
+        END AS price_unit,
+        CASE
+            WHEN pp.normalized_price IS NOT NULL
+             AND pp.normalized_unit IS NOT NULL
+             AND TRIM(pp.normalized_unit) <> ''
+            THEN CAST(pp.normalized_price AS REAL)
+            ELSE CAST(pp.unit_price AS REAL)
+        END AS price,
+        pp.receipt_date
+    FROM product_prices pp
+    JOIN receipts r ON r.id = pp.receipt_id
+    JOIN products p  ON p.id = pp.product_id
+    WHERE
+        r.household_id = ?
+        AND pp.receipt_date >= ?
+        AND pp.receipt_date <  ?
+        AND r.status IN ('pending', 'matched', 'reviewed')
+        AND p.is_non_product = 0
+)
 SELECT
-    p.id            AS product_id,
-    p.name,
-    pp.unit,
-    AVG(CASE WHEN pp.receipt_date >= ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) AS avg_030d,
-    AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) AS avg_3090d,
+    product_id,
+    name,
+    price_unit AS unit,
+    AVG(CASE WHEN receipt_date >= ? THEN price END) AS avg_030d,
+    AVG(CASE WHEN receipt_date <  ? THEN price END) AS avg_3090d,
     ROUND(
-        (AVG(CASE WHEN pp.receipt_date >= ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) -
-         AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END)) /
-        AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) * 100
+        (AVG(CASE WHEN receipt_date >= ? THEN price END) -
+         AVG(CASE WHEN receipt_date <  ? THEN price END)) /
+        AVG(CASE WHEN receipt_date <  ? THEN price END) * 100
     , 2) AS pct_change,
-    COUNT(CASE WHEN pp.receipt_date >= ? THEN 1 END) AS observations_recent,
-    COUNT(CASE WHEN pp.receipt_date <  ? THEN 1 END) AS observations_prior
-FROM product_prices pp
-JOIN receipts r ON r.id = pp.receipt_id
-JOIN products p  ON p.id = pp.product_id
-WHERE
-    r.household_id = ?
-    AND pp.receipt_date >= ?
-    AND pp.receipt_date <  ?
-    AND COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) > 0
-    AND r.status IN ('pending', 'matched', 'reviewed')
-    AND p.is_non_product = 0
-GROUP BY p.id, p.name, pp.unit
+    COUNT(CASE WHEN receipt_date >= ? THEN 1 END) AS observations_recent,
+    COUNT(CASE WHEN receipt_date <  ? THEN 1 END) AS observations_prior
+FROM priced
+WHERE price > 0
+GROUP BY product_id, name, price_unit
 HAVING
-    COUNT(DISTINCT DATE(pp.receipt_date)) >= 3
-    AND COUNT(CASE WHEN pp.receipt_date >= ? THEN 1 END) >= 1
-    AND COUNT(CASE WHEN pp.receipt_date <  ? THEN 1 END) >= 1
-    AND AVG(CASE WHEN pp.receipt_date <  ? THEN COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) END) > 0
-    AND COUNT(DISTINCT CASE WHEN pp.receipt_date >= ? THEN pp.unit END) = 1
-    AND COUNT(DISTINCT CASE WHEN pp.receipt_date <  ? THEN pp.unit END) = 1
-    AND MAX(CASE WHEN pp.receipt_date >= ? THEN pp.unit END)
-        = MAX(CASE WHEN pp.receipt_date <  ? THEN pp.unit END)
-ORDER BY observations_recent DESC, p.id ASC`
+    COUNT(DISTINCT DATE(receipt_date)) >= 3
+    AND COUNT(CASE WHEN receipt_date >= ? THEN 1 END) >= 1
+    AND COUNT(CASE WHEN receipt_date <  ? THEN 1 END) >= 1
+    AND AVG(CASE WHEN receipt_date <  ? THEN price END) > 0
+ORDER BY observations_recent DESC, product_id ASC`
 
 // PriceMoves returns products whose unit price has shifted by >=10% between
-// the last 30 days (recent window) and the 31–90 day window (prior). The price
-// used is COALESCE(normalized_price, unit_price) so that spreadsheet-imported
-// rows (which carry unit_price but no normalized_price) are included alongside
-// scanner-extracted rows. Only products whose unit is identical across both
-// windows are compared, ensuring apples-to-apples comparison (e.g. "$/lb" vs
-// "$/ea" are never mixed). Requires >=3 distinct dates in the 90-day window for
-// signal confidence. Results are split into "up" and "down" slices, each sorted
-// by |pct_change| descending and capped at 5 items per direction.
+// the last 30 days (recent window) and the 31-90 day window (prior). The price
+// used is the normalized price/unit when both fields are present, falling back
+// to unit_price/unit so spreadsheet-imported rows are included. Only histories
+// sharing an effective unit are compared, ensuring apples-to-apples comparison
+// (for example, "$/oz" vs "$/each" are never mixed). Requires >=3 distinct dates
+// in the 90-day window for signal confidence. Results are split into "up" and
+// "down" slices, each sorted by |pct_change| descending and capped at 5 items
+// per direction.
 // GET /api/v1/analytics/price-moves
 func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
 	ctx := c.Request().Context()
@@ -1362,9 +1517,9 @@ func (h *AnalyticsHandler) PriceMoves(c echo.Context) error {
 	cutoff90 := now.AddDate(0, 0, -90).Format("2006-01-02")
 
 	rows, err := h.DB.QueryContext(ctx, qPriceMoves,
-		cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30,
 		householdID, cutoff90, today,
 		cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30, cutoff30,
+		cutoff30, cutoff30, cutoff30,
 	)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "database error")
@@ -1548,6 +1703,7 @@ type inflationResponse struct {
 // inflationObs is a single price/quantity observation row from SQL-C.
 type inflationObs struct {
 	productID string
+	unit      string
 	price     float64
 	qty       float64
 	date      time.Time
@@ -1564,14 +1720,29 @@ WHERE r.household_id = ?
   AND r.status IN ('pending', 'matched', 'reviewed')`
 
 // qInflationPrices fetches price + qty for all basket products over the last
-// 210 days. Buckets are computed in Go.
+// 210 days. Buckets are computed in Go. Price/unit follows the same effective
+// comparable pair as price moves: normalized_price/normalized_unit when both are
+// present, otherwise raw unit_price/unit.
 // Placeholders: householdID, cutoff210 (YYYY-MM-DD), tomorrow (YYYY-MM-DD).
 const qInflationPrices = `
 SELECT
   pp.product_id,
   pp.receipt_date,
-  COALESCE(CAST(pp.normalized_price AS REAL), CAST(pp.unit_price AS REAL)) AS price,
-  CAST(pp.quantity AS REAL)                                                 AS qty
+  CASE
+    WHEN pp.normalized_price IS NOT NULL
+     AND pp.normalized_unit IS NOT NULL
+     AND TRIM(pp.normalized_unit) <> ''
+    THEN CAST(pp.normalized_price AS REAL)
+    ELSE CAST(pp.unit_price AS REAL)
+  END AS price,
+  CASE
+    WHEN pp.normalized_price IS NOT NULL
+     AND pp.normalized_unit IS NOT NULL
+     AND TRIM(pp.normalized_unit) <> ''
+    THEN pp.normalized_unit
+    ELSE pp.unit
+  END AS unit,
+  CAST(pp.quantity AS REAL) AS qty
 FROM product_prices pp
 JOIN products p ON p.id = pp.product_id
 JOIN receipts r ON r.id = pp.receipt_id
@@ -1593,6 +1764,31 @@ func median(sorted []float64) float64 {
 		return sorted[n/2]
 	}
 	return (sorted[n/2-1] + sorted[n/2]) / 2
+}
+
+func dominantInflationUnit(obs []inflationObs) string {
+	counts := make(map[string]int)
+	best := ""
+	bestCount := 0
+	for _, o := range obs {
+		counts[o.unit]++
+		count := counts[o.unit]
+		if count > bestCount || (count == bestCount && (best == "" || o.unit < best)) {
+			best = o.unit
+			bestCount = count
+		}
+	}
+	return best
+}
+
+func filterInflationObsByUnit(obs []inflationObs, unit string) []inflationObs {
+	filtered := make([]inflationObs, 0, len(obs))
+	for _, o := range obs {
+		if o.unit == unit {
+			filtered = append(filtered, o)
+		}
+	}
+	return filtered
 }
 
 // Inflation returns a Laspeyres-style personal inflation index comparing the
@@ -1677,7 +1873,7 @@ func (h *AnalyticsHandler) Inflation(c echo.Context) error {
 	for priceRows.Next() {
 		var o inflationObs
 		var receiptDate string
-		if err := priceRows.Scan(&o.productID, &receiptDate, &o.price, &o.qty); err != nil {
+		if err := priceRows.Scan(&o.productID, &receiptDate, &o.price, &o.unit, &o.qty); err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "database error")
 		}
 		t, err := time.Parse("2006-01-02", receiptDate)
@@ -1709,10 +1905,10 @@ func (h *AnalyticsHandler) Inflation(c echo.Context) error {
 	//   qty_p  — median quantity from Q_90d [now-90, now); fallback to all-time if < 2 obs.
 	//   avg price in W_current [now-30, now), W_3mo [now-120, now-90), W_6mo [now-210, now-180).
 	type productStats struct {
-		qty      float64
-		avgCur   *float64 // W_current avg price
-		avg3mo   *float64 // W_3mo avg price
-		avg6mo   *float64 // W_6mo avg price
+		qty    float64
+		avgCur *float64 // W_current avg price
+		avg3mo *float64 // W_3mo avg price
+		avg6mo *float64 // W_6mo avg price
 	}
 
 	avgOf := func(obs []inflationObs, from, to time.Time) *float64 {
@@ -1733,9 +1929,12 @@ func (h *AnalyticsHandler) Inflation(c echo.Context) error {
 
 	stats := make(map[string]productStats, basketSize)
 	for id, pd := range byProduct {
+		unit := dominantInflationUnit(pd.obs)
+		obs := filterInflationObsByUnit(pd.obs, unit)
+
 		// Compute qty_p from Q_90d: [cutoff90, tomorrow)
 		var qtyQ90 []float64
-		for _, o := range pd.obs {
+		for _, o := range obs {
 			if !o.date.Before(cutoff90T) && o.date.Before(tomorrowT) {
 				qtyQ90 = append(qtyQ90, o.qty)
 			}
@@ -1745,7 +1944,7 @@ func (h *AnalyticsHandler) Inflation(c echo.Context) error {
 			qtySrc = qtyQ90
 		} else {
 			// Fallback to all-time (all rows in SQL-C 210d window).
-			for _, o := range pd.obs {
+			for _, o := range obs {
 				qtySrc = append(qtySrc, o.qty)
 			}
 		}
@@ -1755,9 +1954,9 @@ func (h *AnalyticsHandler) Inflation(c echo.Context) error {
 		sort.Float64s(qtySrc)
 		qtyP := median(qtySrc)
 
-		avgCur := avgOf(pd.obs, cutoff30T, tomorrowT)
-		avg3mo := avgOf(pd.obs, cutoff120T, cutoff90T)
-		avg6mo := avgOf(pd.obs, cutoff210T, cutoff180T)
+		avgCur := avgOf(obs, cutoff30T, tomorrowT)
+		avg3mo := avgOf(obs, cutoff120T, cutoff90T)
+		avg6mo := avgOf(obs, cutoff210T, cutoff180T)
 
 		stats[id] = productStats{qty: qtyP, avgCur: avgCur, avg3mo: avg3mo, avg6mo: avg6mo}
 	}

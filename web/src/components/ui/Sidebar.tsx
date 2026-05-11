@@ -12,6 +12,7 @@ import {
   ShoppingCart,
   Store,
   ScanLine,
+  Table2,
   Plus,
   PencilLine,
   ClipboardCheck,
@@ -39,24 +40,32 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
 
 type IconComponent = ComponentType<LucideProps>
 
-const pageLinks: { to: string; label: string; Icon: IconComponent }[] = [
+interface PageLink {
+  to: string
+  label: string
+  Icon: IconComponent
+  end?: boolean
+}
+
+const pageLinks: PageLink[] = [
   { to: '/analytics', label: 'Analytics', Icon: BarChart3 },
   { to: '/review', label: 'Review', Icon: ClipboardCheck },
   { to: '/products', label: 'Products', Icon: Package },
   { to: '/rules', label: 'Auto-Match', Icon: Wand2 },
-  { to: '/receipts', label: 'Receipts', Icon: Receipt },
+  { to: '/receipts', label: 'Receipts', Icon: Receipt, end: true },
+  { to: '/receipts/compare', label: 'Compare', Icon: Table2 },
 ]
 
 // Import is gated on having at least one configured+enabled integration. It's
 // appended dynamically inside the component so useHasIntegrations hides it
 // during load (no flash-show) and when no integration is connected.
-const IMPORT_LINK: { to: string; label: string; Icon: IconComponent } = {
+const IMPORT_LINK: PageLink = {
   to: '/import',
   label: 'Import',
   Icon: Upload,
 }
 
-const ADMIN_INVITES_LINK: { to: string; label: string; Icon: IconComponent } = {
+const ADMIN_INVITES_LINK: PageLink = {
   to: '/admin/invites',
   label: 'Invites',
   Icon: UserPlus,
@@ -94,7 +103,7 @@ function Sidebar({ open, onClose }: SidebarProps) {
   const { hasAny: hasIntegrations, isLoading: integrationsLoading } = useHasIntegrations()
   // While loading, hide the Import link entirely so it doesn't flash in and
   // then disappear once we learn there are no configured integrations.
-  const adminLinks = user?.is_admin ? [ADMIN_INVITES_LINK] : []
+  const adminLinks: PageLink[] = user?.is_admin ? [ADMIN_INVITES_LINK] : []
   const visiblePageLinks = !integrationsLoading && hasIntegrations
     ? [...pageLinks, ...adminLinks, IMPORT_LINK]
     : [...pageLinks, ...adminLinks]
@@ -229,7 +238,13 @@ function Sidebar({ open, onClose }: SidebarProps) {
           </p>
           <div className="flex flex-col gap-0.5">
             {visiblePageLinks.map((link) => (
-              <NavLink key={link.to} to={link.to} className={navLinkClass} onClick={onClose}>
+              <NavLink
+                key={link.to}
+                to={link.to}
+                className={navLinkClass}
+                onClick={onClose}
+                end={link.end}
+              >
                 <link.Icon size={ICON_SIZE} aria-hidden="true" />
                 <span className="flex-1">{link.label}</span>
                 {link.to === '/review' && unmatchedCount > 0 && (

@@ -16,6 +16,10 @@ import (
 )
 
 func newMiddlewareTestDB(t *testing.T) *sql.DB {
+	return newMiddlewareTestDBAt(t, time.Now().UTC().Add(-30*time.Minute))
+}
+
+func newMiddlewareTestDBAt(t *testing.T, passwordChangedAt time.Time) *sql.DB {
 	t.Helper()
 	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -32,13 +36,13 @@ func newMiddlewareTestDB(t *testing.T) *sql.DB {
 	}
 	if _, err := database.Exec(
 		"INSERT INTO users (id, household_id, email, name, password_hash, is_admin, password_changed_at) VALUES ('admin', 'hh', 'admin@example.com', 'Admin', 'hash', 1, ?)",
-		SQLiteDateTime(time.Date(2026, 5, 9, 12, 1, 0, 0, time.UTC)),
+		SQLiteDateTime(passwordChangedAt),
 	); err != nil {
 		t.Fatalf("seed admin: %v", err)
 	}
 	if _, err := database.Exec(
 		"INSERT INTO users (id, household_id, email, name, password_hash, is_admin, password_changed_at) VALUES ('user', 'hh', 'user@example.com', 'User', 'hash', 0, ?)",
-		SQLiteDateTime(time.Date(2026, 5, 9, 12, 1, 0, 0, time.UTC)),
+		SQLiteDateTime(passwordChangedAt),
 	); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
@@ -131,12 +135,13 @@ func TestRequireAdmin_RejectsMissingUserID(t *testing.T) {
 }
 
 func TestJWTMiddlewareRejectsTokenIssuedBeforePasswordChange(t *testing.T) {
-	database := newMiddlewareTestDB(t)
+	passwordChangedAt := time.Now().UTC().Add(-30 * time.Minute)
+	database := newMiddlewareTestDBAt(t, passwordChangedAt)
 	const secret = "test-secret"
 
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
-	req.Header.Set("Authorization", "Bearer "+authTokenAt(t, secret, time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)))
+	req.Header.Set("Authorization", "Bearer "+authTokenAt(t, secret, passwordChangedAt.Add(-time.Minute)))
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
@@ -152,12 +157,13 @@ func TestJWTMiddlewareRejectsTokenIssuedBeforePasswordChange(t *testing.T) {
 }
 
 func TestJWTMiddlewareAcceptsTokenIssuedAfterPasswordChange(t *testing.T) {
-	database := newMiddlewareTestDB(t)
+	passwordChangedAt := time.Now().UTC().Add(-30 * time.Minute)
+	database := newMiddlewareTestDBAt(t, passwordChangedAt)
 	const secret = "test-secret"
 
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
-	req.Header.Set("Authorization", "Bearer "+authTokenAt(t, secret, time.Date(2026, 5, 9, 12, 2, 0, 0, time.UTC)))
+	req.Header.Set("Authorization", "Bearer "+authTokenAt(t, secret, passwordChangedAt.Add(time.Minute)))
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/search"
 	"github.com/mstefanko/cartledger/internal/storage"
 )
@@ -119,6 +121,8 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products.POST("", h.Create)
 	products.PUT("/:id", h.Update)
 	products.DELETE("/:id", h.Delete)
+	products.GET("/:id/recompute-prices/preview", h.RecomputePricesPreview)
+	products.POST("/:id/recompute-prices", h.RecomputePrices)
 	products.POST("/:id/images", h.UploadImage)
 	products.DELETE("/:id/images/:imageId", h.DeleteImage)
 	products.GET("/:id/links", h.ListLinks)
@@ -392,6 +396,108 @@ func (h *ProductHandler) Update(c echo.Context) error {
 	return c.JSON(http.StatusOK, p)
 }
 
+type recomputePricesPreviewResponse struct {
+	AffectedCount int `json:"affected_count"`
+}
+
+type recomputePricesResponse struct {
+	UpdatedCount int `json:"updated_count"`
+}
+
+// RecomputePricesPreview returns the count of linked historical purchases that
+// can be recomputed from their source line items.
+// GET /api/v1/products/:id/recompute-prices/preview
+func (h *ProductHandler) RecomputePricesPreview(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+
+	if err := h.verifyProduct(c.Request().Context(), productID, householdID); err != nil {
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	lineItemIDs, err := h.linkedLineItemsForProduct(c.Request().Context(), productID, householdID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	return c.JSON(http.StatusOK, recomputePricesPreviewResponse{AffectedCount: len(lineItemIDs)})
+}
+
+// RecomputePrices recomputes linked product_prices rows from their line items.
+// POST /api/v1/products/:id/recompute-prices
+func (h *ProductHandler) RecomputePrices(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+
+	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	lineItemIDs, err := h.linkedLineItemsForProduct(ctx, productID, householdID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	for _, lineItemID := range lineItemIDs {
+		if err := prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to recompute price history"})
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+	return c.JSON(http.StatusOK, recomputePricesResponse{UpdatedCount: len(lineItemIDs)})
+}
+
+func (h *ProductHandler) verifyProduct(ctx context.Context, productID, householdID string) error {
+	var exists int
+	return h.DB.QueryRowContext(ctx,
+		"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+		productID, householdID,
+	).Scan(&exists)
+}
+
+func (h *ProductHandler) linkedLineItemsForProduct(ctx context.Context, productID, householdID string) ([]string, error) {
+	rows, err := h.DB.QueryContext(ctx,
+		`SELECT li.id
+		   FROM line_items li
+		   JOIN receipts r ON r.id = li.receipt_id
+		   JOIN product_prices pp ON pp.line_item_id = li.id
+		  WHERE li.product_id = ?
+		    AND r.household_id = ?
+		    AND r.store_id IS NOT NULL
+		  ORDER BY r.receipt_date DESC, li.line_number, li.id`,
+		productID, householdID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // Delete removes a product and all dependent records in a single transaction.
 // Line items that referenced this product are unmatched (product_id set to NULL).
 // DELETE /api/v1/products/:id
@@ -428,7 +534,7 @@ func (h *ProductHandler) Delete(c echo.Context) error {
 
 	// 3. Unmatch line_items that reference this product.
 	if _, err := tx.Exec(
-		"UPDATE line_items SET product_id = NULL, matched = 'unmatched', confidence = NULL WHERE product_id = ?",
+		"UPDATE line_items SET product_id = NULL, matched = 'unmatched', confidence = NULL, review_status = 'pending' WHERE product_id = ?",
 		productID,
 	); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

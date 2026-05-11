@@ -122,6 +122,33 @@ func insertPMPriceNullNorm(t *testing.T, ah *AnalyticsHandler, householdID, stor
 	}
 }
 
+func insertPMPriceWithNormalizedUnit(t *testing.T, ah *AnalyticsHandler, householdID, storeID, productID, daysOffset, unitPrice, unit, normalizedPrice, normalizedUnit string) {
+	t.Helper()
+	d := ah.DB
+
+	var receiptID string
+	if err := d.QueryRow("SELECT lower(hex(randomblob(16)))").Scan(&receiptID); err != nil {
+		t.Fatalf("gen receipt id: %v", err)
+	}
+	var receiptDate string
+	if err := d.QueryRow("SELECT date('now', ?)", daysOffset).Scan(&receiptDate); err != nil {
+		t.Fatalf("compute date: %v", err)
+	}
+	if _, err := d.Exec(
+		"INSERT INTO receipts (id, household_id, store_id, receipt_date, total, status) VALUES (?, ?, ?, ?, '10.00', 'matched')",
+		receiptID, householdID, storeID, receiptDate,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO product_prices (product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, normalized_price, normalized_unit)
+		 VALUES (?, ?, ?, ?, '1', ?, ?, ?, ?)`,
+		productID, storeID, receiptID, receiptDate, unit, unitPrice, normalizedPrice, normalizedUnit,
+	); err != nil {
+		t.Fatalf("insert product_prices: %v", err)
+	}
+}
+
 // findPMItem returns the priceMoveItem matching productID from a slice, or nil.
 func findPMItem(items []priceMoveItem, productID string) *priceMoveItem {
 	for i := range items {
@@ -341,6 +368,55 @@ func TestPriceMoves_UnitMismatch(t *testing.T) {
 
 	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
 		t.Error("unit-mismatch product should be excluded")
+	}
+}
+
+func TestPriceMoves_UsesNormalizedUnitWhenPresent(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PMNormUnit")
+	productID := insertPMProduct(t, ah, householdID, "Ground Coffee")
+
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-5 days", "6.40", "each", "0.20", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-10 days", "6.40", "each", "0.20", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-15 days", "6.40", "each", "0.20", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-40 days", "3.20", "each", "0.10", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-50 days", "3.20", "each", "0.10", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-60 days", "3.20", "each", "0.10", "oz")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	it := findPMItem(resp.Up, productID)
+	if it == nil {
+		t.Fatalf("expected normalized-unit product in Up list; Up=%v Down=%v", resp.Up, resp.Down)
+	}
+	if it.Unit != "oz" {
+		t.Fatalf("expected effective unit oz, got %q", it.Unit)
+	}
+	if it.PctChange != 100.00 {
+		t.Errorf("pct_change: expected 100.00, got %f", it.PctChange)
+	}
+}
+
+func TestPriceMoves_EffectiveUnitMismatchExcluded(t *testing.T) {
+	ah, cleanup := newAnalyticsHandler(t)
+	defer cleanup()
+
+	householdID, storeID := newPMHousehold(t, ah, "PMEffectiveMismatch")
+	productID := insertPMProduct(t, ah, householdID, "Chocolate")
+
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-5 days", "6.40", "each", "0.20", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-10 days", "6.40", "each", "0.20", "oz")
+	insertPMPriceWithNormalizedUnit(t, ah, householdID, storeID, productID, "-15 days", "6.40", "each", "0.20", "oz")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -40, "3.20", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -50, "3.20", "each")
+	insertPMPriceNullNorm(t, ah, householdID, storeID, productID, -60, "3.20", "each")
+
+	resp := callPriceMoves(t, ah, householdID)
+
+	if findPMItem(resp.Up, productID) != nil || findPMItem(resp.Down, productID) != nil {
+		t.Error("product with mismatched effective units should be excluded")
 	}
 }
 

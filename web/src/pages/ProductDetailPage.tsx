@@ -6,6 +6,8 @@ import {
   getProductUsage,
   deleteProduct,
   updateProduct,
+  previewProductPriceRecompute,
+  recomputeProductPrices,
   uploadProductImage,
   deleteProductImage,
   createProductAlias,
@@ -39,6 +41,28 @@ function pctChange(history: ProductDetail['price_history']): { pct: number; dire
   return { pct: Math.abs(Math.round(pct)), direction: pct > 0.5 ? 'up' : pct < -0.5 ? 'down' : 'flat' }
 }
 
+function canonicalUnitPreview(unit: string): string {
+  const normalized = unit.trim().toLowerCase().replace(/\s+/g, ' ')
+  const aliases: Record<string, string> = {
+    pounds: 'lb',
+    pound: 'lb',
+    lbs: 'lb',
+    ounces: 'oz',
+    ounce: 'oz',
+    gallons: 'gal',
+    gallon: 'gal',
+    'fluid ounces': 'fl_oz',
+    'fluid ounce': 'fl_oz',
+    'fl oz': 'fl_oz',
+    floz: 'fl_oz',
+    each: 'each',
+    ea: 'each',
+    ct: 'each',
+    count: 'each',
+  }
+  return aliases[normalized] ?? normalized
+}
+
 // --- Sub-components ---
 
 function ProductInfoSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
@@ -46,6 +70,8 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   const [brand, setBrand] = useState(detail.product.brand ?? '')
   const [packQuantity, setPackQuantity] = useState(detail.product.pack_quantity?.toString() ?? '')
   const [packUnit, setPackUnit] = useState(detail.product.pack_unit ?? '')
+  const [confirmMode, setConfirmMode] = useState<'save' | 'recompute' | null>(null)
+  const [affectedCount, setAffectedCount] = useState<number | null>(null)
 
   const updateMutation = useMutation({
     mutationFn: (data: { brand?: string; pack_quantity?: number; pack_unit?: string }) =>
@@ -59,13 +85,62 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
     updateMutation.mutate({ brand: brand || undefined })
   }, [brand, updateMutation])
 
-  const handleSavePackInfo = useCallback(() => {
+  const previewMutation = useMutation({
+    mutationFn: () => previewProductPriceRecompute(productId),
+    onSuccess: (data) => {
+      setAffectedCount(data.affected_count)
+    },
+  })
+
+  const recomputeMutation = useMutation({
+    mutationFn: () => recomputeProductPrices(productId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      setConfirmMode(null)
+      setAffectedCount(null)
+    },
+  })
+
+  const packPayload = useCallback(() => {
     const qty = packQuantity ? parseFloat(packQuantity) : undefined
-    updateMutation.mutate({
+    return {
       pack_quantity: qty,
       pack_unit: packUnit || undefined,
+    }
+  }, [packQuantity, packUnit])
+
+  const openSaveConfirm = useCallback(() => {
+    setConfirmMode('save')
+    setAffectedCount(null)
+    previewMutation.mutate()
+  }, [previewMutation])
+
+  const openRecomputeConfirm = useCallback(() => {
+    setConfirmMode('recompute')
+    setAffectedCount(null)
+    previewMutation.mutate()
+  }, [previewMutation])
+
+  const handleSaveOnly = useCallback(() => {
+    updateMutation.mutate(packPayload(), {
+      onSuccess: () => {
+        setConfirmMode(null)
+        setAffectedCount(null)
+      },
     })
-  }, [packQuantity, packUnit, updateMutation])
+  }, [packPayload, updateMutation])
+
+  const handleSaveAndRecompute = useCallback(() => {
+    updateMutation.mutate(packPayload(), {
+      onSuccess: () => {
+        recomputeMutation.mutate()
+      },
+    })
+  }, [packPayload, updateMutation, recomputeMutation])
+
+  const handleRecomputeOnly = useCallback(() => {
+    recomputeMutation.mutate()
+  }, [recomputeMutation])
 
   // Compute price per unit from latest price
   const latestPrice = detail.price_history.length > 0
@@ -75,68 +150,129 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   const pricePerUnit = (latestPrice && packQty && packQty > 0)
     ? latestPrice / packQty
     : null
+  const latestNormalized = detail.price_history.find((entry) => entry.normalized_price && entry.normalized_unit)
+  const packChanged =
+    packQuantity !== (detail.product.pack_quantity?.toString() ?? '') ||
+    packUnit !== (detail.product.pack_unit ?? '')
+  const canonicalUnit = packUnit.trim() ? canonicalUnitPreview(packUnit) : ''
+  const savingPack = updateMutation.isPending || recomputeMutation.isPending
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Product Info</h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {/* Brand */}
-        <div>
-          <label className="block text-small font-medium text-neutral-400 mb-1">Brand</label>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={brand}
-              onChange={(e) => setBrand(e.target.value)}
-              placeholder="e.g., Kirkland, Great Value"
-              className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
-              onBlur={handleSaveBrand}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBrand() }}
-            />
+    <>
+      <div className="bg-white rounded-2xl shadow-subtle p-5">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Product Info</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {/* Brand */}
+          <div>
+            <label className="block text-small font-medium text-neutral-400 mb-1">Brand</label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={brand}
+                onChange={(e) => setBrand(e.target.value)}
+                placeholder="e.g., Kirkland, Great Value"
+                className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                onBlur={handleSaveBrand}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBrand() }}
+              />
+            </div>
+          </div>
+
+          {/* Pack Quantity */}
+          <div>
+            <label className="block text-small font-medium text-neutral-400 mb-1">Package size</label>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                value={packQuantity}
+                onChange={(e) => setPackQuantity(e.target.value)}
+                placeholder="e.g., 12"
+                min="0"
+                step="any"
+                className="w-24 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                onKeyDown={(e) => { if (e.key === 'Enter' && packChanged) openSaveConfirm() }}
+              />
+              <input
+                type="text"
+                value={packUnit}
+                onChange={(e) => setPackUnit(e.target.value)}
+                placeholder="unit (e.g., oz, ct)"
+                className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                onKeyDown={(e) => { if (e.key === 'Enter' && packChanged) openSaveConfirm() }}
+              />
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-small text-neutral-400">
+              <span>Used for price comparisons</span>
+              {canonicalUnit && <span>Canonical: {canonicalUnit}</span>}
+            </div>
           </div>
         </div>
 
-        {/* Pack Quantity */}
-        <div>
-          <label className="block text-small font-medium text-neutral-400 mb-1">Pack Size</label>
-          <div className="flex gap-2">
-            <input
-              type="number"
-              value={packQuantity}
-              onChange={(e) => setPackQuantity(e.target.value)}
-              placeholder="e.g., 12"
-              min="0"
-              step="any"
-              className="w-24 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
-              onBlur={handleSavePackInfo}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleSavePackInfo() }}
-            />
-            <input
-              type="text"
-              value={packUnit}
-              onChange={(e) => setPackUnit(e.target.value)}
-              placeholder="unit (e.g., oz, ct)"
-              className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
-              onBlur={handleSavePackInfo}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleSavePackInfo() }}
-            />
+        <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            {latestNormalized?.normalized_price && latestNormalized.normalized_unit ? (
+              <p className="text-body font-medium text-success-dark">
+                Latest normalized: ${parseFloat(latestNormalized.normalized_price).toFixed(2)} / {latestNormalized.normalized_unit}
+              </p>
+            ) : pricePerUnit != null ? (
+              <p className="text-body font-medium text-success-dark">
+                Price per unit: ${pricePerUnit.toFixed(2)} / {detail.product.pack_unit ?? 'unit'}
+              </p>
+            ) : (
+              <p className="text-caption text-neutral-400">
+                Set package size to see normalized prices
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" onClick={openSaveConfirm} disabled={!packChanged || savingPack}>
+              {updateMutation.isPending ? 'Saving...' : 'Save package size'}
+            </Button>
+            <Button size="sm" variant="subtle" onClick={openRecomputeConfirm} disabled={savingPack}>
+              {recomputeMutation.isPending ? 'Recomputing...' : 'Recompute price history'}
+            </Button>
           </div>
         </div>
       </div>
 
-      {/* Price per unit display */}
-      <div className="mt-4">
-        {pricePerUnit != null ? (
-          <p className="text-body font-medium text-success-dark">
-            Price per unit: ${pricePerUnit.toFixed(2)} / {detail.product.pack_unit ?? 'unit'}
-          </p>
-        ) : (
-          <p className="text-caption text-neutral-400">
-            Set pack size to see per-unit price
-          </p>
+      <Modal
+        open={confirmMode !== null}
+        onClose={() => {
+          if (!savingPack) {
+            setConfirmMode(null)
+            setAffectedCount(null)
+          }
+        }}
+        title={confirmMode === 'save' ? 'Save Package Size' : 'Recompute Price History'}
+        footer={(
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setConfirmMode(null)} disabled={savingPack}>
+              Cancel
+            </Button>
+            {confirmMode === 'save' && (
+              <Button variant="secondary" size="sm" onClick={handleSaveOnly} disabled={savingPack}>
+                Save only
+              </Button>
+            )}
+            <Button
+              size="sm"
+              onClick={confirmMode === 'save' ? handleSaveAndRecompute : handleRecomputeOnly}
+              disabled={savingPack || previewMutation.isPending}
+            >
+              {confirmMode === 'save' ? 'Save and recompute' : 'Recompute'}
+            </Button>
+          </>
         )}
-      </div>
-    </div>
+      >
+        <p className="text-body text-neutral-600">
+          {previewMutation.isPending || affectedCount === null
+            ? 'Checking linked purchase history...'
+            : confirmMode === 'save'
+              ? `Save this package size and recompute ${affectedCount} linked historical purchases?`
+              : `Recompute ${affectedCount} linked historical purchases from their receipt lines?`}
+        </p>
+      </Modal>
+    </>
   )
 }
 

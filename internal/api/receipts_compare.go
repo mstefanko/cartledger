@@ -14,6 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/auth"
+	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/units"
 )
 
@@ -57,16 +58,26 @@ type compareProductResponse struct {
 }
 
 type compareAppearanceResponse struct {
-	LineItemID      string  `json:"line_item_id"`
-	ReceiptID       string  `json:"receipt_id"`
-	RawName         string  `json:"raw_name"`
-	Quantity        *string `json:"quantity,omitempty"`
-	Unit            *string `json:"unit,omitempty"`
-	TotalPrice      string  `json:"total_price"`
-	UnitPrice       *string `json:"unit_price,omitempty"`
-	SizeKnown       bool    `json:"size_known"`
-	NormalizedPrice *string `json:"normalized_price,omitempty"`
-	NormalizedUnit  *string `json:"normalized_unit,omitempty"`
+	LineItemID      string                      `json:"line_item_id"`
+	ReceiptID       string                      `json:"receipt_id"`
+	RawName         string                      `json:"raw_name"`
+	Quantity        *string                     `json:"quantity,omitempty"`
+	Unit            *string                     `json:"unit,omitempty"`
+	TotalPrice      string                      `json:"total_price"`
+	UnitPrice       *string                     `json:"unit_price,omitempty"`
+	SizeKnown       bool                        `json:"size_known"`
+	NormalizedPrice *string                     `json:"normalized_price,omitempty"`
+	NormalizedUnit  *string                     `json:"normalized_unit,omitempty"`
+	Lines           []compareLineChoiceResponse `json:"lines,omitempty"`
+}
+
+type compareLineChoiceResponse struct {
+	LineItemID string  `json:"line_item_id"`
+	RawName    string  `json:"raw_name"`
+	Quantity   *string `json:"quantity,omitempty"`
+	Unit       *string `json:"unit,omitempty"`
+	TotalPrice string  `json:"total_price"`
+	UnitPrice  *string `json:"unit_price,omitempty"`
 }
 
 type compareInvalidReceipt struct {
@@ -201,6 +212,10 @@ type compareLineRow struct {
 	ProductGroupID *string
 	Name           string
 	Category       *string
+	PackQuantity   *decimal.Decimal
+	PackUnit       *string
+	OverrideQty    *decimal.Decimal
+	OverrideUnit   *string
 }
 
 type compareCellAggregate struct {
@@ -212,12 +227,17 @@ type compareCellAggregate struct {
 	ProductGroupID *string
 	Name           string
 	Category       *string
+	PackQuantity   *decimal.Decimal
+	PackUnit       *string
+	OverrideQty    *decimal.Decimal
+	OverrideUnit   *string
 	TotalPrice     decimal.Decimal
 
 	Quantity          decimal.Decimal
 	Unit              string
 	quantitySummable  bool
 	primaryTotalPrice decimal.Decimal
+	Lines             []compareLineChoiceResponse
 }
 
 func (h *ReceiptHandler) loadCompareProducts(ctx context.Context, householdID string, receiptIDs []string, minOverlap int) ([]compareProductResponse, int, error) {
@@ -226,7 +246,8 @@ func (h *ReceiptHandler) loadCompareProducts(ctx context.Context, householdID st
 	rows, err := h.DB.QueryContext(ctx, fmt.Sprintf(
 		`SELECT COALESCE(p.product_group_id, p.id) AS comparison_key,
 		        li.id, li.receipt_id, li.raw_name, li.quantity, li.unit, li.total_price,
-		        p.id, p.product_group_id, COALESCE(pg.name, p.name) AS display_name, p.category
+		        p.id, p.product_group_id, COALESCE(pg.name, p.name) AS display_name, p.category,
+		        p.pack_quantity, p.pack_unit, li.pack_quantity_override, li.pack_unit_override
 		   FROM line_items li
 		   JOIN receipts r ON r.id = li.receipt_id
 		   JOIN products p ON p.id = li.product_id AND p.household_id = r.household_id
@@ -323,7 +344,8 @@ func (h *ReceiptHandler) loadCompareProducts(ctx context.Context, householdID st
 func scanCompareLineRow(rows *sql.Rows) (compareLineRow, error) {
 	var line compareLineRow
 	var quantityText, totalPriceText string
-	var unit, productGroupID, category sql.NullString
+	var unit, productGroupID, category, packUnit, overrideQtyText, overrideUnit sql.NullString
+	var packQty sql.NullFloat64
 	if err := rows.Scan(
 		&line.ComparisonKey,
 		&line.LineItemID,
@@ -336,6 +358,10 @@ func scanCompareLineRow(rows *sql.Rows) (compareLineRow, error) {
 		&productGroupID,
 		&line.Name,
 		&category,
+		&packQty,
+		&packUnit,
+		&overrideQtyText,
+		&overrideUnit,
 	); err != nil {
 		return line, err
 	}
@@ -360,6 +386,23 @@ func scanCompareLineRow(rows *sql.Rows) (compareLineRow, error) {
 	if category.Valid {
 		line.Category = &category.String
 	}
+	if packQty.Valid {
+		d := decimal.NewFromFloat(packQty.Float64)
+		line.PackQuantity = &d
+	}
+	if packUnit.Valid && strings.TrimSpace(packUnit.String) != "" {
+		line.PackUnit = &packUnit.String
+	}
+	if overrideQtyText.Valid && strings.TrimSpace(overrideQtyText.String) != "" {
+		d, err := decimal.NewFromString(strings.TrimSpace(overrideQtyText.String))
+		if err != nil {
+			return line, err
+		}
+		line.OverrideQty = &d
+	}
+	if overrideUnit.Valid && strings.TrimSpace(overrideUnit.String) != "" {
+		line.OverrideUnit = &overrideUnit.String
+	}
 	return line, nil
 }
 
@@ -373,16 +416,22 @@ func newCompareCellAggregate(line compareLineRow) *compareCellAggregate {
 		ProductGroupID:    line.ProductGroupID,
 		Name:              line.Name,
 		Category:          line.Category,
+		PackQuantity:      line.PackQuantity,
+		PackUnit:          line.PackUnit,
+		OverrideQty:       line.OverrideQty,
+		OverrideUnit:      line.OverrideUnit,
 		TotalPrice:        line.TotalPrice,
 		Quantity:          line.Quantity,
 		Unit:              line.Unit,
 		quantitySummable:  true,
 		primaryTotalPrice: line.TotalPrice,
+		Lines:             []compareLineChoiceResponse{compareLineChoiceFromRow(line)},
 	}
 }
 
 func (cell *compareCellAggregate) add(line compareLineRow) {
 	cell.TotalPrice = cell.TotalPrice.Add(line.TotalPrice)
+	cell.Lines = append(cell.Lines, compareLineChoiceFromRow(line))
 	if cell.quantitySummable && cell.Unit == line.Unit {
 		cell.Quantity = cell.Quantity.Add(line.Quantity)
 	} else {
@@ -400,6 +449,10 @@ func (cell *compareCellAggregate) add(line compareLineRow) {
 		cell.ProductGroupID = line.ProductGroupID
 		cell.Name = line.Name
 		cell.Category = line.Category
+		cell.PackQuantity = line.PackQuantity
+		cell.PackUnit = line.PackUnit
+		cell.OverrideQty = line.OverrideQty
+		cell.OverrideUnit = line.OverrideUnit
 	}
 }
 
@@ -409,6 +462,9 @@ func (h *ReceiptHandler) compareAppearanceFromAggregate(cell *compareCellAggrega
 		ReceiptID:  cell.ReceiptID,
 		RawName:    cell.RawName,
 		TotalPrice: cell.TotalPrice.String(),
+	}
+	if len(cell.Lines) > 1 {
+		appearance.Lines = cell.Lines
 	}
 
 	if !cell.quantitySummable {
@@ -426,27 +482,46 @@ func (h *ReceiptHandler) compareAppearanceFromAggregate(cell *compareCellAggrega
 		appearance.UnitPrice = &unitPrice
 	}
 
-	if !compareCellSizeKnown(cell.Quantity, cell.Unit) {
+	var lineUnit *string
+	if cell.Unit != "" {
+		lineUnit = &cell.Unit
+	}
+	normalized, err := prices.NormalizeLineItemPrice(
+		cell.TotalPrice,
+		cell.Quantity,
+		lineUnit,
+		cell.PackQuantity,
+		cell.PackUnit,
+		cell.OverrideQty,
+		cell.OverrideUnit,
+	)
+	if err != nil || normalized.NormalizedPrice == nil || normalized.NormalizedUnit == nil {
 		return appearance
 	}
-
-	normalizedPrice, normalizedUnit, err := units.NormalizePrice(cell.TotalPrice, cell.Quantity, cell.Unit, cell.ProductID, h.DB)
-	if err != nil {
-		return appearance
-	}
-	normalizedPriceStr := normalizedPrice.String()
+	normalizedPriceStr := normalized.NormalizedPrice.String()
 	appearance.NormalizedPrice = &normalizedPriceStr
-	appearance.NormalizedUnit = &normalizedUnit
+	appearance.NormalizedUnit = normalized.NormalizedUnit
 	appearance.SizeKnown = true
 	return appearance
 }
 
-func compareCellSizeKnown(quantity decimal.Decimal, unit string) bool {
-	if unit == "" || !quantity.GreaterThan(decimal.Zero) {
-		return false
+func compareLineChoiceFromRow(line compareLineRow) compareLineChoiceResponse {
+	choice := compareLineChoiceResponse{
+		LineItemID: line.LineItemID,
+		RawName:    line.RawName,
+		TotalPrice: line.TotalPrice.String(),
 	}
-	category := units.Classify(unit)
-	return category == units.CategoryWeight || category == units.CategoryVolume
+	quantity := line.Quantity.String()
+	choice.Quantity = &quantity
+	if line.Unit != "" {
+		unit := line.Unit
+		choice.Unit = &unit
+	}
+	if line.Quantity.GreaterThan(decimal.Zero) {
+		unitPrice := line.TotalPrice.Div(line.Quantity).String()
+		choice.UnitPrice = &unitPrice
+	}
+	return choice
 }
 
 func markBestCompareAppearance(product *compareProductResponse) {

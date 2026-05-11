@@ -25,21 +25,25 @@ import (
 
 // Options configures the preprocessing pipeline.
 type Options struct {
-	MaxEdge       int     // Long edge max pixels (default 1568 — Claude's native limit)
-	JPEGQuality   int     // Output JPEG quality (default 85)
-	ContrastBoost float64 // Contrast adjustment -1.0 to 1.0 (default 0.2)
-	CropThreshold uint8   // Binary threshold for border cropping (default 170)
-	CropMinRatio  float64 // Skip crop if bounding box covers > this ratio (default 0.9)
+	MaxEdge            int     // Long edge max pixels (default 1568 — Claude's native limit)
+	JPEGQuality        int     // Output JPEG quality (default 85)
+	ContrastBoost      float64 // Contrast adjustment -1.0 to 1.0 (default 0.2)
+	CropThreshold      uint8   // Binary threshold for border cropping (default 170)
+	CropMinRatio       float64 // Skip crop if bounding box covers > this ratio (default 0.9)
+	CropMinHeightRatio float64 // Skip crop if it keeps less than this fraction of height
+	CropMinAreaRatio   float64 // Skip crop if it keeps less than this fraction of area
 }
 
 // DefaultOptions returns sensible defaults for receipt preprocessing.
 func DefaultOptions() Options {
 	return Options{
-		MaxEdge:       1568,
-		JPEGQuality:   85,
-		ContrastBoost: 0.2,
-		CropThreshold: 170,
-		CropMinRatio:  0.9,
+		MaxEdge:            1568,
+		JPEGQuality:        85,
+		ContrastBoost:      0.2,
+		CropThreshold:      170,
+		CropMinRatio:       0.9,
+		CropMinHeightRatio: 0.70,
+		CropMinAreaRatio:   0.25,
 	}
 }
 
@@ -167,7 +171,7 @@ func doPreprocess(raw []byte, opts Options) ([]byte, error) {
 
 	// Step 4: Border crop — run on clean grayscale BEFORE contrast/sharpen
 	// to avoid bright artifacts fooling the threshold.
-	img = cropBorders(img, opts.CropThreshold, opts.CropMinRatio)
+	img = cropBorders(img, opts)
 
 	// Step 5: Contrast boost.
 	img = adjust.Contrast(img, opts.ContrastBoost)
@@ -190,9 +194,9 @@ func doPreprocess(raw []byte, opts Options) ([]byte, error) {
 // Uses column/row projection: a column (or row) is considered "paper" only if
 // at least 15% of its pixels are above the threshold. This filters out isolated
 // bright specks from table reflections/wood grain.
-func cropBorders(img image.Image, threshold uint8, minRatio float64) image.Image {
+func cropBorders(img image.Image, opts Options) image.Image {
 	// Binarize: pixels brighter than threshold → white, else black.
-	binary := segment.Threshold(img, threshold)
+	binary := segment.Threshold(img, opts.CropThreshold)
 
 	bounds := binary.Bounds()
 	imgW, imgH := bounds.Dx(), bounds.Dy()
@@ -248,7 +252,7 @@ func cropBorders(img image.Image, threshold uint8, minRatio float64) image.Image
 	coverageRatio := float64(boxW*boxH) / float64(imgW*imgH)
 
 	// Skip crop if box covers most of the image (no clear background).
-	if coverageRatio > minRatio {
+	if coverageRatio > opts.CropMinRatio {
 		return img
 	}
 
@@ -261,7 +265,34 @@ func cropBorders(img image.Image, threshold uint8, minRatio float64) image.Image
 		min(colMaxX+padX, bounds.Max.X),
 		min(rowMaxY+padY, bounds.Max.Y),
 	)
+	if unsafeCrop(imgW, imgH, cropRect, opts) {
+		slog.Debug("image preprocessing skipped unsafe crop",
+			"image_width", imgW,
+			"image_height", imgH,
+			"crop_width", cropRect.Dx(),
+			"crop_height", cropRect.Dy(),
+			"coverage_ratio", coverageRatio,
+		)
+		return img
+	}
 
 	return transform.Crop(img, cropRect)
 }
 
+func unsafeCrop(imgW, imgH int, cropRect image.Rectangle, opts Options) bool {
+	if imgW <= 0 || imgH <= 0 || cropRect.Empty() {
+		return true
+	}
+	cropW := cropRect.Dx()
+	cropH := cropRect.Dy()
+	if opts.CropMinHeightRatio > 0 && float64(cropH)/float64(imgH) < opts.CropMinHeightRatio {
+		return true
+	}
+	if opts.CropMinAreaRatio > 0 && float64(cropW*cropH)/float64(imgW*imgH) < opts.CropMinAreaRatio {
+		return true
+	}
+	if imgH > imgW && cropH <= cropW {
+		return true
+	}
+	return false
+}

@@ -283,6 +283,38 @@ func TestCompareReceipts_UnknownUnitsDoNotNormalizeOrStar(t *testing.T) {
 	}
 }
 
+func TestCompareReceipts_UsesProductPackageSizeForCountLines(t *testing.T) {
+	f := newCompareFixture(t)
+	defer f.close()
+
+	cheerios := compareProduct(t, f, f.HH1, "Cheerios", "cereal")
+	if _, err := f.Handler.DB.Exec("UPDATE products SET pack_quantity = 32, pack_unit = 'oz' WHERE id = ?", cheerios); err != nil {
+		t.Fatalf("update product pack: %v", err)
+	}
+	r1 := compareReceipt(t, f, f.HH1, f.StoreA, "2026-04-01", "8.99", "matched")
+	r2 := compareReceipt(t, f, f.HH1, f.StoreB, "2026-04-08", "7.99", "matched")
+	firstID := compareLine(t, f, r1, cheerios, "GM CHEERIOS", "1", "each", "8.99")
+	compareLine(t, f, r2, cheerios, "CHEERIOS", "1", "", "7.99")
+
+	code, resp, body := callCompareReceipts(t, f.Handler, f.HH1, compareBody([]string{r1, r2}, nil))
+	if code != http.StatusOK {
+		t.Fatalf("want 200 got %d: %s", code, body)
+	}
+	if resp.MissingUnitCount != 0 {
+		t.Fatalf("missing_unit_count = %d, want 0", resp.MissingUnitCount)
+	}
+	row := resp.Products[0]
+	if row.ComparableUnit == nil || *row.ComparableUnit != "oz" {
+		t.Fatalf("comparable unit = %v, want oz", row.ComparableUnit)
+	}
+	if row.Appearances[0].NormalizedPrice == nil || *row.Appearances[0].NormalizedPrice != "0.2809375" {
+		t.Fatalf("first normalized price = %+v, want 0.2809375", row.Appearances[0])
+	}
+	if row.BestAppearance == nil || *row.BestAppearance == firstID {
+		t.Fatalf("best appearance = %v, want second receipt", row.BestAppearance)
+	}
+}
+
 func TestCompareReceipts_AggregatesDuplicateLines(t *testing.T) {
 	f := newCompareFixture(t)
 	defer f.close()
@@ -315,6 +347,9 @@ func TestCompareReceipts_AggregatesDuplicateLines(t *testing.T) {
 	if coffeeRow.Appearances[0].TotalPrice != "12" || coffeeRow.Appearances[0].Quantity != nil || coffeeRow.Appearances[0].Unit != nil {
 		t.Fatalf("conflicting-unit aggregate should keep total only: %+v", coffeeRow.Appearances[0])
 	}
+	if len(coffeeRow.Appearances[0].Lines) != 2 {
+		t.Fatalf("conflicting-unit aggregate lines = %+v, want two selectable lines", coffeeRow.Appearances[0].Lines)
+	}
 	if coffeeRow.ComparableUnit != nil || coffeeRow.BestAppearance != nil {
 		t.Fatalf("only one normalized coffee cell should not star: %+v", coffeeRow)
 	}
@@ -326,6 +361,13 @@ func TestCompareReceipts_AggregatesDuplicateLines(t *testing.T) {
 	first := oatsRow.Appearances[0]
 	if first.LineItemID != oatsPrimary || first.TotalPrice != "1.75" || first.Quantity == nil || *first.Quantity != "12" || first.Unit == nil || *first.Unit != "oz" {
 		t.Fatalf("same-unit aggregate mismatch: %+v", first)
+	}
+	lineNames := map[string]bool{}
+	for _, line := range first.Lines {
+		lineNames[line.RawName] = true
+	}
+	if len(first.Lines) != 2 || !lineNames["OATS 8OZ"] || !lineNames["OATS 4OZ"] {
+		t.Fatalf("same-unit aggregate line picker mismatch: %+v", first.Lines)
 	}
 	if oatsRow.BestAppearance == nil || *oatsRow.BestAppearance != oatsPrimary {
 		t.Fatalf("oats best appearance = %v, want %s", oatsRow.BestAppearance, oatsPrimary)

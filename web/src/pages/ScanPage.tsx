@@ -7,7 +7,7 @@ function ScanPage() {
         Scan Receipt
       </h1>
       <p className="mt-2 text-body text-neutral-400">
-        Take a photo of your receipt or choose an image from your device.
+        Take a photo of your receipt or choose a JPEG, PNG, or PDF from your device.
       </p>
       <div className="mt-6">
         <ReceiptScanner />

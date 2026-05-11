@@ -61,6 +61,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"idx_alias_global", "idx_alias_store",
 		"idx_line_items_receipt", "idx_line_items_product",
 		"idx_product_prices_product", "idx_product_prices_store",
+		"idx_product_prices_line_item",
 		"idx_product_aliases_alias",
 		"idx_receipts_store", "idx_receipts_date",
 		"idx_matching_rules_priority",

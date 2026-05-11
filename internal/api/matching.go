@@ -8,11 +8,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
-	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/prices"
 )
 
 // MatchingHandler holds dependencies for matching and rule endpoints.
@@ -93,22 +93,15 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 	}
 
 	// Fetch the line item and verify it belongs to the household.
-	var rawName, receiptID string
+	var rawName string
 	var storeID *string
-	var receiptDate time.Time
-	var quantity decimal.Decimal
-	var unit *string
-	var totalPrice decimal.Decimal
-	var regularPrice, discountAmount sql.NullString
 	err := h.DB.QueryRow(
-		`SELECT li.raw_name, li.receipt_id, r.store_id, r.receipt_date, li.quantity, li.unit, li.total_price,
-		        li.regular_price, li.discount_amount
+		`SELECT li.raw_name, r.store_id
 		 FROM line_items li
 		 JOIN receipts r ON li.receipt_id = r.id
 		 WHERE li.id = ? AND r.household_id = ?`,
 		lineItemID, householdID,
-	).Scan(&rawName, &receiptID, &storeID, &receiptDate, &quantity, &unit, &totalPrice,
-		&regularPrice, &discountAmount)
+	).Scan(&rawName, &storeID)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
 	}
@@ -126,7 +119,7 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 
 	// Update line_item.
 	_, err = tx.Exec(
-		"UPDATE line_items SET product_id = ?, matched = 'manual' WHERE id = ?",
+		"UPDATE line_items SET product_id = ?, matched = 'manual', review_status = 'pending' WHERE id = ?",
 		req.ProductID, lineItemID,
 	)
 	if err != nil {
@@ -152,37 +145,8 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 		}
 	}
 
-	// Insert product_prices row.
-	if storeID != nil {
-		unitStr := "each"
-		if unit != nil {
-			unitStr = *unit
-		}
-		if quantity.IsZero() {
-			quantity = decimal.NewFromInt(1)
-		}
-		unitPrice := totalPrice.Div(quantity)
-
-		// Determine if this is a sale item.
-		isSale := regularPrice.Valid && discountAmount.Valid
-		var regPriceVal, discountVal interface{}
-		if regularPrice.Valid {
-			regPriceVal = regularPrice.String
-		}
-		if discountAmount.Valid {
-			discountVal = discountAmount.String
-		}
-
-		_, err = tx.Exec(
-			`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			uuid.New().String(), req.ProductID, *storeID, receiptID,
-			receiptDate, quantity.String(), unitStr, unitPrice.String(),
-			regPriceVal, discountVal, isSale, now,
-		)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
-		}
+	if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, lineItemID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
 	}
 
 	// Optionally create matching rule.
@@ -195,15 +159,6 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create rule"})
 		}
-	}
-
-	// Update product purchase stats.
-	_, err = tx.Exec(
-		"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
-		receiptDate, now, req.ProductID,
-	)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update product"})
 	}
 
 	if err := tx.Commit(); err != nil {

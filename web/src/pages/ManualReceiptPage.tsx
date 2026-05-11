@@ -3,14 +3,15 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
-import { createManualReceipt, type ManualLineItemInput } from '@/api/receipts'
+import { createManualReceipt } from '@/api/receipts'
 import { listStores } from '@/api/stores'
-
-type Row = ManualLineItemInput & { _key: string }
-
-function emptyRow(): Row {
-  return { _key: crypto.randomUUID(), raw_name: '', total_price: '' }
-}
+import {
+  ManualLineItemGrid,
+  createManualLineItemRow,
+  manualLineItemRowsAreComplete,
+  toManualLineItemInputs,
+  type ManualLineItemGridRow,
+} from '@/components/receipts/ManualLineItemGrid'
 
 export default function ManualReceiptPage() {
   const navigate = useNavigate()
@@ -28,7 +29,9 @@ export default function ManualReceiptPage() {
   const [subtotal, setSubtotal] = useState('')
   const [tax, setTax] = useState('')
   const [total, setTotal] = useState('')
-  const [rows, setRows] = useState<Row[]>([emptyRow()])
+  const [rows, setRows] = useState<ManualLineItemGridRow[]>([
+    createManualLineItemRow(),
+  ])
   const [submitError, setSubmitError] = useState<string | null>(null)
 
   const mutation = useMutation({
@@ -40,12 +43,7 @@ export default function ManualReceiptPage() {
     onError: (err: Error) => setSubmitError(err.message),
   })
 
-  const isValid =
-    rows.length > 0 &&
-    rows.every(
-      (r) => r.raw_name.trim().length > 0 && r.total_price.trim().length > 0,
-    ) &&
-    receiptDate.length > 0
+  const isValid = manualLineItemRowsAreComplete(rows) && receiptDate.length > 0
 
   const handleSubmit = () => {
     setSubmitError(null)
@@ -55,17 +53,9 @@ export default function ManualReceiptPage() {
       subtotal: subtotal || undefined,
       tax: tax || undefined,
       total: total || undefined,
-      items: rows.map(({ _key, ...rest }) => rest),
+      items: toManualLineItemInputs(rows),
     })
   }
-
-  const updateRow = (key: string, patch: Partial<Row>) =>
-    setRows((rs) => rs.map((r) => (r._key === key ? { ...r, ...patch } : r)))
-
-  const addRow = () => setRows((rs) => [...rs, emptyRow()])
-
-  const removeRow = (key: string) =>
-    setRows((rs) => (rs.length > 1 ? rs.filter((r) => r._key !== key) : rs))
 
   return (
     <div className="mx-auto max-w-3xl py-8">
@@ -140,76 +130,8 @@ export default function ManualReceiptPage() {
         </span>
       </div>
 
-      {/* Column headers */}
-      <div className="mt-3 hidden sm:grid grid-cols-12 gap-2 px-1">
-        <span className="col-span-5 text-small font-medium text-neutral-400 uppercase tracking-wide">Item</span>
-        <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">Qty</span>
-        <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">Unit</span>
-        <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">Price</span>
-        <span className="col-span-1" />
-      </div>
-
-      {/* Item rows */}
-      <div className="mt-1 space-y-2">
-        {rows.map((r) => (
-          <div
-            key={r._key}
-            className="grid grid-cols-12 gap-2 items-end p-3 rounded-xl bg-neutral-50 border border-neutral-200"
-          >
-            <div className="col-span-12 sm:col-span-5">
-              <Input
-                aria-label="Item name"
-                placeholder="e.g. Whole Milk"
-                value={r.raw_name}
-                onChange={(e) => updateRow(r._key, { raw_name: e.target.value })}
-              />
-            </div>
-            <div className="col-span-4 sm:col-span-2">
-              <Input
-                aria-label="Quantity"
-                inputMode="decimal"
-                placeholder="1"
-                value={r.quantity ?? ''}
-                onChange={(e) => updateRow(r._key, { quantity: e.target.value })}
-              />
-            </div>
-            <div className="col-span-4 sm:col-span-2">
-              <Input
-                aria-label="Unit"
-                placeholder="ea"
-                value={r.unit ?? ''}
-                onChange={(e) => updateRow(r._key, { unit: e.target.value })}
-              />
-            </div>
-            <div className="col-span-3 sm:col-span-2">
-              <Input
-                aria-label="Total price"
-                inputMode="decimal"
-                placeholder="0.00"
-                value={r.total_price}
-                onChange={(e) => updateRow(r._key, { total_price: e.target.value })}
-              />
-            </div>
-            <div className="col-span-1 flex items-end pb-0.5">
-              <Button
-                variant="subtle"
-                size="sm"
-                aria-label="Remove item"
-                onClick={() => removeRow(r._key)}
-                disabled={rows.length === 1}
-              >
-                ×
-              </Button>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Add item */}
       <div className="mt-3">
-        <Button variant="outlined" size="sm" onClick={addRow}>
-          + Add item
-        </Button>
+        <ManualLineItemGrid rows={rows} onRowsChange={setRows} />
       </div>
 
       {/* Submit error */}

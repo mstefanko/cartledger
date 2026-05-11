@@ -13,6 +13,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/prices"
 )
 
 // MatchEngine is the minimal surface this package needs from matcher.Engine.
@@ -431,35 +432,8 @@ func commitGroup(
 				}
 			}
 
-			// product_prices: unit_price per-unit (total/qty). Uses the
-			// same math as worker/receipt.go:702 — total.Div(quantity) —
-			// to keep analytics comparable between scan and import paths.
-			qtyDec := decimal.NewFromFloat(pv.Qty)
-			if qtyDec.IsZero() {
-				qtyDec = decimal.NewFromInt(1)
-			}
-			totalDec := decimal.New(pv.TotalCents, -2)
-			up := totalDec.Div(qtyDec)
-
-			priceID := uuid.New().String()
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO product_prices
-				 (id, product_id, store_id, receipt_id, receipt_date,
-				  quantity, unit, unit_price, is_sale, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-				priceID, *productID, storeID, receiptID, receiptDate,
-				qtyDec.String(), unit, up.String(), now,
-			); err != nil {
-				return "", nil, 0, 0, fmt.Errorf("insert product_price: %w", err)
-			}
-
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE products
-				 SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ?
-				 WHERE id = ?`,
-				receiptDate, now, *productID,
-			); err != nil {
-				return "", nil, 0, 0, fmt.Errorf("update product stats: %w", err)
+			if err := prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID); err != nil {
+				return "", nil, 0, 0, fmt.Errorf("record product price: %w", err)
 			}
 		}
 	}

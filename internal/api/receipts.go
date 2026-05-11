@@ -26,6 +26,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
@@ -44,11 +45,15 @@ type ReceiptHandler struct {
 // --- Request / Response types ---
 
 type updateLineItemRequest struct {
-	ProductID  *string `json:"product_id"`
-	Quantity   *string `json:"quantity"`
-	Unit       *string `json:"unit"`
-	Price      *string `json:"price"`
-	TotalPrice *string `json:"total_price"`
+	ProductID            *string `json:"product_id"`
+	Quantity             *string `json:"quantity"`
+	Unit                 *string `json:"unit"`
+	Price                *string `json:"price"`
+	TotalPrice           *string `json:"total_price"`
+	PackQuantityOverride *string `json:"pack_quantity_override"`
+	PackUnitOverride     *string `json:"pack_unit_override"`
+	PackOverrideSource   *string `json:"pack_override_source"`
+	ReviewStatus         *string `json:"review_status"`
 }
 
 type manualLineItemRequest struct {
@@ -69,6 +74,15 @@ type createLineItemRequest struct {
 	TotalPrice        string  `json:"total_price"`
 	LineNumber        *int    `json:"line_number"`
 	CountContribution *string `json:"count_contribution"`
+}
+
+type createLineItemsRequest struct {
+	Items []manualLineItemRequest `json:"items"`
+}
+
+type createLineItemsResponse struct {
+	CreatedCount int    `json:"created_count"`
+	Status       string `json:"status"`
 }
 
 type repairPreviewRequest struct {
@@ -100,6 +114,8 @@ type lineItemResponse struct {
 	ReceiptID            string   `json:"receipt_id"`
 	ProductID            *string  `json:"product_id,omitempty"`
 	ProductName          *string  `json:"product_name,omitempty"`
+	ProductPackQuantity  *float64 `json:"product_pack_quantity,omitempty"`
+	ProductPackUnit      *string  `json:"product_pack_unit,omitempty"`
 	Category             *string  `json:"category,omitempty"`
 	RawName              string   `json:"raw_name"`
 	Quantity             string   `json:"quantity"`
@@ -109,7 +125,11 @@ type lineItemResponse struct {
 	RegularPrice         *string  `json:"regular_price,omitempty"`
 	DiscountAmount       *string  `json:"discount_amount,omitempty"`
 	CountContribution    string   `json:"count_contribution"`
+	PackQuantityOverride *string  `json:"pack_quantity_override,omitempty"`
+	PackUnitOverride     *string  `json:"pack_unit_override,omitempty"`
+	PackOverrideSource   *string  `json:"pack_override_source,omitempty"`
 	Matched              string   `json:"matched"`
+	ReviewStatus         string   `json:"review_status"`
 	Confidence           *float64 `json:"confidence,omitempty"`
 	LineNumber           *int     `json:"line_number,omitempty"`
 	SuggestedName        *string  `json:"suggested_name,omitempty"`
@@ -160,13 +180,18 @@ type receiptDetailResponse struct {
 	LineItems          []lineItemResponse       `json:"line_items"`
 }
 
-// uploadBodyLimit caps the request body for multipart receipt uploads.
-//
-// Per-file cap is 10 MB (see Scan). A single scan accepts multiple images
-// (front/back, multi-page receipts); 50 MB allows ~5 full-size images plus
-// multipart framing overhead while still preventing pathological uploads from
-// OOMing the process. Tightened later via a config knob if needed.
-const uploadBodyLimit = "50M"
+const (
+	// uploadBodyLimit caps the request body for multipart receipt uploads.
+	//
+	// Per-file cap is 10 MB and maxReceiptUploadFiles caps page count. 110 MB
+	// allows ten max-size image pages plus multipart framing overhead while
+	// still preventing pathological uploads from OOMing the process.
+	uploadBodyLimit = "110M"
+
+	maxReceiptUploadFiles    = 10
+	maxReceiptUploadFileSize = 10 << 20 // 10MB
+	receiptUploadMemory      = 8 << 20  // 8MB; larger multipart file parts spill to temp files.
+)
 
 // RegisterRoutes mounts receipt endpoints onto the protected group.
 func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
@@ -178,6 +203,7 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.POST("/compare", h.compareReceipts)
 	receipts.GET("/:id/images/:kind/:page", h.ServeImage)
 	receipts.GET("/:id", h.Get)
+	receipts.POST("/:id/line-items/bulk", h.CreateLineItems)
 	receipts.POST("/:id/line-items", h.CreateLineItem)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
 	receipts.POST("/:id/repair-preview", h.RepairPreview)
@@ -194,17 +220,25 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	userID := auth.UserIDFrom(c)
 
-	form, err := c.MultipartForm()
-	if err != nil {
+	if err := c.Request().ParseMultipartForm(receiptUploadMemory); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid multipart form"})
 	}
+	form := c.Request().MultipartForm
+	if form == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid multipart form"})
+	}
+	defer form.RemoveAll()
 
 	files := form.File["images"]
 	if len(files) == 0 {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "at least one image is required"})
 	}
+	if len(files) > maxReceiptUploadFiles {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("maximum %d pages per receipt", maxReceiptUploadFiles),
+		})
+	}
 
-	const maxFileSize = 10 << 20 // 10MB
 	allowedTypes := map[string]bool{
 		"image/jpeg": true,
 		"image/png":  true,
@@ -212,7 +246,7 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 
 	// Validate all files before saving any.
 	for _, fh := range files {
-		if fh.Size > maxFileSize {
+		if fh.Size > maxReceiptUploadFileSize {
 			return c.JSON(http.StatusBadRequest, map[string]string{
 				"error": fmt.Sprintf("file %s exceeds 10MB limit", fh.Filename),
 			})
@@ -224,10 +258,18 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 			})
 		}
 	}
+	pageSources, pageSourcesProvided, pageSourcesErr := parseReceiptPageSources(form.Value)
 
 	// Create receipt row.
 	receiptID := uuid.New().String()
 	now := time.Now().UTC()
+	if pageSourcesProvided {
+		if pageSourcesErr != "" {
+			slog.Warn("receipt scan page_sources metadata ignored", "receipt_id", receiptID, "reason", pageSourcesErr, "image_count", len(files))
+		} else if !allReceiptPageSourcesPhoto(pageSources) {
+			slog.Info("receipt scan page sources", "receipt_id", receiptID, "image_count", len(files), "source_count", len(pageSources), "page_sources", pageSources)
+		}
+	}
 
 	localStore, err := storage.NewLocal(h.Cfg.DataDir)
 	if err != nil {
@@ -345,6 +387,51 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 		"id":     receiptID,
 		"status": "pending",
 	})
+}
+
+func parseReceiptPageSources(values map[string][]string) ([]string, bool, string) {
+	rawValues := values["page_sources"]
+	if len(rawValues) == 0 {
+		return nil, false, ""
+	}
+
+	if len(rawValues) == 1 {
+		trimmed := strings.TrimSpace(rawValues[0])
+		if strings.HasPrefix(trimmed, "[") {
+			var parsed []string
+			if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+				return nil, true, "invalid_json"
+			}
+			return normalizeReceiptPageSources(parsed), true, ""
+		}
+	}
+
+	return normalizeReceiptPageSources(rawValues), true, ""
+}
+
+func normalizeReceiptPageSources(sources []string) []string {
+	normalized := make([]string, 0, len(sources))
+	for _, source := range sources {
+		switch source {
+		case "photo", "pdf_rendered":
+			normalized = append(normalized, source)
+		default:
+			normalized = append(normalized, "unknown")
+		}
+	}
+	return normalized
+}
+
+func allReceiptPageSourcesPhoto(sources []string) bool {
+	if len(sources) == 0 {
+		return false
+	}
+	for _, source := range sources {
+		if source != "photo" {
+			return false
+		}
+	}
+	return true
 }
 
 // CreateManual handles manually-entered receipts (no image, no LLM).
@@ -521,6 +608,30 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"error": fmt.Sprintf("failed to insert item %d: %v", i, err),
 			})
+		}
+
+		if productID != nil && req.StoreID != nil && strings.TrimSpace(*req.StoreID) != "" {
+			normalized := matcher.Normalize(it.RawName)
+			var aliasExists int
+			_ = tx.QueryRowContext(c.Request().Context(),
+				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
+				*productID, normalized,
+			).Scan(&aliasExists)
+			if aliasExists == 0 {
+				_, _ = tx.ExecContext(c.Request().Context(),
+					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					uuid.New().String(), *productID, normalized, *req.StoreID, now,
+				)
+			}
+			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
+			}
+			if it.Unit != nil && strings.TrimSpace(*it.Unit) != "" {
+				_, _ = tx.ExecContext(c.Request().Context(),
+					"UPDATE products SET default_unit = ? WHERE id = ? AND default_unit IS NULL",
+					*it.Unit, *productID,
+				)
+			}
 		}
 	}
 
@@ -778,9 +889,11 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	// Fetch line items with product info and suggestion data.
 	rows, err := h.DB.Query(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
+		        p.pack_quantity, p.pack_unit,
 		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount, li.count_contribution,
-		        li.matched, li.confidence, li.line_number,
+		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
+		        li.matched, li.review_status, li.confidence, li.line_number,
 		        li.suggested_name, li.suggested_category,
 		        li.suggested_product_id, sp.name
 		 FROM line_items li
@@ -802,9 +915,11 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		var unitPrice *decimal.Decimal
 		if err := rows.Scan(
 			&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
+			&li.ProductPackQuantity, &li.ProductPackUnit,
 			&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
 			&li.RegularPrice, &li.DiscountAmount, &countContribution,
-			&li.Matched, &li.Confidence, &li.LineNumber,
+			&li.PackQuantityOverride, &li.PackUnitOverride, &li.PackOverrideSource,
+			&li.Matched, &li.ReviewStatus, &li.Confidence, &li.LineNumber,
 			&li.SuggestedName, &li.SuggestedCategory,
 			&li.SuggestedProductID, &li.SuggestedProductName,
 		); err != nil {
@@ -1029,11 +1144,10 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 	}
 
 	var storeID *string
-	var receiptDate time.Time
 	err = h.DB.QueryRow(
-		"SELECT store_id, receipt_date FROM receipts WHERE id = ? AND household_id = ?",
+		"SELECT store_id FROM receipts WHERE id = ? AND household_id = ?",
 		receiptID, householdID,
-	).Scan(&storeID, &receiptDate)
+	).Scan(&storeID)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
@@ -1104,24 +1218,9 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 			)
 		}
 
-		unitStr := "each"
-		if req.Unit != nil && strings.TrimSpace(*req.Unit) != "" {
-			unitStr = *req.Unit
+		if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
 		}
-		priceQuantity := quantity
-		if priceQuantity.IsZero() {
-			priceQuantity = decimal.NewFromInt(1)
-		}
-		_, _ = tx.Exec(
-			`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, is_sale, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
-			uuid.New().String(), *productID, *storeID, receiptID,
-			receiptDate, quantity.String(), unitStr, totalPrice.Div(priceQuantity).String(), now,
-		)
-		_, _ = tx.Exec(
-			"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
-			receiptDate, now, *productID,
-		)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1133,6 +1232,234 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	return c.JSON(http.StatusCreated, lineItem)
+}
+
+type parsedManualLineItem struct {
+	rawName           string
+	productID         *string
+	quantity          decimal.Decimal
+	unit              *string
+	unitPrice         *string
+	totalPrice        decimal.Decimal
+	countContribution decimal.Decimal
+}
+
+// CreateLineItems adds multiple manually-entered line items to an existing receipt.
+// POST /api/v1/receipts/:id/line-items/bulk
+func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	receiptID := c.Param("id")
+
+	var req createLineItemsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.Items) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "at least one item is required"})
+	}
+
+	var storeID *string
+	var status string
+	err := h.DB.QueryRow(
+		"SELECT store_id, status FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&storeID, &status)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if status == "reviewed" {
+		return c.JSON(http.StatusConflict, map[string]string{"error": "cannot add line items to a reviewed receipt"})
+	}
+	if status == "pending" || status == "processing" {
+		return c.JSON(http.StatusConflict, map[string]string{"error": "receipt is still processing"})
+	}
+
+	parsedItems := make([]parsedManualLineItem, 0, len(req.Items))
+	for i, item := range req.Items {
+		parsed, err := h.parseManualLineItem(item, householdID)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("items[%d].%s", i, err.Error()),
+			})
+		}
+		parsedItems = append(parsedItems, parsed)
+	}
+
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	var startLineNumber int
+	if err := tx.QueryRowContext(
+		c.Request().Context(),
+		"SELECT COALESCE(MAX(line_number), 0) + 1 FROM line_items WHERE receipt_id = ?",
+		receiptID,
+	).Scan(&startLineNumber); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	engine := matcher.NewEngine(h.DB)
+	storeIDArg := ""
+	if storeID != nil {
+		storeIDArg = *storeID
+	}
+	now := time.Now().UTC()
+
+	for i, item := range parsedItems {
+		itemID := uuid.New().String()
+		productID := item.productID
+		matched := "unmatched"
+		var confidence *float64
+
+		if productID != nil {
+			matched = "manual"
+		} else {
+			result := engine.MatchWithSuggestion(item.rawName, "", storeIDArg, householdID)
+			switch result.Method {
+			case "rule", "alias", "fuzzy":
+				if result.ProductID != "" {
+					pid := result.ProductID
+					productID = &pid
+					matched = result.Method
+					conf := result.Confidence
+					confidence = &conf
+				}
+			}
+		}
+
+		_, err = tx.ExecContext(
+			c.Request().Context(),
+			`INSERT INTO line_items
+			    (id, receipt_id, product_id, raw_name, quantity, unit, unit_price,
+			     total_price, matched, confidence, line_number, count_contribution, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			itemID, receiptID, productID, item.rawName, item.quantity.String(), item.unit,
+			item.unitPrice, item.totalPrice.String(), matched, confidence,
+			startLineNumber+i, item.countContribution.String(), now,
+		)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
+		}
+
+		if productID != nil && storeID != nil {
+			normalized := matcher.Normalize(item.rawName)
+			var aliasExists int
+			_ = tx.QueryRowContext(
+				c.Request().Context(),
+				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
+				*productID, normalized,
+			).Scan(&aliasExists)
+			if aliasExists == 0 {
+				_, _ = tx.ExecContext(
+					c.Request().Context(),
+					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					uuid.New().String(), *productID, normalized, *storeID, now,
+				)
+			}
+			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
+			}
+			if item.unit != nil && strings.TrimSpace(*item.unit) != "" {
+				_, _ = tx.ExecContext(
+					c.Request().Context(),
+					"UPDATE products SET default_unit = ? WHERE id = ? AND default_unit IS NULL",
+					*item.unit, *productID,
+				)
+			}
+		}
+	}
+
+	_, err = tx.ExecContext(
+		c.Request().Context(),
+		"UPDATE receipts SET status = 'matched', error_message = NULL WHERE id = ?",
+		receiptID,
+	)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update receipt"})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	return c.JSON(http.StatusCreated, createLineItemsResponse{
+		CreatedCount: len(parsedItems),
+		Status:       "matched",
+	})
+}
+
+func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, householdID string) (parsedManualLineItem, error) {
+	rawName := strings.TrimSpace(item.RawName)
+	if rawName == "" {
+		return parsedManualLineItem{}, fmt.Errorf("raw_name is required")
+	}
+	totalPriceText := strings.TrimSpace(item.TotalPrice)
+	totalPrice, err := decimal.NewFromString(totalPriceText)
+	if err != nil {
+		return parsedManualLineItem{}, fmt.Errorf("total_price must be a decimal")
+	}
+
+	quantityText := "1"
+	if item.Quantity != nil && strings.TrimSpace(*item.Quantity) != "" {
+		quantityText = strings.TrimSpace(*item.Quantity)
+	}
+	quantity, err := decimal.NewFromString(quantityText)
+	if err != nil {
+		return parsedManualLineItem{}, fmt.Errorf("quantity must be a decimal")
+	}
+
+	var unitPrice *string
+	if item.UnitPrice != nil && strings.TrimSpace(*item.UnitPrice) != "" {
+		value := strings.TrimSpace(*item.UnitPrice)
+		if _, err := decimal.NewFromString(value); err != nil {
+			return parsedManualLineItem{}, fmt.Errorf("unit_price must be a decimal")
+		}
+		unitPrice = &value
+	}
+
+	var productID *string
+	if item.ProductID != nil && strings.TrimSpace(*item.ProductID) != "" {
+		value := strings.TrimSpace(*item.ProductID)
+		var exists int
+		err := h.DB.QueryRow(
+			"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+			value, householdID,
+		).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return parsedManualLineItem{}, fmt.Errorf("product_id not found")
+		}
+		if err != nil {
+			return parsedManualLineItem{}, fmt.Errorf("product_id validation failed")
+		}
+		productID = &value
+	}
+
+	unit := trimmedStringPtr(item.Unit)
+	return parsedManualLineItem{
+		rawName:           rawName,
+		productID:         productID,
+		quantity:          quantity,
+		unit:              unit,
+		unitPrice:         unitPrice,
+		totalPrice:        totalPrice,
+		countContribution: deriveCountContribution(quantity, unit),
+	}, nil
+}
+
+func trimmedStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func deriveCountContribution(quantity decimal.Decimal, unit *string) decimal.Decimal {
@@ -1149,15 +1476,50 @@ func deriveCountContribution(quantity decimal.Decimal, unit *string) decimal.Dec
 	return decimal.NewFromInt(1)
 }
 
+func nullableTrimmedString(value string) interface{} {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableDecimalString(value string) (interface{}, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	if _, err := decimal.NewFromString(value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func nullableReceiptTime(value string) (interface{}, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "<unknown>") {
+		return nil, nil
+	}
+	if parsed, err := time.Parse("15:04", value); err == nil {
+		return parsed.Format("15:04"), nil
+	}
+	if parsed, err := time.Parse("15:04:05", value); err == nil {
+		return parsed.Format("15:04:05"), nil
+	}
+	return nil, fmt.Errorf("invalid receipt time")
+}
+
 func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemResponse, error) {
 	var li lineItemResponse
 	var quantity, totalPrice, countContribution decimal.Decimal
 	var unitPrice *decimal.Decimal
 	err := h.DB.QueryRow(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
+		        p.pack_quantity, p.pack_unit,
 		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount, li.count_contribution,
-		        li.matched, li.confidence, li.line_number,
+		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
+		        li.matched, li.review_status, li.confidence, li.line_number,
 		        li.suggested_name, li.suggested_category,
 		        li.suggested_product_id, sp.name
 		 FROM line_items li
@@ -1167,9 +1529,11 @@ func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemRes
 		receiptID, itemID,
 	).Scan(
 		&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
+		&li.ProductPackQuantity, &li.ProductPackUnit,
 		&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
 		&li.RegularPrice, &li.DiscountAmount, &countContribution,
-		&li.Matched, &li.Confidence, &li.LineNumber,
+		&li.PackQuantityOverride, &li.PackUnitOverride, &li.PackOverrideSource,
+		&li.Matched, &li.ReviewStatus, &li.Confidence, &li.LineNumber,
 		&li.SuggestedName, &li.SuggestedCategory,
 		&li.SuggestedProductID, &li.SuggestedProductName,
 	)
@@ -1272,12 +1636,11 @@ func (h *ReceiptHandler) ApplyRepair(c echo.Context) error {
 	}
 
 	var storeID *string
-	var receiptDate time.Time
 	var status string
 	err := h.DB.QueryRow(
-		"SELECT store_id, receipt_date, status FROM receipts WHERE id = ? AND household_id = ?",
+		"SELECT store_id, status FROM receipts WHERE id = ? AND household_id = ?",
 		receiptID, householdID,
-	).Scan(&storeID, &receiptDate, &status)
+	).Scan(&storeID, &status)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
@@ -1317,7 +1680,7 @@ func (h *ReceiptHandler) ApplyRepair(c echo.Context) error {
 		if strings.TrimSpace(item.RawName) == "" {
 			continue
 		}
-		if err := insertRepairedLineItem(tx, receiptID, storeID, receiptDate, item, preserved, now); err != nil {
+		if err := insertRepairedLineItem(tx, receiptID, storeID, item, preserved, now); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to apply repaired items"})
 		}
 	}
@@ -1386,7 +1749,7 @@ func loadPreservedMatches(tx *sql.Tx, receiptID string) (map[string]preservedLin
 	return matches, nil
 }
 
-func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, receiptDate time.Time, item llm.ExtractedItem, preserved map[string]preservedLineMatch, now time.Time) error {
+func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, item llm.ExtractedItem, preserved map[string]preservedLineMatch, now time.Time) error {
 	quantity := decimal.NewFromFloat(item.Quantity)
 	if quantity.IsZero() {
 		quantity = decimal.NewFromInt(1)
@@ -1460,23 +1823,7 @@ func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, recei
 	}
 
 	if productID != nil && storeID != nil {
-		unit := "each"
-		if item.Unit != nil && strings.TrimSpace(*item.Unit) != "" {
-			unit = *item.Unit
-		}
-		priceQuantity := quantity
-		if priceQuantity.IsZero() {
-			priceQuantity = decimal.NewFromInt(1)
-		}
-		isSale := regularPrice != nil && discountAmount != nil
-		_, err = tx.Exec(
-			`INSERT INTO product_prices
-			    (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			uuid.New().String(), *productID, *storeID, receiptID, receiptDate,
-			quantity.String(), unit, totalPrice.Div(priceQuantity).String(),
-			regularPrice, discountAmount, isSale, now,
-		)
+		err = prices.RecordProductPriceFromLineItem(context.Background(), tx, lineItemID)
 	}
 	return err
 }
@@ -1549,30 +1896,107 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 	// Build dynamic update.
 	setClauses := make([]string, 0)
 	args := make([]interface{}, 0)
+	reviewSensitiveChange := false
+	settingAccepted := false
+	clearingProduct := false
 
 	if req.ProductID != nil {
-		setClauses = append(setClauses, "product_id = ?")
-		args = append(args, *req.ProductID)
+		productID := strings.TrimSpace(*req.ProductID)
+		if productID == "" {
+			clearingProduct = true
+			setClauses = append(setClauses, "product_id = NULL", "matched = 'unmatched'", "confidence = NULL")
+		} else {
+			var productExists int
+			err := h.DB.QueryRow(
+				"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
+				productID, householdID,
+			).Scan(&productExists)
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "product_id not found"})
+			}
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+			}
+			setClauses = append(setClauses, "product_id = ?", "matched = 'manual'")
+			args = append(args, productID)
+		}
+		reviewSensitiveChange = true
 	}
 	if req.Quantity != nil {
 		setClauses = append(setClauses, "quantity = ?")
 		args = append(args, *req.Quantity)
+		reviewSensitiveChange = true
 	}
 	if req.Unit != nil {
 		setClauses = append(setClauses, "unit = ?")
 		args = append(args, *req.Unit)
+		reviewSensitiveChange = true
 	}
 	if req.Price != nil {
 		setClauses = append(setClauses, "total_price = ?")
 		args = append(args, *req.Price)
+		reviewSensitiveChange = true
 	}
 	if req.TotalPrice != nil {
 		setClauses = append(setClauses, "total_price = ?")
 		args = append(args, *req.TotalPrice)
+		reviewSensitiveChange = true
+	}
+	if req.PackQuantityOverride != nil {
+		setClauses = append(setClauses, "pack_quantity_override = ?")
+		args = append(args, nullableTrimmedString(*req.PackQuantityOverride))
+		reviewSensitiveChange = true
+	}
+	if req.PackUnitOverride != nil {
+		setClauses = append(setClauses, "pack_unit_override = ?")
+		args = append(args, nullableTrimmedString(*req.PackUnitOverride))
+		reviewSensitiveChange = true
+	}
+	if req.PackOverrideSource != nil {
+		source := strings.TrimSpace(*req.PackOverrideSource)
+		if source != "" && source != "user" && source != "import" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "pack_override_source must be user or import"})
+		}
+		setClauses = append(setClauses, "pack_override_source = ?")
+		args = append(args, nullableTrimmedString(source))
+		reviewSensitiveChange = true
+	}
+	if req.ReviewStatus != nil {
+		status := strings.TrimSpace(*req.ReviewStatus)
+		if status != "pending" && status != "accepted" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "review_status must be pending or accepted"})
+		}
+		if status == "accepted" {
+			settingAccepted = true
+		}
+		if settingAccepted && clearingProduct {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "match line item before accepting it"})
+		}
+		setClauses = append(setClauses, "review_status = ?")
+		args = append(args, status)
+	} else if reviewSensitiveChange {
+		setClauses = append(setClauses, "review_status = 'pending'")
 	}
 
 	if len(setClauses) == 0 {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "no fields to update"})
+	}
+
+	if settingAccepted && req.ProductID == nil {
+		var productID sql.NullString
+		err := h.DB.QueryRow(
+			"SELECT product_id FROM line_items WHERE id = ? AND receipt_id = ?",
+			itemID, receiptID,
+		).Scan(&productID)
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if !productID.Valid || strings.TrimSpace(productID.String) == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "match line item before accepting it"})
+		}
 	}
 
 	args = append(args, itemID, receiptID)
@@ -1581,7 +2005,13 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 		strings.Join(setClauses, ", "),
 	)
 
-	result, err := h.DB.Exec(query, args...)
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(c.Request().Context(), query, args...)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -1590,31 +2020,170 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
 	}
 
+	if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update price record"})
+	}
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
 }
 
-// UpdateReceipt updates receipt status (e.g., mark as reviewed).
+// UpdateReceipt updates editable receipt metadata and status.
 // PUT /api/v1/receipts/:id
 func (h *ReceiptHandler) UpdateReceipt(c echo.Context) error {
 	householdID := auth.HouseholdIDFrom(c)
 	receiptID := c.Param("id")
 
 	var req struct {
-		Status string `json:"status"`
+		Status      *string `json:"status"`
+		StoreID     *string `json:"store_id"`
+		ReceiptDate *string `json:"receipt_date"`
+		ReceiptTime *string `json:"receipt_time"`
+		Subtotal    *string `json:"subtotal"`
+		Tax         *string `json:"tax"`
+		Total       *string `json:"total"`
+		CardType    *string `json:"card_type"`
+		CardLast4   *string `json:"card_last4"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	allowedStatuses := map[string]bool{"reviewed": true, "matched": true}
-	if !allowedStatuses[req.Status] {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid status"})
+	setClauses := make([]string, 0)
+	args := make([]interface{}, 0)
+	priceSensitiveChange := false
+	responseStatus := "updated"
+
+	if req.Status != nil {
+		status := strings.TrimSpace(*req.Status)
+		allowedStatuses := map[string]bool{"reviewed": true, "matched": true}
+		if !allowedStatuses[status] {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid status"})
+		}
+		setClauses = append(setClauses, "status = ?")
+		args = append(args, status)
+		responseStatus = status
+	}
+	if req.StoreID != nil {
+		storeID := strings.TrimSpace(*req.StoreID)
+		if storeID != "" {
+			var exists int
+			err := h.DB.QueryRow(
+				"SELECT 1 FROM stores WHERE id = ? AND household_id = ?",
+				storeID, householdID,
+			).Scan(&exists)
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "store_id not found"})
+			}
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+			}
+		}
+		setClauses = append(setClauses, "store_id = ?")
+		args = append(args, nullableTrimmedString(storeID))
+		priceSensitiveChange = true
+	}
+	if req.ReceiptDate != nil {
+		receiptDate := strings.TrimSpace(*req.ReceiptDate)
+		if receiptDate == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "receipt_date is required"})
+		}
+		if _, err := time.Parse("2006-01-02", receiptDate); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "receipt_date must be YYYY-MM-DD"})
+		}
+		setClauses = append(setClauses, "receipt_date = ?")
+		args = append(args, receiptDate)
+		priceSensitiveChange = true
+	}
+	if req.ReceiptTime != nil {
+		receiptTime, err := nullableReceiptTime(*req.ReceiptTime)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "receipt_time must be HH:MM"})
+		}
+		setClauses = append(setClauses, "receipt_time = ?")
+		args = append(args, receiptTime)
+	}
+	if req.Subtotal != nil {
+		value, err := nullableDecimalString(*req.Subtotal)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "subtotal must be a decimal"})
+		}
+		setClauses = append(setClauses, "subtotal = ?")
+		args = append(args, value)
+	}
+	if req.Tax != nil {
+		value, err := nullableDecimalString(*req.Tax)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "tax must be a decimal"})
+		}
+		setClauses = append(setClauses, "tax = ?")
+		args = append(args, value)
+	}
+	if req.Total != nil {
+		value, err := nullableDecimalString(*req.Total)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "total must be a decimal"})
+		}
+		setClauses = append(setClauses, "total = ?")
+		args = append(args, value)
+	}
+	if req.CardType != nil {
+		setClauses = append(setClauses, "card_type = ?")
+		args = append(args, nullableTrimmedString(*req.CardType))
+	}
+	if req.CardLast4 != nil {
+		last4 := strings.TrimSpace(*req.CardLast4)
+		if last4 != "" && len(last4) != 4 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "card_last4 must be 4 digits"})
+		}
+		setClauses = append(setClauses, "card_last4 = ?")
+		args = append(args, nullableTrimmedString(last4))
+	}
+	if len(setClauses) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "no fields to update"})
 	}
 
-	result, err := h.DB.Exec(
-		"UPDATE receipts SET status = ? WHERE id = ? AND household_id = ?",
-		req.Status, receiptID, householdID,
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	var exists int
+	err = tx.QueryRowContext(
+		c.Request().Context(),
+		"SELECT 1 FROM receipts WHERE id = ? AND household_id = ?",
+		receiptID, householdID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if req.Status != nil && strings.TrimSpace(*req.Status) == "reviewed" {
+		var pendingCount int
+		if err := tx.QueryRowContext(
+			c.Request().Context(),
+			"SELECT COUNT(*) FROM line_items WHERE receipt_id = ? AND review_status <> 'accepted'",
+			receiptID,
+		).Scan(&pendingCount); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if pendingCount > 0 {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "all line items must be reviewed before confirming receipt"})
+		}
+	}
+
+	args = append(args, receiptID, householdID)
+	query := fmt.Sprintf(
+		"UPDATE receipts SET %s WHERE id = ? AND household_id = ?",
+		strings.Join(setClauses, ", "),
 	)
+	result, err := tx.ExecContext(c.Request().Context(), query, args...)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
@@ -1623,7 +2192,41 @@ func (h *ReceiptHandler) UpdateReceipt(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
 
-	return c.JSON(http.StatusOK, map[string]string{"status": req.Status})
+	if priceSensitiveChange {
+		rows, err := tx.QueryContext(
+			c.Request().Context(),
+			"SELECT id FROM line_items WHERE receipt_id = ?",
+			receiptID,
+		)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		lineItemIDs := make([]string, 0)
+		for rows.Next() {
+			var lineItemID string
+			if err := rows.Scan(&lineItemID); err != nil {
+				rows.Close()
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+			}
+			lineItemIDs = append(lineItemIDs, lineItemID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		rows.Close()
+		for _, lineItemID := range lineItemIDs {
+			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, lineItemID); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update price records"})
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": responseStatus})
 }
 
 // --- Accept Suggestions types ---
@@ -1666,11 +2269,10 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 
 	// Verify receipt belongs to household.
 	var storeID *string
-	var receiptDate time.Time
 	err := h.DB.QueryRow(
-		"SELECT store_id, receipt_date FROM receipts WHERE id = ? AND household_id = ?",
+		"SELECT store_id FROM receipts WHERE id = ? AND household_id = ?",
 		receiptID, householdID,
-	).Scan(&storeID, &receiptDate)
+	).Scan(&storeID)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
@@ -1697,20 +2299,15 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 		// Fetch line item with suggestion data.
 		var rawName string
 		var suggestedName, suggestedCategory, suggestedProductID, suggestedBrand *string
-		var quantity decimal.Decimal
 		var unit *string
-		var totalPrice decimal.Decimal
-		var regularPrice, discountAmount sql.NullString
 		err := tx.QueryRow(
 			`SELECT li.raw_name, li.suggested_name, li.suggested_category, li.suggested_product_id,
-			        li.quantity, li.unit, li.total_price, li.regular_price, li.discount_amount,
-			        li.suggested_brand
+			        li.unit, li.suggested_brand
 			 FROM line_items li
 			 WHERE li.id = ? AND li.receipt_id = ?`,
 			itemID, receiptID,
 		).Scan(&rawName, &suggestedName, &suggestedCategory, &suggestedProductID,
-			&quantity, &unit, &totalPrice, &regularPrice, &discountAmount,
-			&suggestedBrand)
+			&unit, &suggestedBrand)
 		if err == sql.ErrNoRows {
 			continue // skip invalid IDs
 		}
@@ -1818,37 +2415,12 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 				)
 			}
 
-			// Insert product_prices record.
-			unitStr := "each"
-			if unit != nil {
-				unitStr = *unit
+			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
 			}
-			if quantity.IsZero() {
-				quantity = decimal.NewFromInt(1)
-			}
-			unitPrice := totalPrice.Div(quantity)
-			isSale := regularPrice.Valid && discountAmount.Valid
-			var regPriceVal, discountVal interface{}
-			if regularPrice.Valid {
-				regPriceVal = regularPrice.String
-			}
-			if discountAmount.Valid {
-				discountVal = discountAmount.String
-			}
-			_, _ = tx.Exec(
-				`INSERT INTO product_prices (id, product_id, store_id, receipt_id, receipt_date, quantity, unit, unit_price, regular_price, discount_amount, is_sale, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				uuid.New().String(), productID, *storeID, receiptID,
-				receiptDate, quantity.String(), unitStr, unitPrice.String(),
-				regPriceVal, discountVal, isSale, now,
-			)
 		}
 
-		// Update product purchase stats and set default_unit if not yet set.
-		_, _ = tx.Exec(
-			"UPDATE products SET last_purchased_at = ?, purchase_count = purchase_count + 1, updated_at = ? WHERE id = ?",
-			receiptDate, now, productID,
-		)
+		// Set default_unit if not yet set.
 		if unit != nil && *unit != "" {
 			_, _ = tx.Exec(
 				"UPDATE products SET default_unit = ? WHERE id = ? AND default_unit IS NULL",

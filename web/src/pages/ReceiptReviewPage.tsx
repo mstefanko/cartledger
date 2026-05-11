@@ -2,14 +2,40 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ReceiptReview } from '@/components/receipts/ReceiptReview'
-import { getReceipt, deleteReceipt, reprocessReceipt, type ReceiptDetail } from '@/api/receipts'
+import { getReceipt, deleteReceipt, reprocessReceipt, updateReceipt, type ReceiptDetail } from '@/api/receipts'
+import { listStores } from '@/api/stores'
 import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 import { ApiClientError } from '@/api/client'
 import { formatDateOnly } from '@/lib/dates'
+import type { UpdateReceiptRequest } from '@/types'
 
 const LENS_SIZE = 280
 const ZOOM = 0.75
+
+type ReceiptMetaForm = {
+  store_id: string
+  receipt_date: string
+  receipt_time: string
+  subtotal: string
+  tax: string
+  total: string
+}
+
+const emptyReceiptMeta: ReceiptMetaForm = {
+  store_id: '',
+  receipt_date: '',
+  receipt_time: '',
+  subtotal: '',
+  tax: '',
+  total: '',
+}
+
+function timeInputValue(value: string | null | undefined): string {
+  if (!value || value.toLowerCase() === '<unknown>') return ''
+  const match = value.match(/^(\d{2}:\d{2})/)
+  return match?.[1] ?? ''
+}
 
 function ReceiptImagePending({ message }: { message: string }) {
   return (
@@ -94,8 +120,26 @@ function ReceiptReviewPage() {
     queryFn: () => getReceipt(id!),
     enabled: !!id,
   })
+  const { data: stores = [] } = useQuery({
+    queryKey: ['stores'],
+    queryFn: listStores,
+  })
+  const [receiptMeta, setReceiptMeta] = useState<ReceiptMetaForm>(emptyReceiptMeta)
+
+  useEffect(() => {
+    if (!receipt) return
+    setReceiptMeta({
+      store_id: receipt.store_id ?? '',
+      receipt_date: receipt.receipt_date ?? '',
+      receipt_time: timeInputValue(receipt.receipt_time),
+      subtotal: receipt.subtotal ?? '',
+      tax: receipt.tax ?? '',
+      total: receipt.total ?? '',
+    })
+  }, [receipt])
 
   const isExtracting = receipt?.status === 'pending' || receipt?.status === 'processing'
+  const canEditReceiptMeta = !!receipt && receipt.status !== 'reviewed'
 
   useEffect(() => {
     if (!id || !isExtracting) return
@@ -113,6 +157,33 @@ function ReceiptReviewPage() {
       navigate('/receipts')
     },
   })
+
+  const updateReceiptMutation = useMutation({
+    mutationFn: (patch: UpdateReceiptRequest) => updateReceipt(id!, patch),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['receipt', id] })
+      void queryClient.invalidateQueries({ queryKey: ['receipts'] })
+      void queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+
+  const commitReceiptMeta = useCallback(
+    (field: keyof ReceiptMetaForm) => {
+      if (!receipt || !canEditReceiptMeta) return
+      const value = receiptMeta[field].trim()
+      const current: ReceiptMetaForm = {
+        store_id: receipt.store_id ?? '',
+        receipt_date: receipt.receipt_date ?? '',
+        receipt_time: timeInputValue(receipt.receipt_time),
+        subtotal: receipt.subtotal ?? '',
+        tax: receipt.tax ?? '',
+        total: receipt.total ?? '',
+      }
+      if (value === current[field]) return
+      updateReceiptMutation.mutate({ [field]: value } as UpdateReceiptRequest)
+    },
+    [canEditReceiptMeta, receipt, receiptMeta, updateReceiptMutation],
+  )
 
   const [retryError, setRetryError] = useState<string | null>(null)
   const retryMutation = useMutation({
@@ -155,6 +226,11 @@ function ReceiptReviewPage() {
     const processed = images.filter((image) => image.kind === 'processed')
     return processed.length > 0 ? processed : images.filter((image) => image.kind === 'original')
   })()
+  const metaControlClass = [
+    'h-9 w-full rounded-lg border border-neutral-200 bg-white px-2 text-caption text-neutral-900',
+    'focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand',
+    !canEditReceiptMeta ? 'cursor-not-allowed bg-neutral-50 text-neutral-400' : '',
+  ].join(' ')
 
   return (
     <div className="py-6">
@@ -176,32 +252,115 @@ function ReceiptReviewPage() {
       </h1>
 
       {receipt && (
-        <div className="flex items-center gap-3 text-sm text-neutral-500 mb-4">
-          {receipt.receipt_date && (
-            <span>
-              {formatDateOnly(receipt.receipt_date, {
-                year: 'numeric',
-                month: 'short',
-                day: 'numeric',
-              })}
-              {receipt.receipt_time && ` at ${receipt.receipt_time}`}
-            </span>
-          )}
-          {receipt.created_at && receipt.created_at !== receipt.receipt_date && (
-            <span className="text-neutral-400">
-              Scanned {new Date(receipt.created_at).toLocaleDateString(undefined, {
-                year: 'numeric',
-                month: 'short',
-                day: 'numeric',
-              })}
-            </span>
-          )}
-          {receipt.card_type && (
-            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-neutral-100 text-neutral-700">
-              {receipt.card_type}
-              {receipt.card_last4 ? ` \u00b7\u00b7\u00b7\u00b7${receipt.card_last4}` : ''}
-            </span>
-          )}
+        <div className="mb-4 rounded-lg border border-neutral-200 bg-neutral-50/60 p-3">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-[minmax(9rem,1fr)_minmax(8rem,0.9fr)_minmax(7rem,0.7fr)_repeat(3,minmax(5.5rem,0.6fr))]">
+            <label className="flex flex-col gap-1 text-small font-medium text-neutral-500">
+              Store
+              <select
+                value={receiptMeta.store_id}
+                disabled={!canEditReceiptMeta}
+                onChange={(event) => {
+                  const value = event.target.value
+                  setReceiptMeta((prev) => ({ ...prev, store_id: value }))
+                  updateReceiptMutation.mutate({ store_id: value })
+                }}
+                className={metaControlClass}
+              >
+                <option value="">Unknown</option>
+                {stores.map((store) => (
+                  <option key={store.id} value={store.id}>
+                    {store.nickname ?? store.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1 text-small font-medium text-neutral-500">
+              Date
+              <input
+                type="date"
+                value={receiptMeta.receipt_date}
+                disabled={!canEditReceiptMeta}
+                onChange={(event) => setReceiptMeta((prev) => ({ ...prev, receipt_date: event.target.value }))}
+                onBlur={() => commitReceiptMeta('receipt_date')}
+                className={metaControlClass}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-small font-medium text-neutral-500">
+              Time
+              <input
+                type="time"
+                value={receiptMeta.receipt_time}
+                disabled={!canEditReceiptMeta}
+                placeholder="Time missing"
+                onChange={(event) => setReceiptMeta((prev) => ({ ...prev, receipt_time: event.target.value }))}
+                onBlur={() => commitReceiptMeta('receipt_time')}
+                className={metaControlClass}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-small font-medium text-neutral-500">
+              Subtotal
+              <input
+                inputMode="decimal"
+                value={receiptMeta.subtotal}
+                disabled={!canEditReceiptMeta}
+                onChange={(event) => setReceiptMeta((prev) => ({ ...prev, subtotal: event.target.value }))}
+                onBlur={() => commitReceiptMeta('subtotal')}
+                className={metaControlClass}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-small font-medium text-neutral-500">
+              Tax
+              <input
+                inputMode="decimal"
+                value={receiptMeta.tax}
+                disabled={!canEditReceiptMeta}
+                onChange={(event) => setReceiptMeta((prev) => ({ ...prev, tax: event.target.value }))}
+                onBlur={() => commitReceiptMeta('tax')}
+                className={metaControlClass}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-small font-medium text-neutral-500">
+              Total
+              <input
+                inputMode="decimal"
+                value={receiptMeta.total}
+                disabled={!canEditReceiptMeta}
+                onChange={(event) => setReceiptMeta((prev) => ({ ...prev, total: event.target.value }))}
+                onBlur={() => commitReceiptMeta('total')}
+                className={metaControlClass}
+              />
+            </label>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-3 text-small text-neutral-400">
+            {receipt.receipt_date && (
+              <span>
+                {formatDateOnly(receipt.receipt_date, {
+                  year: 'numeric',
+                  month: 'short',
+                  day: 'numeric',
+                })}
+                {receipt.receipt_time && !receipt.receipt_time.toLowerCase().includes('unknown') && ` at ${receipt.receipt_time}`}
+              </span>
+            )}
+            {receipt.created_at && receipt.created_at !== receipt.receipt_date && (
+              <span>
+                Scanned {new Date(receipt.created_at).toLocaleDateString(undefined, {
+                  year: 'numeric',
+                  month: 'short',
+                  day: 'numeric',
+                })}
+              </span>
+            )}
+            {receipt.card_type && (
+              <span className="inline-flex items-center rounded bg-neutral-100 px-2 py-0.5 text-small font-medium text-neutral-700">
+                {receipt.card_type}
+                {receipt.card_last4 ? ` \u00b7\u00b7\u00b7\u00b7${receipt.card_last4}` : ''}
+              </span>
+            )}
+            {updateReceiptMutation.isError && (
+              <span className="text-expensive">Receipt details failed to save.</span>
+            )}
+          </div>
         </div>
       )}
 

@@ -1,10 +1,8 @@
-PORT ?= 8079
-
-# Load .env if it exists (exports vars for all targets)
-ifneq (,$(wildcard .env))
-  include .env
-  export
-endif
+# The Go server loads .env via godotenv. Do not include/export the full file
+# here: make treats quoted dotenv values as literal bytes.
+ENV_PORT_RAW := $(shell sed -n 's/^[[:space:]]*PORT[[:space:]]*=[[:space:]]*//p' .env 2>/dev/null | tail -n 1 | sed 's/[[:space:]]*\#.*$$//; s/^[[:space:]]*//; s/[[:space:]]*$$//')
+ENV_PORT := $(subst ',,$(subst ",,$(ENV_PORT_RAW)))
+PORT ?= $(if $(ENV_PORT),$(ENV_PORT),8079)
 
 .PHONY: run kill restart build dev smoke
 

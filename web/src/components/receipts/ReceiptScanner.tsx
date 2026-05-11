@@ -3,17 +3,24 @@ import { useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { scanReceipt } from '@/api/receipts'
 import { Button } from '@/components/ui/Button'
+import {
+  isPdfFile,
+  MAX_RECEIPT_PAGES,
+  normalizeReceiptImageFile,
+  RECEIPT_FILE_ACCEPT,
+  RECEIPT_UPLOAD_JPEG_QUALITY,
+  RECEIPT_UPLOAD_MAX_LONG_EDGE,
+  type ReceiptPageSource,
+  type ReceiptUploadPage,
+  validatePageBudget,
+  validateReceiptFile,
+} from '@/lib/receiptUpload'
 import type { Receipt } from '@/types'
 
-const MAX_IMAGES = 5
-const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
-const ACCEPTED_TYPES = ['image/jpeg', 'image/png']
-const RESIZE_MAX_DIM = 1600 // max width or height in px
-const RESIZE_QUALITY = 0.85
-
-interface ImageEntry {
+interface PageEntry {
   file: File
   previewUrl: string
+  source: ReceiptPageSource
 }
 
 type ScannerPhase = 'capture' | 'preparing' | 'uploading' | 'error'
@@ -26,19 +33,20 @@ type ScannerPhase = 'capture' | 'preparing' | 'uploading' | 'error'
  * On any failure, returns the original file so the upload still works.
  */
 async function resizeImage(file: File): Promise<File> {
+  const normalizedFile = normalizeReceiptImageFile(file)
   try {
     // createImageBitmap handles EXIF orientation automatically
-    const bitmap = await createImageBitmap(file)
+    const bitmap = await createImageBitmap(normalizedFile)
     const { width, height } = bitmap
 
     // Skip if already within bounds
-    if (width <= RESIZE_MAX_DIM && height <= RESIZE_MAX_DIM) {
+    if (width <= RECEIPT_UPLOAD_MAX_LONG_EDGE && height <= RECEIPT_UPLOAD_MAX_LONG_EDGE) {
       bitmap.close()
-      return file
+      return normalizedFile
     }
 
     // Calculate target dimensions preserving aspect ratio
-    const scale = Math.min(RESIZE_MAX_DIM / width, RESIZE_MAX_DIM / height)
+    const scale = Math.min(RECEIPT_UPLOAD_MAX_LONG_EDGE / width, RECEIPT_UPLOAD_MAX_LONG_EDGE / height)
     let targetW = Math.round(width * scale)
     let targetH = Math.round(height * scale)
 
@@ -72,48 +80,41 @@ async function resizeImage(file: File): Promise<File> {
     if (source instanceof ImageBitmap) source.close()
 
     const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, 'image/jpeg', RESIZE_QUALITY)
+      canvas.toBlob(resolve, 'image/jpeg', RECEIPT_UPLOAD_JPEG_QUALITY)
     )
 
-    if (!blob) return file // fallback to original
+    if (!blob) return normalizedFile // fallback to original
 
-    return new File([blob], file.name.replace(/\.\w+$/, '.jpg'), {
+    return new File([blob], normalizedFile.name.replace(/\.\w+$/, '.jpg'), {
       type: 'image/jpeg',
-      lastModified: file.lastModified,
+      lastModified: normalizedFile.lastModified,
     })
   } catch {
     // Any failure (canvas OOM, unsupported format) — send original
-    return file
+    return normalizedFile
   }
-}
-
-function validateFile(file: File): string | null {
-  if (!ACCEPTED_TYPES.includes(file.type)) {
-    return `"${file.name}" is not a supported format. Use JPEG or PNG.`
-  }
-  if (file.size > MAX_FILE_SIZE) {
-    const sizeMB = (file.size / (1024 * 1024)).toFixed(1)
-    return `"${file.name}" is ${sizeMB} MB. Maximum is 10 MB.`
-  }
-  return null
 }
 
 function ReceiptScanner() {
   const navigate = useNavigate()
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const [images, setImages] = useState<ImageEntry[]>([])
+  const pagesRef = useRef<PageEntry[]>([])
+  const [pages, setPages] = useState<PageEntry[]>([])
   const [phase, setPhase] = useState<ScannerPhase>('capture')
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    pagesRef.current = pages
+  }, [pages])
 
   // Clean up object URLs on unmount
   useEffect(() => {
     return () => {
-      images.forEach((img) => URL.revokeObjectURL(img.previewUrl))
+      pagesRef.current.forEach((page) => URL.revokeObjectURL(page.previewUrl))
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const uploadMutation = useMutation<Receipt, Error, File[]>({
+  const uploadMutation = useMutation<Receipt, Error, ReceiptUploadPage[]>({
     mutationFn: scanReceipt,
     onSuccess: (receipt) => {
       navigate(`/receipts/${receipt.id}`)
@@ -125,45 +126,75 @@ function ReceiptScanner() {
   })
 
   const handleFileChange = useCallback(
-    (event: React.ChangeEvent<HTMLInputElement>) => {
-      const files = event.target.files
-      if (!files || files.length === 0) return
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? [])
+      event.target.value = ''
+      if (files.length === 0) return
 
       setError(null)
+      setPhase('preparing')
 
-      const newEntries: ImageEntry[] = []
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i]
-        if (!file) continue
+      const newEntries: PageEntry[] = []
+      let nextError: string | null = null
 
-        if (images.length + newEntries.length >= MAX_IMAGES) {
-          setError(`Maximum ${MAX_IMAGES} images per receipt.`)
-          break
+      try {
+        for (const file of files) {
+          const validationError = validateReceiptFile(file)
+          if (validationError) {
+            nextError ??= validationError
+            continue
+          }
+
+          const budgetError = validatePageBudget(pages.length + newEntries.length, 1)
+          if (budgetError) {
+            nextError ??= budgetError
+            break
+          }
+
+          if (isPdfFile(file)) {
+            const remainingPageBudget = MAX_RECEIPT_PAGES - pages.length - newEntries.length
+            try {
+              const { renderPdfToJpegs } = await import('@/lib/pdfIngest')
+              const renderedPages = await renderPdfToJpegs(file, { remainingPageBudget })
+              newEntries.push(
+                ...renderedPages.map((page) => ({
+                  file: page.file,
+                  previewUrl: URL.createObjectURL(page.file),
+                  source: 'pdf_rendered' as const,
+                })),
+              )
+            } catch (err) {
+              nextError ??= err instanceof Error ? err.message : 'Failed to prepare the selected PDF.'
+            }
+            continue
+          }
+
+          newEntries.push({
+            file,
+            previewUrl: URL.createObjectURL(file),
+            source: 'photo',
+          })
         }
 
-        const validationError = validateFile(file)
-        if (validationError) {
-          setError(validationError)
-          continue
+        if (newEntries.length > 0) {
+          setPages((prev) => [...prev, ...newEntries])
         }
 
-        newEntries.push({
-          file,
-          previewUrl: URL.createObjectURL(file),
-        })
+        if (nextError) {
+          setError(nextError)
+        }
+      } catch (err) {
+        newEntries.forEach((entry) => URL.revokeObjectURL(entry.previewUrl))
+        setError(err instanceof Error ? err.message : 'Failed to prepare the selected receipt file.')
+      } finally {
+        setPhase('capture')
       }
-
-      if (newEntries.length > 0) {
-        setImages((prev) => [...prev, ...newEntries])
-      }
-
-      event.target.value = ''
     },
-    [images.length],
+    [pages.length],
   )
 
-  const removeImage = useCallback((index: number) => {
-    setImages((prev) => {
+  const removePage = useCallback((index: number) => {
+    setPages((prev) => {
       const removed = prev[index]
       if (removed) {
         URL.revokeObjectURL(removed.previewUrl)
@@ -177,35 +208,40 @@ function ReceiptScanner() {
   }, [])
 
   const handleUpload = useCallback(async () => {
-    if (images.length === 0) return
+    if (pages.length === 0) return
     setError(null)
     setPhase('preparing')
 
     try {
-      const resized = await Promise.all(images.map((img) => resizeImage(img.file)))
+      const resized = await Promise.all(
+        pages.map(async (page) => ({
+          file: await resizeImage(page.file),
+          source: page.source,
+        })),
+      )
       setPhase('uploading')
       uploadMutation.mutate(resized)
     } catch {
-      setError('Failed to process images. Please try again.')
+      setError('Failed to process receipt pages. Please try again.')
       setPhase('error')
     }
-  }, [images, uploadMutation])
+  }, [pages, uploadMutation])
 
   const handleRetry = useCallback(() => {
     setError(null)
     setPhase('capture')
   }, [])
 
-  // --- Preparing state (resizing images) ---
+  // --- Preparing state (converting/resizing pages) ---
   if (phase === 'preparing') {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <div className="h-12 w-12 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
         <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
-          Preparing images...
+          Preparing receipt...
         </p>
         <p className="mt-2 text-body text-neutral-400">
-          Optimizing for faster processing.
+          Converting and optimizing pages.
         </p>
       </div>
     )
@@ -217,10 +253,10 @@ function ReceiptScanner() {
       <div className="flex flex-col items-center justify-center py-16 text-center">
         <div className="h-12 w-12 animate-spin rounded-full border-4 border-neutral-200 border-t-brand" />
         <p className="mt-6 font-display text-feature font-semibold text-neutral-900">
-          Uploading images...
+          Uploading receipt...
         </p>
         <p className="mt-2 text-body text-neutral-400">
-          {images.length} {images.length === 1 ? 'image' : 'images'} being sent.
+          {pages.length} {pages.length === 1 ? 'page' : 'pages'} being sent.
         </p>
       </div>
     )
@@ -254,13 +290,13 @@ function ReceiptScanner() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*"
-        capture="environment"
+        accept={RECEIPT_FILE_ACCEPT}
+        multiple
         className="hidden"
         onChange={handleFileChange}
       />
 
-      {images.length === 0 && (
+      {pages.length === 0 && (
         <button
           type="button"
           onClick={openFilePicker}
@@ -271,20 +307,20 @@ function ReceiptScanner() {
             <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0z" />
           </svg>
           <span className="text-body-medium text-neutral-900">
-            Take Photo or Choose Image
+            Take Photo or Choose File
           </span>
           <span className="text-caption text-neutral-400">
-            JPEG or PNG, up to 10 MB
+            JPEG, PNG, or PDF, up to 10 pages and 10 MB per file
           </span>
         </button>
       )}
 
-      {images.length > 0 && (
+      {pages.length > 0 && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-          {images.map((img, index) => (
-            <div key={img.previewUrl} className="group relative aspect-[3/4] overflow-hidden rounded-xl border border-neutral-200">
+          {pages.map((page, index) => (
+            <div key={page.previewUrl} className="group relative aspect-[3/4] overflow-hidden rounded-xl border border-neutral-200">
               <img
-                src={img.previewUrl}
+                src={page.previewUrl}
                 alt={`Receipt page ${index + 1}`}
                 className="h-full w-full object-cover"
               />
@@ -293,9 +329,9 @@ function ReceiptScanner() {
               </span>
               <button
                 type="button"
-                onClick={() => removeImage(index)}
+                onClick={() => removePage(index)}
                 className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-lg bg-neutral-900/70 text-white opacity-0 transition-opacity group-hover:opacity-100 hover:bg-expensive active:bg-expensive cursor-pointer"
-                aria-label={`Remove image ${index + 1}`}
+                aria-label={`Remove page ${index + 1}`}
               >
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -310,9 +346,9 @@ function ReceiptScanner() {
         <p className="text-caption text-expensive">{error}</p>
       )}
 
-      {images.length > 0 && (
+      {pages.length > 0 && (
         <div className="flex flex-col gap-3 sm:flex-row">
-          {images.length < MAX_IMAGES && (
+          {pages.length < MAX_RECEIPT_PAGES && (
             <Button variant="outlined" onClick={openFilePicker} className="flex-1">
               <svg className="mr-2 h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
@@ -329,10 +365,10 @@ function ReceiptScanner() {
         </div>
       )}
 
-      {images.length > 0 && (
+      {pages.length > 0 && (
         <p className="text-center text-small text-neutral-400">
-          {images.length} of {MAX_IMAGES} images
-          {images.length < MAX_IMAGES && ' — add more for long receipts'}
+          {pages.length} of {MAX_RECEIPT_PAGES} pages
+          {pages.length < MAX_RECEIPT_PAGES && ' — add more for long receipts'}
         </p>
       )}
     </div>

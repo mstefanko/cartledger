@@ -23,6 +23,16 @@ export interface CompareAppearance {
   size_known: boolean
   normalized_price?: string
   normalized_unit?: string
+  lines?: CompareLineChoice[]
+}
+
+export interface CompareLineChoice {
+  line_item_id: string
+  raw_name: string
+  quantity?: string
+  unit?: string
+  total_price: string
+  unit_price?: string
 }
 
 export interface CompareProduct {
