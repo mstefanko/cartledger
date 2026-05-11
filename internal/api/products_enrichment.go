@@ -22,6 +22,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/enrichment/adapters"
 	"github.com/mstefanko/cartledger/internal/httpsafe"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/upc"
 )
 
 type addProductLinkRequest struct {
@@ -32,6 +33,13 @@ type addProductLinkResponse struct {
 	Link        productLinkResponse                   `json:"link"`
 	Suggestions []productEnrichmentSuggestionResponse `json:"suggestions"`
 }
+
+var (
+	openFoodFactsAPIBase     = "https://world.openfoodfacts.org/api/v2/product/"
+	openFoodFactsProductBase = "https://world.openfoodfacts.org/product/"
+	usdaSearchAPIBase        = "https://api.nal.usda.gov/fdc/v1/foods/search"
+	usdaFoodDetailsBase      = "https://fdc.nal.usda.gov/fdc-app.html#/food-details/"
+)
 
 type enrichUPCRequest struct {
 	UPC string `json:"upc"`
@@ -103,20 +111,7 @@ func normalizeUPCPointer(value *string) (*string, error) {
 }
 
 func normalizeUPCValue(value string) (string, error) {
-	var b strings.Builder
-	for _, r := range strings.TrimSpace(value) {
-		if r >= '0' && r <= '9' {
-			b.WriteRune(r)
-		}
-	}
-	out := b.String()
-	if out == "" {
-		return "", nil
-	}
-	if len(out) < 8 || len(out) > 14 {
-		return "", fmt.Errorf("upc must contain 8 to 14 digits")
-	}
-	return out, nil
+	return upc.Normalize(value)
 }
 
 func scanProductLink(scanner rowScanner) (productLinkResponse, error) {
@@ -219,13 +214,14 @@ func (h *ProductHandler) EnrichByUPC(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
-	sourceURL := "https://world.openfoodfacts.org/product/" + url.PathEscape(upc)
-	apiURL := "https://world.openfoodfacts.org/api/v2/product/" + url.PathEscape(upc) + ".json"
+	sourceURL := strings.TrimRight(openFoodFactsProductBase, "/") + "/" + url.PathEscape(upc)
+	apiURL := strings.TrimRight(openFoodFactsAPIBase, "/") + "/" + url.PathEscape(upc) + ".json"
 	suggestions := []enrichment.Suggestion{
 		enrichment.NewSuggestion("user_upc", sourceURL, "upc", upc, "UPC entered by user", 0.9),
 	}
 
-	client := httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, false)
+	allowPrivateProviders := h.Cfg != nil && h.Cfg.AllowPrivateIntegrations
+	client := httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, allowPrivateProviders)
 	result, fetchErr := client.Fetch(ctx, apiURL)
 	var fetchedAt time.Time
 	var status int
@@ -253,7 +249,7 @@ func (h *ProductHandler) EnrichByUPC(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	if h.Cfg != nil && strings.TrimSpace(h.Cfg.USDAFDCAPIKey) != "" {
-		usdaLink, usdaSuggestions, err := h.fetchUSDASuggestions(ctx, productID, upc, strings.TrimSpace(h.Cfg.USDAFDCAPIKey))
+		usdaLink, usdaSuggestions, err := h.fetchUSDASuggestions(ctx, productID, upc, strings.TrimSpace(h.Cfg.USDAFDCAPIKey), allowPrivateProviders)
 		if err == nil && len(usdaSuggestions) > 0 {
 			usdaStored, err := h.storeSuggestions(ctx, productID, &usdaLink.ID, usdaSuggestions)
 			if err != nil {
@@ -301,7 +297,7 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 		if errors.Is(err, errInvalidSuggestionValue) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		if strings.Contains(err.Error(), "UNIQUE constraint") {
+		if isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "accepted value conflicts with an existing product"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -349,14 +345,20 @@ func (h *ProductHandler) RejectEnrichmentSuggestion(c echo.Context) error {
 }
 
 func (h *ProductHandler) upsertProductLink(ctx context.Context, productID, source string, externalID *string, rawURL string, label *string, fetchedAt time.Time, status int, contentHash string, lastError *string, confidence *float64) (productLinkResponse, error) {
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return productLinkResponse{}, err
+	}
+	defer tx.Rollback()
+
 	now := time.Now().UTC()
 	var id string
-	err := h.DB.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		"SELECT id FROM product_links WHERE product_id = ? AND url = ? ORDER BY created_at LIMIT 1",
 		productID, rawURL,
 	).Scan(&id)
 	if err == sql.ErrNoRows {
-		err = h.DB.QueryRowContext(ctx,
+		err = tx.QueryRowContext(ctx,
 			`INSERT INTO product_links
 			    (id, product_id, source, external_id, url, label, created_at, fetched_at, http_status, content_hash, last_error, source_confidence)
 			 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -367,7 +369,7 @@ func (h *ProductHandler) upsertProductLink(ctx context.Context, productID, sourc
 	if err != nil {
 		return productLinkResponse{}, err
 	}
-	_, err = h.DB.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`UPDATE product_links
 		    SET source = ?, external_id = ?, label = ?, fetched_at = ?, http_status = ?,
 		        content_hash = ?, last_error = ?, source_confidence = ?
@@ -375,6 +377,9 @@ func (h *ProductHandler) upsertProductLink(ctx context.Context, productID, sourc
 		source, externalID, label, nullableTime(fetchedAt), nullableInt(status), nullableTrimmedString(contentHash), lastError, confidence, id, productID,
 	)
 	if err != nil {
+		return productLinkResponse{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return productLinkResponse{}, err
 	}
 	return h.fetchProductLink(ctx, productID, id)
@@ -421,6 +426,7 @@ func (h *ProductHandler) storeSuggestions(ctx context.Context, productID string,
 }
 
 func (h *ProductHandler) fetchProductEnrichmentSuggestions(productID string, pendingOnly bool) []productEnrichmentSuggestionResponse {
+	currentValues := h.currentValuesForProduct(productID)
 	query := `SELECT id, product_id, product_link_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at
 	            FROM product_enrichment_suggestions
 	           WHERE product_id = ?`
@@ -436,7 +442,7 @@ func (h *ProductHandler) fetchProductEnrichmentSuggestions(productID string, pen
 	defer rows.Close()
 	var out []productEnrichmentSuggestionResponse
 	for rows.Next() {
-		s, err := h.scanSuggestion(rows)
+		s, err := h.scanSuggestion(rows, currentValues)
 		if err == nil {
 			out = append(out, s)
 		}
@@ -450,10 +456,10 @@ func (h *ProductHandler) fetchSuggestion(ctx context.Context, productID, suggest
 		   FROM product_enrichment_suggestions
 		  WHERE id = ? AND product_id = ?`,
 		suggestionID, productID,
-	))
+	), h.currentValuesForProduct(productID))
 }
 
-func (h *ProductHandler) scanSuggestion(scanner rowScanner) (productEnrichmentSuggestionResponse, error) {
+func (h *ProductHandler) scanSuggestion(scanner rowScanner, currentValues map[string]string) (productEnrichmentSuggestionResponse, error) {
 	var s productEnrichmentSuggestionResponse
 	var linkID, evidence sql.NullString
 	var confidence sql.NullFloat64
@@ -469,39 +475,30 @@ func (h *ProductHandler) scanSuggestion(scanner rowScanner) (productEnrichmentSu
 	if confidence.Valid {
 		s.Confidence = &confidence.Float64
 	}
-	if current := h.currentValueForField(s.ProductID, s.Field); current != "" {
+	if current := currentValues[s.Field]; current != "" {
 		s.CurrentValue = &current
 	}
 	return s, nil
 }
 
-func (h *ProductHandler) currentValueForField(productID, field string) string {
-	switch field {
-	case "name", "brand", "upc", "pack_quantity", "pack_unit":
-		var p productResponse
-		err := h.DB.QueryRow(
-			"SELECT name, brand, upc, pack_quantity, pack_unit FROM products WHERE id = ?",
-			productID,
-		).Scan(&p.Name, &p.Brand, &p.UPC, &p.PackQuantity, &p.PackUnit)
-		if err != nil {
-			return ""
-		}
-		switch field {
-		case "name":
-			return p.Name
-		case "brand":
-			return ptrStringValue(p.Brand)
-		case "upc":
-			return ptrStringValue(p.UPC)
-		case "pack_quantity":
-			if p.PackQuantity != nil {
-				return strconv.FormatFloat(*p.PackQuantity, 'f', -1, 64)
-			}
-		case "pack_unit":
-			return ptrStringValue(p.PackUnit)
-		}
+func (h *ProductHandler) currentValuesForProduct(productID string) map[string]string {
+	values := make(map[string]string, 5)
+	var p productResponse
+	err := h.DB.QueryRow(
+		"SELECT name, brand, upc, pack_quantity, pack_unit FROM products WHERE id = ?",
+		productID,
+	).Scan(&p.Name, &p.Brand, &p.UPC, &p.PackQuantity, &p.PackUnit)
+	if err != nil {
+		return values
 	}
-	return ""
+	values["name"] = p.Name
+	values["brand"] = ptrStringValue(p.Brand)
+	values["upc"] = ptrStringValue(p.UPC)
+	if p.PackQuantity != nil {
+		values["pack_quantity"] = strconv.FormatFloat(*p.PackQuantity, 'f', -1, 64)
+	}
+	values["pack_unit"] = ptrStringValue(p.PackUnit)
+	return values
 }
 
 func (h *ProductHandler) fetchProductNutrition(productID string) []productNutritionResponse {
@@ -622,10 +619,14 @@ func applyNutritionSuggestion(ctx context.Context, tx *sql.Tx, productID string,
 	if s.Confidence != nil {
 		confidence = *s.Confidence
 	}
+	conflictTarget := "ON CONFLICT(product_id, product_link_id)"
+	if linkID == nil {
+		conflictTarget = "ON CONFLICT(product_id) WHERE product_link_id IS NULL"
+	}
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO product_nutrition (product_id, product_link_id, accepted_by_user, source_confidence, `+column+`, created_at, updated_at)
 		 VALUES (?, ?, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-		 ON CONFLICT(product_id, product_link_id) DO UPDATE SET
+		 `+conflictTarget+` DO UPDATE SET
 		    accepted_by_user = 1,
 		    source_confidence = COALESCE(excluded.source_confidence, product_nutrition.source_confidence),
 		    `+column+` = excluded.`+column+`,
@@ -636,6 +637,8 @@ func applyNutritionSuggestion(ctx context.Context, tx *sql.Tx, productID string,
 }
 
 func nutritionFieldColumn(field string) (column, kind string, ok bool) {
+	// Trust boundary for applyNutritionSuggestion's SQL column interpolation:
+	// only values from this hard-coded map may become column names.
 	fields := map[string][2]string{
 		"serving_quantity":       {"serving_quantity", "float"},
 		"serving_unit":           {"serving_unit", "text"},
@@ -727,8 +730,8 @@ func suggestionsFromOpenFoodFacts(upc, sourceURL string, body []byte) []enrichme
 	return out
 }
 
-func (h *ProductHandler) fetchUSDASuggestions(ctx context.Context, productID, upc, apiKey string) (productLinkResponse, []enrichment.Suggestion, error) {
-	apiURL, _ := url.Parse("https://api.nal.usda.gov/fdc/v1/foods/search")
+func (h *ProductHandler) fetchUSDASuggestions(ctx context.Context, productID, upc, apiKey string, allowPrivate bool) (productLinkResponse, []enrichment.Suggestion, error) {
+	apiURL, _ := url.Parse(usdaSearchAPIBase)
 	query := apiURL.Query()
 	query.Set("api_key", apiKey)
 	query.Set("query", upc)
@@ -736,7 +739,7 @@ func (h *ProductHandler) fetchUSDASuggestions(ctx context.Context, productID, up
 	apiURL.RawQuery = query.Encode()
 
 	sourceURL := "https://fdc.nal.usda.gov/fdc-app.html#/food-search?query=" + url.QueryEscape(upc)
-	client := httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, false)
+	client := httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, allowPrivate)
 	result, err := client.Fetch(ctx, apiURL.String())
 	fetchedAt := time.Now().UTC()
 	status := 0
@@ -788,7 +791,7 @@ func suggestionsFromUSDA(upc, defaultSourceURL string, body []byte) (string, []e
 		}
 		sourceURL := defaultSourceURL
 		if food.FdcID > 0 {
-			sourceURL = "https://fdc.nal.usda.gov/fdc-app.html#/food-details/" + strconv.Itoa(food.FdcID) + "/nutrients"
+			sourceURL = strings.TrimRight(usdaFoodDetailsBase, "/") + "/" + strconv.Itoa(food.FdcID) + "/nutrients"
 		}
 		var out []enrichment.Suggestion
 		add := func(field, value, evidence string, confidence float64) {
@@ -899,7 +902,8 @@ func classifyProductURL(rawURL string) (string, *string, *string) {
 		return "kroger", externalID, stringPtr("Kroger product page")
 	}
 	if host != "" {
-		return "url", &host, stringPtr(host)
+		hash := hashContent(rawURL)
+		return "url", &hash, stringPtr(host)
 	}
 	return "url", nil, nil
 }

@@ -73,7 +73,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"idx_product_images_product",
 		"idx_receipt_images_receipt", "idx_receipt_images_active",
 		"idx_product_links_product", "idx_product_links_source",
-		"idx_product_nutrition_product",
+		"idx_product_nutrition_product", "idx_product_nutrition_product_no_link",
 		"idx_product_enrichment_suggestions_product",
 		"idx_products_group",
 	}

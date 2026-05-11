@@ -26,6 +26,7 @@ type ExtractedItem struct {
 	RawName            string   `json:"raw_name"`
 	StoreItemCode      *string  `json:"store_item_code,omitempty"`
 	ReceiptDescription *string  `json:"receipt_description,omitempty"`
+	UPC                *string  `json:"upc,omitempty"`
 	SuggestedName      string   `json:"suggested_name"`
 	SuggestedCategory  string   `json:"suggested_category"`
 	SuggestedBrand     string   `json:"suggested_brand"`

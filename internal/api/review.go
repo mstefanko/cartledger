@@ -33,6 +33,7 @@ type unmatchedLineItemResponse struct {
 	RawText            string                  `json:"raw_text"`
 	StoreItemCode      *string                 `json:"store_item_code,omitempty"`
 	ReceiptDescription *string                 `json:"receipt_description,omitempty"`
+	UPC                *string                 `json:"upc,omitempty"`
 	Quantity           string                  `json:"quantity"`
 	Unit               *string                 `json:"unit,omitempty"`
 	UnitPrice          *string                 `json:"unit_price,omitempty"`
@@ -145,6 +146,7 @@ func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 			li.raw_name,
 			li.store_item_code,
 			li.receipt_description,
+			li.upc,
 			li.quantity,
 			li.unit,
 			li.unit_price,
@@ -179,6 +181,7 @@ func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 			&item.RawText,
 			&item.StoreItemCode,
 			&item.ReceiptDescription,
+			&item.UPC,
 			&item.Quantity,
 			&item.Unit,
 			&item.UnitPrice,

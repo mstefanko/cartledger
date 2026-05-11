@@ -313,7 +313,7 @@ func (h *ProductHandler) Create(c echo.Context) error {
 		householdID, req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, upc, req.PackQuantity, req.PackUnit, now, now,
 	).Scan(&id)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint") {
+		if isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "product name already exists"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -401,7 +401,7 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, upc, req.PackQuantity, req.PackUnit, req.ProductGroupID, now, productID, householdID,
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint") {
+		if isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "product name already exists"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

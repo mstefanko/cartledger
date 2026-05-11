@@ -134,6 +134,151 @@ func TestAddProductLinkReturnsKrogerSuggestionsAndAcceptsPackOnly(t *testing.T) 
 	}
 }
 
+func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	h.Cfg.AllowPrivateIntegrations = true
+	h.Cfg.USDAFDCAPIKey = "test-key"
+	householdID, _, _, productID := seedTestData(t, h)
+
+	upc := "0001111008400"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/off/api/v2/product/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"status": 1,
+				"product": {
+					"product_name": "Mission Carb Balance Tortillas",
+					"brands": "Mission",
+					"code": "0001111008400",
+					"quantity": "12 oz",
+					"ingredients_text": "Water, wheat.",
+					"allergens": "en:wheat",
+					"serving_size": "1 tortilla",
+					"nutriments": {
+						"energy-kcal_serving": 70,
+						"proteins_serving": 5
+					}
+				}
+			}`))
+		case r.URL.Path == "/fdc/v1/foods/search":
+			if r.URL.Query().Get("api_key") != "test-key" || r.URL.Query().Get("query") != upc {
+				t.Fatalf("unexpected USDA query: %s", r.URL.RawQuery)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"foods": [{
+					"fdcId": 123,
+					"description": "MISSION TORTILLAS",
+					"brandOwner": "MISSION",
+					"gtinUpc": "0001111008400",
+					"ingredients": "Water, wheat.",
+					"foodNutrients": [
+						{"nutrientName": "Energy", "unitName": "KCAL", "value": 72},
+						{"nutrientName": "Sodium, Na", "unitName": "MG", "value": 280}
+					]
+				}]
+			}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	oldOFFAPI := openFoodFactsAPIBase
+	oldOFFProduct := openFoodFactsProductBase
+	oldUSDASearch := usdaSearchAPIBase
+	oldUSDADetails := usdaFoodDetailsBase
+	openFoodFactsAPIBase = server.URL + "/off/api/v2/product"
+	openFoodFactsProductBase = server.URL + "/off/product"
+	usdaSearchAPIBase = server.URL + "/fdc/v1/foods/search"
+	usdaFoodDetailsBase = server.URL + "/fdc-app.html#/food-details/"
+	defer func() {
+		openFoodFactsAPIBase = oldOFFAPI
+		openFoodFactsProductBase = oldOFFProduct
+		usdaSearchAPIBase = oldUSDASearch
+		usdaFoodDetailsBase = oldUSDADetails
+	}()
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrich/upc", `{"upc":"`+upc+`"}`, householdID, productID)
+	if err := h.EnrichByUPC(c); err != nil {
+		t.Fatalf("EnrichByUPC: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body addProductLinkResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	bySourceField := map[string]string{}
+	for _, suggestion := range body.Suggestions {
+		bySourceField[suggestion.Source+"."+suggestion.Field] = suggestion.Value
+	}
+	if bySourceField["openfoodfacts.name"] != "Mission Carb Balance Tortillas" {
+		t.Fatalf("OFF name missing; suggestions=%+v", body.Suggestions)
+	}
+	if bySourceField["openfoodfacts.pack_quantity"] != "12" || bySourceField["openfoodfacts.calories"] != "70" {
+		t.Fatalf("OFF pack/nutrition missing; suggestions=%+v", body.Suggestions)
+	}
+	if bySourceField["usda_fdc.sodium_mg"] != "280" || bySourceField["usda_fdc.calories"] != "72" {
+		t.Fatalf("USDA nutrition missing; suggestions=%+v", body.Suggestions)
+	}
+
+	var linkCount int
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_links WHERE product_id = ?", productID).Scan(&linkCount); err != nil {
+		t.Fatalf("link count: %v", err)
+	}
+	if linkCount != 2 {
+		t.Fatalf("product_links = %d, want OFF + USDA links", linkCount)
+	}
+}
+
+func TestAcceptNutritionSuggestionWithoutLinkUpdatesExistingRow(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	insertSuggestion := func(id, value string) {
+		t.Helper()
+		if _, err := h.DB.Exec(
+			`INSERT INTO product_enrichment_suggestions
+			    (id, product_id, source, source_url, field, value, status)
+			 VALUES (?, ?, 'manual', 'manual://nutrition', 'calories', ?, 'pending')`,
+			id, productID, value,
+		); err != nil {
+			t.Fatalf("insert suggestion %s: %v", id, err)
+		}
+	}
+	insertSuggestion("sug-calories-70", "70")
+	insertSuggestion("sug-calories-80", "80")
+
+	e := echo.New()
+	for _, id := range []string{"sug-calories-70", "sug-calories-80"} {
+		c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrichment-suggestions/"+id+"/accept", `{}`, householdID, productID)
+		c.SetParamNames("id", "suggestionId")
+		c.SetParamValues(productID, id)
+		if err := h.AcceptEnrichmentSuggestion(c); err != nil {
+			t.Fatalf("AcceptEnrichmentSuggestion %s: %v", id, err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("accept %s status = %d, want 200; body=%s", id, rec.Code, rec.Body.String())
+		}
+	}
+
+	var rowCount int
+	var calories sqlNullFloat
+	if err := h.DB.QueryRow("SELECT COUNT(*), calories FROM product_nutrition WHERE product_id = ?", productID).Scan(&rowCount, &calories); err != nil {
+		t.Fatalf("query nutrition: %v", err)
+	}
+	if rowCount != 1 || !calories.Valid || calories.Float64 != 80 {
+		t.Fatalf("nutrition rowCount=%d calories=%+v, want one row updated to 80", rowCount, calories)
+	}
+}
+
 type sqlNullFloat struct {
 	Float64 float64
 	Valid   bool

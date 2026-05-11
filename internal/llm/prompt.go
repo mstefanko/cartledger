@@ -8,6 +8,7 @@ Rules:
 - raw_name must be EXACTLY as printed on receipt (preserve abbreviations)
 - store_item_code: store-printed item number/SKU if visible; Costco commonly prints this before the description
 - receipt_description: printed product text with the store item number/SKU removed only when confident
+- upc: product barcode/UPC/GTIN if explicitly printed for this line item; digits only; null when absent
 - Store item numbers/SKUs are not purchase quantities
 - suggested_name: clean, human-readable canonical product name
   - Include brand when identifiable (e.g., "Kirkland Organic Broccoli Florets")
@@ -61,6 +62,7 @@ Rules:
 - Preserve existing correct items.
 - Fix only issues supported by the image or the user note.
 - Store item numbers/SKUs are not purchase quantities.
+- If a product barcode/UPC/GTIN is printed for a line item, include upc as digits only; otherwise null.
 - For Costco receipts, the leading numeric field before the description is usually the store_item_code.
 - If only total_price is visible, set packaged-goods purchase quantity to 1.
 - Package text like 1GAL, 16 CT, 2 x 8 ct, or 2/31.7 is package content, not purchase quantity.

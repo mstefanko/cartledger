@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -53,5 +54,48 @@ func TestSafeHTTPClientCapsResponseBytes(t *testing.T) {
 	_, err := client.Fetch(context.Background(), server.URL)
 	if !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatalf("Fetch err = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestSafeHTTPClientBlocksPrivateRedirectTarget(t *testing.T) {
+	var serverPort string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://rebind.test:"+serverPort+"/private", http.StatusFound)
+	}))
+	defer server.Close()
+
+	serverHost, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split server URL: %v", err)
+	}
+	serverPort = port
+	restoreLookup := SetLookupIPsForTest(func(host string) ([]net.IP, error) {
+		switch host {
+		case "public.test":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		case "rebind.test":
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		default:
+			return net.LookupIP(host)
+		}
+	})
+	defer restoreLookup()
+
+	restoreDial := SetDialContextForTest(func(ctx context.Context, network, address string) (net.Conn, error) {
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if port == serverPort {
+			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(serverHost, serverPort))
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	})
+	defer restoreDial()
+
+	client := NewSafeHTTPClient(2*time.Second, 1024, false)
+	_, err = client.Fetch(context.Background(), "http://public.test:"+serverPort+"/redirect")
+	if !errors.Is(err, ErrPrivateAddressBlocked) {
+		t.Fatalf("Fetch redirect err = %v, want ErrPrivateAddressBlocked", err)
 	}
 }

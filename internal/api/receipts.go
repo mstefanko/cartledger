@@ -30,6 +30,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/receiptline"
 	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/storecodes"
+	"github.com/mstefanko/cartledger/internal/upc"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
 
@@ -62,7 +63,8 @@ type updateLineItemRequest struct {
 type manualLineItemRequest struct {
 	RawName              string  `json:"raw_name"`
 	ProductID            *string `json:"product_id"` // optional: user picked from autocomplete
-	Quantity             *string `json:"quantity"`   // decimal string; defaults to "1"
+	UPC                  *string `json:"upc"`
+	Quantity             *string `json:"quantity"` // decimal string; defaults to "1"
 	Unit                 *string `json:"unit"`
 	UnitPrice            *string `json:"unit_price"`
 	TotalPrice           string  `json:"total_price"` // required
@@ -73,6 +75,7 @@ type manualLineItemRequest struct {
 type createLineItemRequest struct {
 	RawName              string  `json:"raw_name"`
 	ProductID            *string `json:"product_id"`
+	UPC                  *string `json:"upc"`
 	Quantity             *string `json:"quantity"`
 	Unit                 *string `json:"unit"`
 	UnitPrice            *string `json:"unit_price"`
@@ -127,6 +130,7 @@ type lineItemResponse struct {
 	RawName              string   `json:"raw_name"`
 	StoreItemCode        *string  `json:"store_item_code,omitempty"`
 	ReceiptDescription   *string  `json:"receipt_description,omitempty"`
+	UPC                  *string  `json:"upc,omitempty"`
 	Quantity             string   `json:"quantity"`
 	Unit                 *string  `json:"unit,omitempty"`
 	UnitPrice            *string  `json:"unit_price,omitempty"`
@@ -614,15 +618,23 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			quantity = *it.Quantity
 		}
 		countContribution := receiptline.CountContribution(decimal.RequireFromString(quantity), it.Unit)
+		normalizedUPC, err := upc.Normalize(ptrStringValue(it.UPC))
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("items[%d].%s", i, err.Error())})
+		}
+		var itemUPC *string
+		if normalizedUPC != "" {
+			itemUPC = &normalizedUPC
+		}
 
 		_, err = tx.ExecContext(c.Request().Context(), `
 			INSERT INTO line_items
 			    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
-			     quantity, unit,
+			     upc, quantity, unit,
 			     unit_price, total_price, matched, confidence, line_number,
 			     suggested_product_id, count_contribution, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			itemID, receiptID, productID, it.RawName, storeItemCodePtr, receiptDescription, quantity, it.Unit,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			itemID, receiptID, productID, it.RawName, storeItemCodePtr, receiptDescription, itemUPC, quantity, it.Unit,
 			it.UnitPrice, it.TotalPrice, matched, confidence, lineNum,
 			suggestedProductID, countContribution.String(), now,
 		)
@@ -921,7 +933,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	rows, err := h.DB.Query(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        p.pack_quantity, p.pack_unit,
-		        li.raw_name, li.store_item_code, li.receipt_description,
+		        li.raw_name, li.store_item_code, li.receipt_description, li.upc,
 		        li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount, li.count_contribution,
 		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
@@ -948,7 +960,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		if err := rows.Scan(
 			&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
 			&li.ProductPackQuantity, &li.ProductPackUnit,
-			&li.RawName, &li.StoreItemCode, &li.ReceiptDescription,
+			&li.RawName, &li.StoreItemCode, &li.ReceiptDescription, &li.UPC,
 			&quantity, &li.Unit, &unitPrice, &totalPrice,
 			&li.RegularPrice, &li.DiscountAmount, &countContribution,
 			&li.PackQuantityOverride, &li.PackUnitOverride, &li.PackOverrideSource,
@@ -1179,6 +1191,14 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
+	itemUPC, err := upc.Normalize(strings.TrimSpace(ptrStringValue(req.UPC)))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	var itemUPCPtr *string
+	if itemUPC != "" {
+		itemUPCPtr = &itemUPC
+	}
 
 	var storeID *string
 	var storeName *string
@@ -1263,11 +1283,11 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 	_, err = tx.Exec(
 		`INSERT INTO line_items
 		    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
-		     quantity, unit, unit_price, total_price, matched, confidence, line_number,
+		     upc, quantity, unit, unit_price, total_price, matched, confidence, line_number,
 		     count_contribution, pack_quantity_override, pack_unit_override, pack_override_source, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		itemID, receiptID, productID, req.RawName, storeItemCodePtr, receiptDescription,
-		quantity.String(), req.Unit, unitPrice, totalPrice.String(), matched, confidence,
+		itemUPCPtr, quantity.String(), req.Unit, unitPrice, totalPrice.String(), matched, confidence,
 		lineNumber, countContribution.String(), packQuantityOverride, packUnitOverride, packOverrideSource, now,
 	)
 	if err != nil {
@@ -1317,6 +1337,7 @@ type parsedManualLineItem struct {
 	rawName              string
 	storeItemCode        *string
 	receiptDescription   *string
+	upc                  *string
 	productID            *string
 	quantity             decimal.Decimal
 	unit                 *string
@@ -1425,11 +1446,11 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 			c.Request().Context(),
 			`INSERT INTO line_items
 			    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
-			     quantity, unit, unit_price, total_price, matched, confidence, line_number,
+			     upc, quantity, unit, unit_price, total_price, matched, confidence, line_number,
 			     count_contribution, pack_quantity_override, pack_unit_override, pack_override_source, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			itemID, receiptID, productID, item.rawName, item.storeItemCode, item.receiptDescription,
-			item.quantity.String(), item.unit, item.unitPrice, item.totalPrice.String(), matched, confidence,
+			item.upc, item.quantity.String(), item.unit, item.unitPrice, item.totalPrice.String(), matched, confidence,
 			startLineNumber+i, item.countContribution.String(), item.packQuantityOverride, item.packUnitOverride, item.packOverrideSource, now,
 		)
 		if err != nil {
@@ -1543,6 +1564,14 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 	if err != nil {
 		return parsedManualLineItem{}, err
 	}
+	normalizedUPC, err := upc.Normalize(ptrStringValue(item.UPC))
+	if err != nil {
+		return parsedManualLineItem{}, err
+	}
+	var itemUPC *string
+	if normalizedUPC != "" {
+		itemUPC = &normalizedUPC
+	}
 	parsedLine := matcher.ParseLine(rawName, chain)
 	storeItemCode := storecodes.Normalize(parsedLine.StoreItemCode)
 	var storeItemCodePtr *string
@@ -1557,6 +1586,7 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 		rawName:              rawName,
 		storeItemCode:        storeItemCodePtr,
 		receiptDescription:   receiptDescription,
+		upc:                  itemUPC,
 		productID:            productID,
 		quantity:             quantity,
 		unit:                 unit,
@@ -1650,7 +1680,7 @@ func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemRes
 	err := h.DB.QueryRow(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        p.pack_quantity, p.pack_unit,
-		        li.raw_name, li.store_item_code, li.receipt_description,
+		        li.raw_name, li.store_item_code, li.receipt_description, li.upc,
 		        li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount, li.count_contribution,
 		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
@@ -1665,7 +1695,7 @@ func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemRes
 	).Scan(
 		&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
 		&li.ProductPackQuantity, &li.ProductPackUnit,
-		&li.RawName, &li.StoreItemCode, &li.ReceiptDescription,
+		&li.RawName, &li.StoreItemCode, &li.ReceiptDescription, &li.UPC,
 		&quantity, &li.Unit, &unitPrice, &totalPrice,
 		&li.RegularPrice, &li.DiscountAmount, &countContribution,
 		&li.PackQuantityOverride, &li.PackUnitOverride, &li.PackOverrideSource,
@@ -1945,16 +1975,17 @@ func insertRepairedLineItem(ctx context.Context, tx *sql.Tx, receiptID, househol
 	if item.SuggestedBrand != "" {
 		suggestedBrand = &item.SuggestedBrand
 	}
+	itemUPC := upc.NormalizePointer(item.UPC)
 
 	lineItemID := uuid.New().String()
 	_, err := tx.Exec(
 		`INSERT INTO line_items
 		    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
-		     quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution,
+		     upc, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution,
 		     suggested_name, suggested_category, suggested_brand, suggested_product_id,
 		     matched, confidence, line_number, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		lineItemID, receiptID, productID, item.RawName, item.StoreItemCode, item.ReceiptDescription,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		lineItemID, receiptID, productID, item.RawName, item.StoreItemCode, item.ReceiptDescription, itemUPC,
 		quantity.String(), item.Unit, unitPrice, totalPrice.String(), regularPrice, discountAmount, countContribution.String(),
 		suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
 		matched, confidence, item.LineNumber, now,

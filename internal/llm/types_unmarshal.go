@@ -58,6 +58,7 @@ type extractedItemJSON struct {
 	RawName            string        `json:"raw_name"`
 	StoreItemCode      *string       `json:"store_item_code"`
 	ReceiptDescription *string       `json:"receipt_description"`
+	UPC                *string       `json:"upc"`
 	SuggestedName      string        `json:"suggested_name"`
 	SuggestedCategory  string        `json:"suggested_category"`
 	SuggestedBrand     string        `json:"suggested_brand"`
@@ -82,6 +83,7 @@ func (i *ExtractedItem) UnmarshalJSON(data []byte) error {
 		RawName:            aux.RawName,
 		StoreItemCode:      aux.StoreItemCode,
 		ReceiptDescription: aux.ReceiptDescription,
+		UPC:                aux.UPC,
 		SuggestedName:      aux.SuggestedName,
 		SuggestedCategory:  aux.SuggestedCategory,
 		SuggestedBrand:     aux.SuggestedBrand,

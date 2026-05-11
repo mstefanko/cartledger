@@ -142,6 +142,7 @@ export interface LineItem {
   raw_name: string
   store_item_code?: string | null
   receipt_description?: string | null
+  upc?: string | null
   quantity: string
   unit: string | null
   unit_price: string | null

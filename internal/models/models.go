@@ -46,6 +46,9 @@ type Product struct {
 	LastPurchasedAt *time.Time `json:"last_purchased_at,omitempty"`
 	PurchaseCount   int        `json:"purchase_count"`
 	Brand           *string    `json:"brand,omitempty" db:"brand"`
+	UPC             *string    `json:"upc,omitempty" db:"upc"`
+	PackQuantity    *float64   `json:"pack_quantity,omitempty" db:"pack_quantity"`
+	PackUnit        *string    `json:"pack_unit,omitempty" db:"pack_unit"`
 	ProductTags     *string    `json:"product_tags,omitempty" db:"product_tags"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
@@ -92,21 +95,28 @@ type Receipt struct {
 
 // LineItem represents an individual item on a receipt.
 type LineItem struct {
-	ID                 string           `json:"id"`
-	ReceiptID          string           `json:"receipt_id"`
-	ProductID          *string          `json:"product_id,omitempty"`
-	RawName            string           `json:"raw_name"`
-	Quantity           decimal.Decimal  `json:"quantity"`
-	Unit               *string          `json:"unit,omitempty"`
-	UnitPrice          *decimal.Decimal `json:"unit_price,omitempty"`
-	TotalPrice         decimal.Decimal  `json:"total_price"`
-	Matched            string           `json:"matched"`
-	Confidence         *float64         `json:"confidence,omitempty"`
-	LineNumber         *int             `json:"line_number,omitempty"`
-	SuggestedName      *string          `json:"suggested_name,omitempty" db:"suggested_name"`
-	SuggestedCategory  *string          `json:"suggested_category,omitempty" db:"suggested_category"`
-	SuggestedProductID *string          `json:"suggested_product_id,omitempty" db:"suggested_product_id"`
-	CreatedAt          time.Time        `json:"created_at"`
+	ID                   string           `json:"id"`
+	ReceiptID            string           `json:"receipt_id"`
+	ProductID            *string          `json:"product_id,omitempty"`
+	RawName              string           `json:"raw_name"`
+	StoreItemCode        *string          `json:"store_item_code,omitempty"`
+	ReceiptDescription   *string          `json:"receipt_description,omitempty"`
+	UPC                  *string          `json:"upc,omitempty"`
+	Quantity             decimal.Decimal  `json:"quantity"`
+	Unit                 *string          `json:"unit,omitempty"`
+	UnitPrice            *decimal.Decimal `json:"unit_price,omitempty"`
+	TotalPrice           decimal.Decimal  `json:"total_price"`
+	Matched              string           `json:"matched"`
+	Confidence           *float64         `json:"confidence,omitempty"`
+	LineNumber           *int             `json:"line_number,omitempty"`
+	SuggestedName        *string          `json:"suggested_name,omitempty" db:"suggested_name"`
+	SuggestedCategory    *string          `json:"suggested_category,omitempty" db:"suggested_category"`
+	SuggestedProductID   *string          `json:"suggested_product_id,omitempty" db:"suggested_product_id"`
+	CountContribution    decimal.Decimal  `json:"count_contribution"`
+	PackQuantityOverride *string          `json:"pack_quantity_override,omitempty"`
+	PackUnitOverride     *string          `json:"pack_unit_override,omitempty"`
+	PackOverrideSource   *string          `json:"pack_override_source,omitempty"`
+	CreatedAt            time.Time        `json:"created_at"`
 }
 
 // ProductPrice stores a denormalized price record for analytics.

@@ -1088,7 +1088,14 @@ function SuggestionsSection({ detail, productId }: { detail: ProductDetail; prod
 }
 
 function NutritionSection({ nutrition }: { nutrition: ProductNutrition[] }) {
-  if (!nutrition || nutrition.length === 0) return null
+  if (!nutrition || nutrition.length === 0) {
+    return (
+      <div className="bg-white rounded-2xl shadow-subtle p-5">
+        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Nutrition</h2>
+        <p className="text-caption text-neutral-400">No nutrition accepted yet.</p>
+      </div>
+    )
+  }
   const row = nutrition[0]!
   const nutrients: Array<[string, number | null | undefined, string]> = [
     ['Calories', row.calories, ''],

@@ -25,6 +25,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/storecodes"
+	"github.com/mstefanko/cartledger/internal/upc"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -892,12 +893,13 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		if item.SuggestedBrand != "" {
 			suggestedBrand = &item.SuggestedBrand
 		}
+		itemUPC := upc.NormalizePointer(item.UPC)
 
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, store_item_code, receipt_description, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, store_item_code, receipt_description, upc, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
-			item.StoreItemCode, item.ReceiptDescription,
+			item.StoreItemCode, item.ReceiptDescription, itemUPC,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
 			regularPrice, discountAmount, countContribution.String(),
 			suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,

@@ -44,6 +44,7 @@ export async function updateLineItem(
 export interface CreateLineItemRequest {
   raw_name: string
   product_id?: string
+  upc?: string
   quantity?: string
   unit?: string
   unit_price?: string
@@ -171,6 +172,7 @@ export async function applyRepairPreview(
 export interface ManualLineItemInput {
   raw_name: string
   product_id?: string
+  upc?: string
   quantity?: string
   unit?: string
   unit_price?: string

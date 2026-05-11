@@ -124,14 +124,32 @@ func productName(text string) string {
 			continue
 		}
 		lower := strings.ToLower(clean)
+		if skipProductNameLine(lower) {
+			continue
+		}
 		if strings.Contains(lower, "kroger") && (strings.Contains(lower, " - ") || strings.Contains(lower, "|")) {
 			clean = strings.TrimSpace(strings.Split(strings.Split(clean, " - ")[0], "|")[0])
+			lower = strings.ToLower(clean)
+			if skipProductNameLine(lower) {
+				continue
+			}
 		}
-		if len(clean) >= 4 && !strings.Contains(lower, "sign in") && !strings.Contains(lower, "shopping cart") {
+		if len(clean) >= 4 {
 			return clean
 		}
 	}
 	return ""
+}
+
+func skipProductNameLine(lower string) bool {
+	switch lower {
+	case "kroger", "shop", "departments", "sign in", "shopping cart", "cart", "menu":
+		return true
+	}
+	return strings.Contains(lower, "sign in") ||
+		strings.Contains(lower, "shopping cart") ||
+		strings.Contains(lower, "pickup at") ||
+		strings.Contains(lower, "delivery to")
 }
 
 func sectionAfter(text string, starts []string, stops []string) string {

@@ -13,7 +13,7 @@ import (
 func VisibleText(raw []byte) string {
 	doc, err := html.Parse(bytes.NewReader(raw))
 	if err != nil {
-		return string(raw)
+		return ""
 	}
 	var parts []string
 	var walk func(*html.Node, bool)

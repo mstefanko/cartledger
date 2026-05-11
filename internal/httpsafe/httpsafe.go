@@ -23,12 +23,22 @@ var (
 )
 
 var lookupIPsFn = net.LookupIP
+var dialContextFn = (&net.Dialer{}).DialContext
 
 // SetLookupIPsForTest swaps the resolver used by ValidateURL and SafeHTTPClient.
 func SetLookupIPsForTest(fn func(string) ([]net.IP, error)) func() {
 	old := lookupIPsFn
 	lookupIPsFn = fn
 	return func() { lookupIPsFn = old }
+}
+
+// SetDialContextForTest swaps the network dialer used after connect-time
+// address validation. It is only for tests that need local httptest servers
+// behind synthetic public hostnames.
+func SetDialContextForTest(fn func(context.Context, string, string) (net.Conn, error)) func() {
+	old := dialContextFn
+	dialContextFn = fn
+	return func() { dialContextFn = old }
 }
 
 // ValidateURL parses rawURL and, unless allowPrivate is true, rejects any URL
@@ -197,8 +207,7 @@ func (c *SafeHTTPClient) safeDialContext(ctx context.Context, network, address s
 			}
 		}
 	}
-	dialer := &net.Dialer{}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+	return dialContextFn(ctx, network, net.JoinHostPort(ips[0].String(), port))
 }
 
 func resolveDialIPs(host string) ([]net.IP, error) {

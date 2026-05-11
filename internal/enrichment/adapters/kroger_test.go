@@ -36,3 +36,22 @@ func TestKrogerParseExtractsIdentityPackAndNutrition(t *testing.T) {
 	assertField("ingredients", "Water, modified wheat starch, wheat gluten, vegetable shortening.")
 	assertField("allergens", "Wheat")
 }
+
+func TestKrogerParseSkipsNavigationBeforeProductName(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "kroger_layout_alt.html"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	suggestions := Parse("https://www.kroger.com/p/example/0002222200000", enrichment.VisibleText(raw))
+	fields := map[string]string{}
+	for _, s := range suggestions {
+		fields[s.Field] = s.Value
+	}
+	if fields["name"] != "Simple Truth Organic Black Beans 15 oz" {
+		t.Fatalf("name = %q, want product title; fields=%v", fields["name"], fields)
+	}
+	if fields["pack_quantity"] != "15" || fields["pack_unit"] != "oz" {
+		t.Fatalf("pack = %q %q, want 15 oz", fields["pack_quantity"], fields["pack_unit"])
+	}
+}

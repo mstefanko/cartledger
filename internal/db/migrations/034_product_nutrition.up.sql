@@ -28,3 +28,7 @@ CREATE TABLE product_nutrition (
 
 CREATE INDEX idx_product_nutrition_product
     ON product_nutrition(product_id);
+
+CREATE UNIQUE INDEX idx_product_nutrition_product_no_link
+    ON product_nutrition(product_id)
+    WHERE product_link_id IS NULL;
