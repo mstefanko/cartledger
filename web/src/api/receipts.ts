@@ -50,6 +50,8 @@ export interface CreateLineItemRequest {
   total_price: string
   line_number?: number
   count_contribution?: string
+  pack_quantity_override?: string
+  pack_unit_override?: string
 }
 
 export async function createLineItem(
@@ -173,6 +175,9 @@ export interface ManualLineItemInput {
   unit?: string
   unit_price?: string
   total_price: string
+  pack_quantity_override?: string
+  pack_unit_override?: string
+  pack_override_source?: 'user'
 }
 
 export interface CreateManualReceiptRequest {

@@ -29,6 +29,7 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"shopping_lists", "shopping_list_items", "unit_conversions",
 		"product_images", "product_links", "receipt_images",
 		"store_product_codes",
+		"product_nutrition", "product_enrichment_suggestions",
 		"products_fts", "product_aliases_fts",
 		"product_groups",
 	}
@@ -61,7 +62,8 @@ func TestMigrationsUpAndDown(t *testing.T) {
 	indexes := []string{
 		"idx_alias_global", "idx_alias_store",
 		"idx_line_items_receipt", "idx_line_items_product",
-		"idx_line_items_store_item_code",
+		"idx_line_items_store_item_code", "idx_line_items_upc",
+		"idx_products_household_upc",
 		"idx_product_prices_product", "idx_product_prices_store",
 		"idx_product_prices_line_item",
 		"idx_store_product_codes_product", "idx_store_product_codes_household_store",
@@ -71,6 +73,8 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"idx_product_images_product",
 		"idx_receipt_images_receipt", "idx_receipt_images_active",
 		"idx_product_links_product", "idx_product_links_source",
+		"idx_product_nutrition_product",
+		"idx_product_enrichment_suggestions_product",
 		"idx_products_group",
 	}
 	for _, idx := range indexes {

@@ -16,7 +16,7 @@ import {
 } from '@/components/receipts/ManualLineItemGrid'
 // CreateRuleModal replaced by inline batch rule modal
 import { getReceipt, updateLineItem, createLineItem, createLineItems, repairReceiptPreview, applyRepairPreview, acceptSuggestions, confirmReceipt, type CreateLineItemRequest, type ManualLineItemInput, type ReceiptDetail, type RepairPreviewResponse } from '@/api/receipts'
-import { listProducts } from '@/api/products'
+import { addProductLink, listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { LineItem, Product } from '@/types'
 
@@ -318,6 +318,9 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   const [sizeEditItem, setSizeEditItem] = useState<LineItemRow | null>(null)
   const [sizeQuantity, setSizeQuantity] = useState('')
   const [sizeUnit, setSizeUnit] = useState('')
+  const [productUrlItem, setProductUrlItem] = useState<LineItemRow | null>(null)
+  const [productUrl, setProductUrl] = useState('')
+  const [productUrlError, setProductUrlError] = useState<string | null>(null)
 
   // --- Mutations ---
   const matchMutation = useMutation({
@@ -367,6 +370,25 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
       queryClient.invalidateQueries({ queryKey: ['receipts', 'compare'] })
       queryClient.invalidateQueries({ queryKey: ['product-detail'] })
+    },
+  })
+
+  const productUrlMutation = useMutation({
+    mutationFn: () => {
+      if (!productUrlItem?.product_id) throw new Error('missing product')
+      return addProductLink(productUrlItem.product_id, { url: productUrl.trim() })
+    },
+    onSuccess: () => {
+      setProductUrlItem(null)
+      setProductUrl('')
+      setProductUrlError(null)
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+      if (productUrlItem?.product_id) {
+        queryClient.invalidateQueries({ queryKey: ['product-detail', productUrlItem.product_id] })
+      }
+    },
+    onError: (err: Error) => {
+      setProductUrlError(err.message)
     },
   })
 
@@ -744,6 +766,18 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                   {item.matched === 'code' && (
                     <Badge variant="neutral">code match</Badge>
                   )}
+                  <button
+                    type="button"
+                    className="text-xs text-neutral-400 hover:text-brand"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setProductUrlItem(item)
+                      setProductUrl('')
+                      setProductUrlError(null)
+                    }}
+                  >
+                    Add URL
+                  </button>
                 </div>
               )}
             </div>
@@ -1320,6 +1354,58 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
           <p className="text-caption text-neutral-400">
             Optional cleanup for this receipt line only.
           </p>
+        </div>
+      </Modal>
+
+      <Modal
+        open={productUrlItem !== null}
+        onClose={() => {
+          if (!productUrlMutation.isPending) {
+            setProductUrlItem(null)
+            setProductUrl('')
+            setProductUrlError(null)
+          }
+        }}
+        title="Add Product URL"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setProductUrlItem(null)}
+              disabled={productUrlMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                setProductUrlError(null)
+                productUrlMutation.mutate()
+              }}
+              disabled={!productUrl.trim() || productUrlMutation.isPending}
+            >
+              {productUrlMutation.isPending ? 'Fetching...' : 'Add URL'}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <div>
+            <p className="text-body-medium text-neutral-900">{productUrlItem?.product_name}</p>
+            <p className="text-caption text-neutral-400">{productUrlItem?.raw_name}</p>
+          </div>
+          <input
+            type="url"
+            value={productUrl}
+            onChange={(e) => setProductUrl(e.target.value)}
+            placeholder="https://www.kroger.com/p/..."
+            className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-body focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            autoFocus
+          />
+          {productUrlError && (
+            <p className="text-small text-expensive">{productUrlError}</p>
+          )}
         </div>
       </Modal>
 

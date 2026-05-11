@@ -110,7 +110,7 @@ function ProductsPage() {
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [brandFilter, setBrandFilter] = useState('')
-  const [missingFilter, setMissingFilter] = useState<'' | 'missing_brand' | 'missing_pack'>('')
+  const [missingFilter, setMissingFilter] = useState<'' | 'missing_brand' | 'missing_pack' | 'missing_upc'>('')
   const [selection, setSelection] = useState<Set<string>>(new Set())
   const [groupModalOpen, setGroupModalOpen] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -140,7 +140,7 @@ function ProductsPage() {
   })
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: { name?: string; category?: string; default_unit?: string; brand?: string } }) =>
+    mutationFn: ({ id, data }: { id: string; data: { name?: string; category?: string; default_unit?: string; brand?: string; upc?: string } }) =>
       updateProduct(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['products'] })
@@ -208,6 +208,7 @@ function ProductsPage() {
         if (brandFilter && p.brand !== brandFilter) return false
         if (missingFilter === 'missing_brand' && p.brand) return false
         if (missingFilter === 'missing_pack' && p.pack_quantity != null) return false
+        if (missingFilter === 'missing_upc' && p.upc) return false
         return true
       })
       .map((p) => ({
@@ -226,6 +227,7 @@ function ProductsPage() {
         category: 'category',
         default_unit: 'default_unit',
         brand: 'brand',
+        upc: 'upc',
       }
 
       const field = fieldMap[columnId]
@@ -288,6 +290,16 @@ function ProductsPage() {
         meta: { editable: true, cellType: 'text' as const },
         cell: ({ getValue }) => {
           const val = getValue() as string | undefined
+          return val ?? '\u2014'
+        },
+      },
+      {
+        accessorKey: 'upc',
+        header: 'UPC',
+        size: 130,
+        meta: { editable: true, cellType: 'text' as const },
+        cell: ({ getValue }) => {
+          const val = getValue() as string | null | undefined
           return val ?? '\u2014'
         },
       },
@@ -432,11 +444,12 @@ function ProductsPage() {
           </select>
           <select
             value={missingFilter}
-            onChange={(e) => setMissingFilter(e.target.value as '' | 'missing_brand' | 'missing_pack')}
+            onChange={(e) => setMissingFilter(e.target.value as '' | 'missing_brand' | 'missing_pack' | 'missing_upc')}
             className="px-3 py-2 text-body border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand"
           >
             <option value="">All products</option>
             <option value="missing_brand">Missing brand</option>
+            <option value="missing_upc">Missing UPC</option>
             <option value="missing_pack">Missing pack size</option>
           </select>
           {debouncedSearch && !isLoading && (

@@ -60,23 +60,27 @@ type updateLineItemRequest struct {
 }
 
 type manualLineItemRequest struct {
-	RawName    string  `json:"raw_name"`
-	ProductID  *string `json:"product_id"` // optional: user picked from autocomplete
-	Quantity   *string `json:"quantity"`   // decimal string; defaults to "1"
-	Unit       *string `json:"unit"`
-	UnitPrice  *string `json:"unit_price"`
-	TotalPrice string  `json:"total_price"` // required
+	RawName              string  `json:"raw_name"`
+	ProductID            *string `json:"product_id"` // optional: user picked from autocomplete
+	Quantity             *string `json:"quantity"`   // decimal string; defaults to "1"
+	Unit                 *string `json:"unit"`
+	UnitPrice            *string `json:"unit_price"`
+	TotalPrice           string  `json:"total_price"` // required
+	PackQuantityOverride *string `json:"pack_quantity_override"`
+	PackUnitOverride     *string `json:"pack_unit_override"`
 }
 
 type createLineItemRequest struct {
-	RawName           string  `json:"raw_name"`
-	ProductID         *string `json:"product_id"`
-	Quantity          *string `json:"quantity"`
-	Unit              *string `json:"unit"`
-	UnitPrice         *string `json:"unit_price"`
-	TotalPrice        string  `json:"total_price"`
-	LineNumber        *int    `json:"line_number"`
-	CountContribution *string `json:"count_contribution"`
+	RawName              string  `json:"raw_name"`
+	ProductID            *string `json:"product_id"`
+	Quantity             *string `json:"quantity"`
+	Unit                 *string `json:"unit"`
+	UnitPrice            *string `json:"unit_price"`
+	TotalPrice           string  `json:"total_price"`
+	LineNumber           *int    `json:"line_number"`
+	CountContribution    *string `json:"count_contribution"`
+	PackQuantityOverride *string `json:"pack_quantity_override"`
+	PackUnitOverride     *string `json:"pack_unit_override"`
 }
 
 type createLineItemsRequest struct {
@@ -1171,6 +1175,10 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "count_contribution must be a decimal"})
 		}
 	}
+	packQuantityOverride, packUnitOverride, packOverrideSource, err := parsePackOverrideInputs(req.PackQuantityOverride, req.PackUnitOverride)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 
 	var storeID *string
 	var storeName *string
@@ -1256,11 +1264,11 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 		`INSERT INTO line_items
 		    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
 		     quantity, unit, unit_price, total_price, matched, confidence, line_number,
-		     count_contribution, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		     count_contribution, pack_quantity_override, pack_unit_override, pack_override_source, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		itemID, receiptID, productID, req.RawName, storeItemCodePtr, receiptDescription,
 		quantity.String(), req.Unit, unitPrice, totalPrice.String(), matched, confidence,
-		lineNumber, countContribution.String(), now,
+		lineNumber, countContribution.String(), packQuantityOverride, packUnitOverride, packOverrideSource, now,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
@@ -1306,15 +1314,18 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 }
 
 type parsedManualLineItem struct {
-	rawName            string
-	storeItemCode      *string
-	receiptDescription *string
-	productID          *string
-	quantity           decimal.Decimal
-	unit               *string
-	unitPrice          *string
-	totalPrice         decimal.Decimal
-	countContribution  decimal.Decimal
+	rawName              string
+	storeItemCode        *string
+	receiptDescription   *string
+	productID            *string
+	quantity             decimal.Decimal
+	unit                 *string
+	unitPrice            *string
+	totalPrice           decimal.Decimal
+	countContribution    decimal.Decimal
+	packQuantityOverride *string
+	packUnitOverride     *string
+	packOverrideSource   *string
 }
 
 // CreateLineItems adds multiple manually-entered line items to an existing receipt.
@@ -1415,11 +1426,11 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 			`INSERT INTO line_items
 			    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
 			     quantity, unit, unit_price, total_price, matched, confidence, line_number,
-			     count_contribution, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			     count_contribution, pack_quantity_override, pack_unit_override, pack_override_source, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			itemID, receiptID, productID, item.rawName, item.storeItemCode, item.receiptDescription,
 			item.quantity.String(), item.unit, item.unitPrice, item.totalPrice.String(), matched, confidence,
-			startLineNumber+i, item.countContribution.String(), now,
+			startLineNumber+i, item.countContribution.String(), item.packQuantityOverride, item.packUnitOverride, item.packOverrideSource, now,
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
@@ -1528,6 +1539,10 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 	}
 
 	unit := trimmedStringPtr(item.Unit)
+	packQuantityOverride, packUnitOverride, packOverrideSource, err := parsePackOverrideInputs(item.PackQuantityOverride, item.PackUnitOverride)
+	if err != nil {
+		return parsedManualLineItem{}, err
+	}
 	parsedLine := matcher.ParseLine(rawName, chain)
 	storeItemCode := storecodes.Normalize(parsedLine.StoreItemCode)
 	var storeItemCodePtr *string
@@ -1539,16 +1554,35 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 		receiptDescription = &parsedLine.ReceiptDescription
 	}
 	return parsedManualLineItem{
-		rawName:            rawName,
-		storeItemCode:      storeItemCodePtr,
-		receiptDescription: receiptDescription,
-		productID:          productID,
-		quantity:           quantity,
-		unit:               unit,
-		unitPrice:          unitPrice,
-		totalPrice:         totalPrice,
-		countContribution:  receiptline.CountContribution(quantity, unit),
+		rawName:              rawName,
+		storeItemCode:        storeItemCodePtr,
+		receiptDescription:   receiptDescription,
+		productID:            productID,
+		quantity:             quantity,
+		unit:                 unit,
+		unitPrice:            unitPrice,
+		totalPrice:           totalPrice,
+		countContribution:    receiptline.CountContribution(quantity, unit),
+		packQuantityOverride: packQuantityOverride,
+		packUnitOverride:     packUnitOverride,
+		packOverrideSource:   packOverrideSource,
 	}, nil
+}
+
+func parsePackOverrideInputs(quantityValue, unitValue *string) (*string, *string, *string, error) {
+	qty := strings.TrimSpace(ptrStringValue(quantityValue))
+	unit := strings.TrimSpace(ptrStringValue(unitValue))
+	if qty == "" && unit == "" {
+		return nil, nil, nil, nil
+	}
+	if qty == "" || unit == "" {
+		return nil, nil, nil, fmt.Errorf("pack size requires quantity and unit")
+	}
+	if parsed, err := decimal.NewFromString(qty); err != nil || !parsed.IsPositive() {
+		return nil, nil, nil, fmt.Errorf("pack_quantity_override must be a positive decimal")
+	}
+	source := "user"
+	return &qty, &unit, &source, nil
 }
 
 func trimmedStringPtr(value *string) *string {

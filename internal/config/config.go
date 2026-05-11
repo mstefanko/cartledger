@@ -35,6 +35,7 @@ type Config struct {
 	GeminiAPIKey    string
 	LLMProvider     string // "claude", "claude-cli", "gemini", "mock" (empty = auto-detect)
 	LLMModel        string // Claude model ID (default: claude-sonnet-4-20250514)
+	USDAFDCAPIKey   string
 	// LLMMonthlyTokenBudget is the per-household monthly LLM token cap
 	// (input + output, combined). 0 means no cap. A reasonable self-host
 	// default is 2_000_000 (~$6/mo at Sonnet pricing). See
@@ -199,6 +200,7 @@ func load(server bool) (*Config, error) {
 		GeminiAPIKey:                getEnv("GEMINI_API_KEY", ""),
 		LLMProvider:                 getEnv("LLM_PROVIDER", ""),
 		LLMModel:                    getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
+		USDAFDCAPIKey:               getEnv("USDA_FDC_API_KEY", ""),
 		LLMMonthlyTokenBudget:       getEnvInt64("LLM_MONTHLY_TOKEN_BUDGET", 0),
 		JWTSecret:                   os.Getenv("JWT_SECRET"), // no default — policy applied below
 		AllowPrivateIntegrations:    getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),

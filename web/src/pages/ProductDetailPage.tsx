@@ -6,6 +6,10 @@ import {
   getProductUsage,
   deleteProduct,
   updateProduct,
+  addProductLink,
+  enrichProductByUPC,
+  acceptProductEnrichmentSuggestion,
+  rejectProductEnrichmentSuggestion,
   previewProductPriceRecompute,
   recomputeProductPrices,
   uploadProductImage,
@@ -20,7 +24,7 @@ import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
 import { ProductMerge } from '@/components/products/ProductMerge'
-import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry, ProductGroup, GroupSuggestion } from '@/types'
+import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry, ProductGroup, GroupSuggestion, ProductEnrichmentSuggestion, ProductNutrition } from '@/types'
 
 // --- Helper ---
 
@@ -68,13 +72,14 @@ function canonicalUnitPreview(unit: string): string {
 function ProductInfoSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
   const queryClient = useQueryClient()
   const [brand, setBrand] = useState(detail.product.brand ?? '')
+  const [upc, setUpc] = useState(detail.product.upc ?? '')
   const [packQuantity, setPackQuantity] = useState(detail.product.pack_quantity?.toString() ?? '')
   const [packUnit, setPackUnit] = useState(detail.product.pack_unit ?? '')
   const [confirmMode, setConfirmMode] = useState<'save' | 'recompute' | null>(null)
   const [affectedCount, setAffectedCount] = useState<number | null>(null)
 
   const updateMutation = useMutation({
-    mutationFn: (data: { brand?: string; pack_quantity?: number; pack_unit?: string }) =>
+    mutationFn: (data: { brand?: string; upc?: string | null; pack_quantity?: number; pack_unit?: string }) =>
       updateProduct(productId, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
@@ -84,6 +89,17 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   const handleSaveBrand = useCallback(() => {
     updateMutation.mutate({ brand: brand || undefined })
   }, [brand, updateMutation])
+
+  const handleSaveUPC = useCallback(() => {
+    updateMutation.mutate({ upc: upc.trim() || null })
+  }, [upc, updateMutation])
+
+  const upcMutation = useMutation({
+    mutationFn: () => enrichProductByUPC(productId, { upc: upc.trim() }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
 
   const previewMutation = useMutation({
     mutationFn: () => previewProductPriceRecompute(productId),
@@ -161,7 +177,7 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
     <>
       <div className="bg-white rounded-2xl shadow-subtle p-5">
         <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Product Info</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           {/* Brand */}
           <div>
             <label className="block text-small font-medium text-neutral-400 mb-1">Brand</label>
@@ -175,6 +191,31 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
                 onBlur={handleSaveBrand}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBrand() }}
               />
+            </div>
+          </div>
+
+          {/* UPC */}
+          <div>
+            <label className="block text-small font-medium text-neutral-400 mb-1">UPC</label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={upc}
+                onChange={(e) => setUpc(e.target.value)}
+                placeholder="Barcode"
+                inputMode="numeric"
+                className="min-w-0 flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                onBlur={handleSaveUPC}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSaveUPC() }}
+              />
+              <Button
+                size="sm"
+                variant="subtle"
+                onClick={() => upcMutation.mutate()}
+                disabled={upc.trim().length === 0 || upcMutation.isPending}
+              >
+                {upcMutation.isPending ? 'Looking...' : 'Lookup'}
+              </Button>
             </div>
           </div>
 
@@ -824,43 +865,264 @@ function TransactionsSection({ detail }: { detail: ProductDetail }) {
   )
 }
 
-function MealieLinksSection({ detail }: { detail: ProductDetail }) {
-  if (detail.links.length === 0) {
-    return null
+function sourceLabel(source: string): string {
+  switch (source) {
+    case 'mealie_food':
+      return 'Mealie food'
+    case 'mealie_recipe':
+      return 'Mealie recipe'
+    case 'kroger':
+      return 'Kroger'
+    case 'openfoodfacts':
+      return 'Open Food Facts'
+    case 'user_upc':
+      return 'UPC'
+    default:
+      return source
+  }
+}
+
+function SourcesSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
+  const queryClient = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [url, setURL] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  const mutation = useMutation({
+    mutationFn: () => addProductLink(productId, { url: url.trim() }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      setURL('')
+      setError(null)
+      setOpen(false)
+    },
+    onError: (err: Error) => {
+      setError(err.message)
+    },
+  })
+
+  const handleSubmit = () => {
+    if (!url.trim()) return
+    setError(null)
+    mutation.mutate()
   }
 
-  const sourceLabel = (source: string): string => {
-    switch (source) {
-      case 'mealie_food':
-        return 'food'
-      case 'mealie_recipe':
-        return 'recipe'
-      default:
-        return source
-    }
+  return (
+    <>
+      <div className="bg-white rounded-2xl shadow-subtle p-5">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h2 className="font-display text-feature font-semibold text-neutral-900">Sources</h2>
+          <Button size="sm" variant="subtle" onClick={() => setOpen(true)}>
+            Add URL
+          </Button>
+        </div>
+        {detail.links.length === 0 ? (
+          <p className="text-caption text-neutral-400">No source links yet.</p>
+        ) : (
+          <div className="space-y-2">
+            {detail.links.map((link) => (
+              <div key={link.id} className="rounded-xl border border-neutral-200 px-3 py-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <svg className="w-4 h-4 text-brand flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                  </svg>
+                  <a
+                    href={link.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="min-w-0 flex-1 truncate text-body text-brand hover:underline"
+                  >
+                    {link.label ?? link.url}
+                  </a>
+                  <Badge variant="neutral">{sourceLabel(link.source)}</Badge>
+                  {link.http_status && (
+                    <span className="text-small text-neutral-400">HTTP {link.http_status}</span>
+                  )}
+                </div>
+                {(link.fetched_at || link.last_error || link.source_confidence != null) && (
+                  <div className="mt-1 flex flex-wrap gap-3 text-small text-neutral-400">
+                    {link.fetched_at && <span>Fetched {new Date(link.fetched_at).toLocaleDateString()}</span>}
+                    {link.source_confidence != null && <span>{Math.round(link.source_confidence * 100)}% confidence</span>}
+                    {link.last_error && <span className="text-expensive">{link.last_error}</span>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <Modal
+        open={open}
+        onClose={() => {
+          if (!mutation.isPending) {
+            setOpen(false)
+            setError(null)
+          }
+        }}
+        title="Add Product URL"
+        footer={(
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setOpen(false)} disabled={mutation.isPending}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={handleSubmit} disabled={mutation.isPending || !url.trim()}>
+              {mutation.isPending ? 'Fetching...' : 'Add URL'}
+            </Button>
+          </>
+        )}
+      >
+        <div className="space-y-3">
+          <input
+            type="url"
+            value={url}
+            onChange={(e) => setURL(e.target.value)}
+            placeholder="https://www.kroger.com/p/..."
+            className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-body focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand"
+            autoFocus
+          />
+          {error && <p className="text-small text-expensive">{error}</p>}
+        </div>
+      </Modal>
+    </>
+  )
+}
+
+function fieldLabel(field: string): string {
+  const labels: Record<string, string> = {
+    name: 'Name',
+    brand: 'Brand',
+    upc: 'UPC',
+    pack_quantity: 'Pack quantity',
+    pack_unit: 'Pack unit',
+    serving_quantity: 'Serving quantity',
+    serving_unit: 'Serving unit',
+    serving_label: 'Serving size',
+    servings_per_container: 'Servings',
+    calories: 'Calories',
+    total_fat_g: 'Total fat',
+    saturated_fat_g: 'Saturated fat',
+    trans_fat_g: 'Trans fat',
+    cholesterol_mg: 'Cholesterol',
+    sodium_mg: 'Sodium',
+    total_carbohydrate_g: 'Carbs',
+    dietary_fiber_g: 'Fiber',
+    total_sugars_g: 'Sugars',
+    added_sugars_g: 'Added sugars',
+    protein_g: 'Protein',
+    ingredients: 'Ingredients',
+    allergens: 'Allergens',
+  }
+  return labels[field] ?? field
+}
+
+function SuggestionsSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
+  const queryClient = useQueryClient()
+  const suggestions = detail.enrichment_suggestions ?? []
+  const acceptMutation = useMutation({
+    mutationFn: (suggestion: ProductEnrichmentSuggestion) =>
+      acceptProductEnrichmentSuggestion(productId, suggestion.id, { fields: [suggestion.field] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+  const rejectMutation = useMutation({
+    mutationFn: (suggestion: ProductEnrichmentSuggestion) =>
+      rejectProductEnrichmentSuggestion(productId, suggestion.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
+
+  if (suggestions.length === 0) {
+    return null
   }
 
   return (
     <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Linked in Mealie</h2>
+      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Suggestions</h2>
       <div className="space-y-2">
-        {detail.links.map((link) => (
-          <div key={link.id} className="flex items-center gap-2">
-            <svg className="w-4 h-4 text-brand flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-            </svg>
-            <a
-              href={link.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-body text-brand hover:underline"
-            >
-              {link.label ?? link.url}
-            </a>
-            <Badge variant="neutral">{sourceLabel(link.source)}</Badge>
+        {suggestions.map((suggestion) => (
+          <div key={suggestion.id} className="rounded-xl border border-neutral-200 px-3 py-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-caption font-semibold text-neutral-900">{fieldLabel(suggestion.field)}</span>
+                  <Badge variant="neutral">{sourceLabel(suggestion.source)}</Badge>
+                  {suggestion.confidence != null && (
+                    <span className="text-small text-neutral-400">{Math.round(suggestion.confidence * 100)}%</span>
+                  )}
+                </div>
+                <div className="mt-1 grid gap-1 text-caption sm:grid-cols-2">
+                  <span className="min-w-0 text-neutral-400">Current: {suggestion.current_value || '—'}</span>
+                  <span className="min-w-0 text-neutral-900">Suggested: {suggestion.value}</span>
+                </div>
+                {suggestion.evidence && (
+                  <p className="mt-1 line-clamp-2 text-small text-neutral-400">{suggestion.evidence}</p>
+                )}
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <Button
+                  size="sm"
+                  variant="subtle"
+                  onClick={() => rejectMutation.mutate(suggestion)}
+                  disabled={rejectMutation.isPending || acceptMutation.isPending}
+                >
+                  Dismiss
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => acceptMutation.mutate(suggestion)}
+                  disabled={acceptMutation.isPending || rejectMutation.isPending}
+                >
+                  Accept
+                </Button>
+              </div>
+            </div>
           </div>
         ))}
       </div>
+    </div>
+  )
+}
+
+function NutritionSection({ nutrition }: { nutrition: ProductNutrition[] }) {
+  if (!nutrition || nutrition.length === 0) return null
+  const row = nutrition[0]!
+  const nutrients: Array<[string, number | null | undefined, string]> = [
+    ['Calories', row.calories, ''],
+    ['Fat', row.total_fat_g, 'g'],
+    ['Sat fat', row.saturated_fat_g, 'g'],
+    ['Sodium', row.sodium_mg, 'mg'],
+    ['Carbs', row.total_carbohydrate_g, 'g'],
+    ['Fiber', row.dietary_fiber_g, 'g'],
+    ['Sugars', row.total_sugars_g, 'g'],
+    ['Protein', row.protein_g, 'g'],
+  ]
+
+  return (
+    <div className="bg-white rounded-2xl shadow-subtle p-5">
+      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Nutrition</h2>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {nutrients.filter(([, value]) => value != null).map(([label, value, unit]) => (
+          <div key={label} className="rounded-xl bg-neutral-50 px-3 py-2">
+            <span className="block text-small text-neutral-400">{label}</span>
+            <span className="text-caption font-semibold text-neutral-900">{value}{unit}</span>
+          </div>
+        ))}
+      </div>
+      {(row.serving_label || row.serving_quantity || row.servings_per_container) && (
+        <p className="mt-3 text-caption text-neutral-500">
+          Serving: {row.serving_label ?? `${row.serving_quantity ?? ''} ${row.serving_unit ?? ''}`.trim()}
+          {row.servings_per_container != null ? `; ${row.servings_per_container} servings/container` : ''}
+        </p>
+      )}
+      {row.ingredients && (
+        <p className="mt-3 text-small text-neutral-500">
+          <span className="font-medium text-neutral-700">Ingredients:</span> {row.ingredients}
+        </p>
+      )}
     </div>
   )
 }
@@ -1256,13 +1518,15 @@ function ProductDetailPage() {
       <div className="space-y-5">
         <ProductInfoSection detail={detail} productId={productId} />
         <ProductGroupSection detail={detail} productId={productId} />
+        <SourcesSection detail={detail} productId={productId} />
+        <SuggestionsSection detail={detail} productId={productId} />
+        <NutritionSection nutrition={detail.nutrition} />
         <PriceTrendSection detail={detail} />
         <PhotosSection detail={detail} productId={productId} />
         <StoreCodesSection detail={detail} />
         <AliasesSection detail={detail} productId={productId} stores={stores} />
         <PriceComparisonSection detail={detail} />
         <TransactionsSection detail={detail} />
-        <MealieLinksSection detail={detail} />
       </div>
 
       {/* Merge Modal */}

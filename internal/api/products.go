@@ -36,6 +36,7 @@ type createProductRequest struct {
 	DefaultUnit  *string  `json:"default_unit,omitempty"`
 	Notes        *string  `json:"notes,omitempty"`
 	Brand        *string  `json:"brand,omitempty"`
+	UPC          *string  `json:"upc,omitempty"`
 	PackQuantity *float64 `json:"pack_quantity,omitempty"`
 	PackUnit     *string  `json:"pack_unit,omitempty"`
 }
@@ -46,6 +47,7 @@ type updateProductRequest struct {
 	DefaultUnit    *string  `json:"default_unit,omitempty"`
 	Notes          *string  `json:"notes,omitempty"`
 	Brand          *string  `json:"brand,omitempty"`
+	UPC            *string  `json:"upc,omitempty"`
 	PackQuantity   *float64 `json:"pack_quantity,omitempty"`
 	PackUnit       *string  `json:"pack_unit,omitempty"`
 	ProductGroupID *string  `json:"product_group_id,omitempty"`
@@ -61,6 +63,7 @@ type productResponse struct {
 	DefaultUnit     *string    `json:"default_unit,omitempty"`
 	Notes           *string    `json:"notes,omitempty"`
 	Brand           *string    `json:"brand,omitempty"`
+	UPC             *string    `json:"upc,omitempty"`
 	PackQuantity    *float64   `json:"pack_quantity,omitempty"`
 	PackUnit        *string    `json:"pack_unit,omitempty"`
 	ProductGroupID  *string    `json:"product_group_id,omitempty"`
@@ -83,13 +86,18 @@ type productImageResponse struct {
 }
 
 type productLinkResponse struct {
-	ID         string    `json:"id"`
-	ProductID  string    `json:"product_id"`
-	Source     string    `json:"source"`
-	ExternalID *string   `json:"external_id,omitempty"`
-	URL        string    `json:"url"`
-	Label      *string   `json:"label,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID               string     `json:"id"`
+	ProductID        string     `json:"product_id"`
+	Source           string     `json:"source"`
+	ExternalID       *string    `json:"external_id,omitempty"`
+	URL              string     `json:"url"`
+	Label            *string    `json:"label,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	FetchedAt        *time.Time `json:"fetched_at,omitempty"`
+	HTTPStatus       *int       `json:"http_status,omitempty"`
+	ContentHash      *string    `json:"content_hash,omitempty"`
+	LastError        *string    `json:"last_error,omitempty"`
+	SourceConfidence *float64   `json:"source_confidence,omitempty"`
 }
 
 // fetchProduct loads a single product with computed alias_count and last_price.
@@ -97,14 +105,14 @@ func (h *ProductHandler) fetchProduct(id string) (productResponse, error) {
 	var p productResponse
 	err := h.DB.QueryRow(
 		`SELECT p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-		        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
+		        p.brand, p.upc, p.pack_quantity, p.pack_unit, p.product_group_id,
 		        p.last_purchased_at, p.purchase_count,
 		        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 		        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
 		        p.created_at, p.updated_at
 		 FROM products p WHERE p.id = ?`, id,
 	).Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.Brand, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
+		&p.Brand, &p.UPC, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
 		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
 	return p, err
 }
@@ -126,6 +134,10 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products.POST("/:id/images", h.UploadImage)
 	products.DELETE("/:id/images/:imageId", h.DeleteImage)
 	products.GET("/:id/links", h.ListLinks)
+	products.POST("/:id/links", h.AddLink)
+	products.POST("/:id/enrich/upc", h.EnrichByUPC)
+	products.POST("/:id/enrichment-suggestions/:suggestionId/accept", h.AcceptEnrichmentSuggestion)
+	products.POST("/:id/enrichment-suggestions/:suggestionId/reject", h.RejectEnrichmentSuggestion)
 	products.GET("/:id/detail", h.Detail)
 	products.GET("/:id/usage", h.GetProductUsage)
 }
@@ -134,7 +146,7 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 // Kept as a const so query variants stay byte-identical and reviewers can
 // diff the WHERE/ORDER BY clauses without re-reading a 14-column tuple.
 const productListColumns = `p.id, p.household_id, p.name, p.category, p.default_unit, p.notes,
-	        p.brand, p.pack_quantity, p.pack_unit, p.product_group_id,
+	        p.brand, p.upc, p.pack_quantity, p.pack_unit, p.product_group_id,
 	        p.last_purchased_at, p.purchase_count,
 	        (SELECT COUNT(*) FROM product_aliases WHERE product_id = p.id) as alias_count,
 	        (SELECT PRINTF('%.2f', pp.unit_price) FROM product_prices pp WHERE pp.product_id = p.id ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC LIMIT 1) as last_price,
@@ -146,7 +158,7 @@ const productListColumns = `p.id, p.household_id, p.name, p.category, p.default_
 // debug.
 func scanProductRow(rows *sql.Rows, p *productResponse) error {
 	return rows.Scan(&p.ID, &p.HouseholdID, &p.Name, &p.Category, &p.DefaultUnit, &p.Notes,
-		&p.Brand, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
+		&p.Brand, &p.UPC, &p.PackQuantity, &p.PackUnit, &p.ProductGroupID,
 		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -287,14 +299,18 @@ func (h *ProductHandler) Create(c echo.Context) error {
 		normalized := matcher.NormalizeBrand(*req.Brand)
 		req.Brand = &normalized
 	}
+	upc, err := normalizeUPCPointer(req.UPC)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 
 	now := time.Now().UTC()
 	var id string
-	err := h.DB.QueryRow(
-		`INSERT INTO products (id, household_id, name, category, default_unit, notes, brand, pack_quantity, pack_unit, created_at, updated_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	err = h.DB.QueryRow(
+		`INSERT INTO products (id, household_id, name, category, default_unit, notes, brand, upc, pack_quantity, pack_unit, created_at, updated_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
-		householdID, req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, now, now,
+		householdID, req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, upc, req.PackQuantity, req.PackUnit, now, now,
 	).Scan(&id)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -342,6 +358,9 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		if req.Brand == nil {
 			req.Brand = existing.Brand
 		}
+		if req.UPC == nil {
+			req.UPC = existing.UPC
+		}
 		if req.PackQuantity == nil {
 			req.PackQuantity = existing.PackQuantity
 		}
@@ -358,6 +377,10 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		normalized := matcher.NormalizeBrand(*req.Brand)
 		req.Brand = &normalized
 	}
+	upc, err := normalizeUPCPointer(req.UPC)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 
 	// Validate product_group_id belongs to this household if set.
 	if req.ProductGroupID != nil && *req.ProductGroupID != "" {
@@ -373,9 +396,9 @@ func (h *ProductHandler) Update(c echo.Context) error {
 
 	now := time.Now().UTC()
 	result, err := h.DB.Exec(
-		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, brand = ?, pack_quantity = ?, pack_unit = ?, product_group_id = ?, updated_at = ?
+		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, brand = ?, upc = ?, pack_quantity = ?, pack_unit = ?, product_group_id = ?, updated_at = ?
 		 WHERE id = ? AND household_id = ?`,
-		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, req.ProductGroupID, now, productID, householdID,
+		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, upc, req.PackQuantity, req.PackUnit, req.ProductGroupID, now, productID, householdID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -829,7 +852,8 @@ func (h *ProductHandler) ListLinks(c echo.Context) error {
 	}
 
 	rows, err := h.DB.Query(
-		`SELECT id, product_id, source, external_id, url, label, created_at
+		`SELECT id, product_id, source, external_id, url, label, created_at,
+		        fetched_at, http_status, content_hash, last_error, source_confidence
 		 FROM product_links WHERE product_id = ? ORDER BY created_at`,
 		productID,
 	)
@@ -840,8 +864,8 @@ func (h *ProductHandler) ListLinks(c echo.Context) error {
 
 	links := make([]productLinkResponse, 0)
 	for rows.Next() {
-		var l productLinkResponse
-		if err := rows.Scan(&l.ID, &l.ProductID, &l.Source, &l.ExternalID, &l.URL, &l.Label, &l.CreatedAt); err != nil {
+		l, err := scanProductLink(rows)
+		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		links = append(links, l)
@@ -1153,17 +1177,19 @@ type productSibling struct {
 }
 
 type productDetailResponse struct {
-	Product      productResponse            `json:"product"`
-	PricePerUnit *string                    `json:"price_per_unit,omitempty"`
-	Group        *productGroupInfo          `json:"group,omitempty"`
-	Siblings     []productSibling           `json:"siblings,omitempty"`
-	Aliases      []productAliasResponse     `json:"aliases"`
-	StoreCodes   []productStoreCodeResponse `json:"store_codes"`
-	Images       []productImageResponse     `json:"images"`
-	Links        []productLinkResponse      `json:"links"`
-	PriceHistory []priceHistoryEntry        `json:"price_history"`
-	StoreCompare []storeComparison          `json:"store_comparison"`
-	Stats        purchaseStats              `json:"stats"`
+	Product               productResponse                       `json:"product"`
+	PricePerUnit          *string                               `json:"price_per_unit,omitempty"`
+	Group                 *productGroupInfo                     `json:"group,omitempty"`
+	Siblings              []productSibling                      `json:"siblings,omitempty"`
+	Aliases               []productAliasResponse                `json:"aliases"`
+	StoreCodes            []productStoreCodeResponse            `json:"store_codes"`
+	Images                []productImageResponse                `json:"images"`
+	Links                 []productLinkResponse                 `json:"links"`
+	Nutrition             []productNutritionResponse            `json:"nutrition"`
+	EnrichmentSuggestions []productEnrichmentSuggestionResponse `json:"enrichment_suggestions"`
+	PriceHistory          []priceHistoryEntry                   `json:"price_history"`
+	StoreCompare          []storeComparison                     `json:"store_comparison"`
+	Stats                 purchaseStats                         `json:"stats"`
 }
 
 // Detail returns comprehensive product information including aliases, images, links,
@@ -1193,13 +1219,15 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 	}
 
 	resp := productDetailResponse{
-		Product:      p,
-		Aliases:      make([]productAliasResponse, 0),
-		StoreCodes:   make([]productStoreCodeResponse, 0),
-		Images:       make([]productImageResponse, 0),
-		Links:        make([]productLinkResponse, 0),
-		PriceHistory: make([]priceHistoryEntry, 0),
-		StoreCompare: make([]storeComparison, 0),
+		Product:               p,
+		Aliases:               make([]productAliasResponse, 0),
+		StoreCodes:            make([]productStoreCodeResponse, 0),
+		Images:                make([]productImageResponse, 0),
+		Links:                 make([]productLinkResponse, 0),
+		Nutrition:             make([]productNutritionResponse, 0),
+		EnrichmentSuggestions: make([]productEnrichmentSuggestionResponse, 0),
+		PriceHistory:          make([]priceHistoryEntry, 0),
+		StoreCompare:          make([]storeComparison, 0),
 	}
 
 	// Compute price_per_unit when pack_quantity is available.
@@ -1302,18 +1330,23 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 
 	// Fetch links.
 	linkRows, err := h.DB.Query(
-		"SELECT id, product_id, source, external_id, url, label, created_at FROM product_links WHERE product_id = ? ORDER BY created_at",
+		`SELECT id, product_id, source, external_id, url, label, created_at,
+		        fetched_at, http_status, content_hash, last_error, source_confidence
+		   FROM product_links WHERE product_id = ? ORDER BY created_at`,
 		productID,
 	)
 	if err == nil {
 		defer linkRows.Close()
 		for linkRows.Next() {
-			var l productLinkResponse
-			if linkRows.Scan(&l.ID, &l.ProductID, &l.Source, &l.ExternalID, &l.URL, &l.Label, &l.CreatedAt) == nil {
+			l, scanErr := scanProductLink(linkRows)
+			if scanErr == nil {
 				resp.Links = append(resp.Links, l)
 			}
 		}
 	}
+
+	resp.Nutrition = h.fetchProductNutrition(productID)
+	resp.EnrichmentSuggestions = h.fetchProductEnrichmentSuggestions(productID, true)
 
 	// Fetch price history with store name.
 	priceRows, err := h.DB.Query(

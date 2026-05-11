@@ -6,6 +6,7 @@ import type {
   ProductImage,
   ProductLink,
   ProductDetail,
+  ProductEnrichmentSuggestion,
   CreateProductRequest,
   UpdateProductRequest,
   CreateAliasRequest,
@@ -76,6 +77,47 @@ export async function deleteProductImage(productId: string, imageId: string): Pr
 
 export async function listProductLinks(productId: string): Promise<ProductLink[]> {
   return get<ProductLink[]>(`/products/${encodeURIComponent(productId)}/links`)
+}
+
+export async function addProductLink(
+  productId: string,
+  data: { url: string },
+): Promise<{ link: ProductLink; suggestions: ProductEnrichmentSuggestion[] }> {
+  return post<{ link: ProductLink; suggestions: ProductEnrichmentSuggestion[] }>(
+    `/products/${encodeURIComponent(productId)}/links`,
+    data,
+  )
+}
+
+export async function enrichProductByUPC(
+  productId: string,
+  data: { upc: string },
+): Promise<{ link: ProductLink; suggestions: ProductEnrichmentSuggestion[] }> {
+  return post<{ link: ProductLink; suggestions: ProductEnrichmentSuggestion[] }>(
+    `/products/${encodeURIComponent(productId)}/enrich/upc`,
+    data,
+  )
+}
+
+export async function acceptProductEnrichmentSuggestion(
+  productId: string,
+  suggestionId: string,
+  data: { fields?: string[] } = {},
+): Promise<ProductEnrichmentSuggestion> {
+  return post<ProductEnrichmentSuggestion>(
+    `/products/${encodeURIComponent(productId)}/enrichment-suggestions/${encodeURIComponent(suggestionId)}/accept`,
+    data,
+  )
+}
+
+export async function rejectProductEnrichmentSuggestion(
+  productId: string,
+  suggestionId: string,
+): Promise<void> {
+  return post<void>(
+    `/products/${encodeURIComponent(productId)}/enrichment-suggestions/${encodeURIComponent(suggestionId)}/reject`,
+    {},
+  )
 }
 
 export async function listProductAliases(productId: string): Promise<ProductAlias[]> {

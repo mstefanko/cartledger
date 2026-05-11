@@ -46,6 +46,7 @@ export interface Product {
   category: string | null
   default_unit: string | null
   brand?: string
+  upc?: string | null
   pack_quantity?: number
   pack_unit?: string
   product_group_id?: string
@@ -251,6 +252,54 @@ export interface ProductLink {
   url: string
   label: string | null
   created_at: string
+  fetched_at?: string | null
+  http_status?: number | null
+  content_hash?: string | null
+  last_error?: string | null
+  source_confidence?: number | null
+}
+
+export interface ProductNutrition {
+  id: string
+  product_id: string
+  product_link_id?: string | null
+  serving_quantity?: number | null
+  serving_unit?: string | null
+  serving_label?: string | null
+  servings_per_container?: number | null
+  calories?: number | null
+  total_fat_g?: number | null
+  saturated_fat_g?: number | null
+  trans_fat_g?: number | null
+  cholesterol_mg?: number | null
+  sodium_mg?: number | null
+  total_carbohydrate_g?: number | null
+  dietary_fiber_g?: number | null
+  total_sugars_g?: number | null
+  added_sugars_g?: number | null
+  protein_g?: number | null
+  ingredients?: string | null
+  allergens_json?: string | null
+  source_confidence?: number | null
+  accepted_by_user: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface ProductEnrichmentSuggestion {
+  id: string
+  product_id: string
+  product_link_id?: string | null
+  source: string
+  source_url: string
+  field: string
+  value: string
+  current_value?: string | null
+  evidence?: string | null
+  confidence?: number | null
+  status: 'pending' | 'accepted' | 'rejected'
+  created_at: string
+  updated_at: string
 }
 
 // --- Product Group Types ---
@@ -329,6 +378,8 @@ export interface ProductDetail {
   store_codes: ProductStoreCode[]
   images: ProductImage[]
   links: ProductLink[]
+  nutrition: ProductNutrition[]
+  enrichment_suggestions: ProductEnrichmentSuggestion[]
   price_history: PriceHistoryEntry[]
   store_comparison: StorePriceComparison[]
   price_per_unit?: number
@@ -430,6 +481,7 @@ export interface CreateProductRequest {
   category?: string
   default_unit?: string
   brand?: string
+  upc?: string
   pack_quantity?: number
   pack_unit?: string
   notes?: string
@@ -440,6 +492,7 @@ export interface UpdateProductRequest {
   category?: string
   default_unit?: string
   brand?: string
+  upc?: string | null
   pack_quantity?: number
   pack_unit?: string
   product_group_id?: string | null

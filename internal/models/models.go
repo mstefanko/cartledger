@@ -75,33 +75,33 @@ type MatchingRule struct {
 
 // Receipt represents a scanned receipt.
 type Receipt struct {
-	ID           string          `json:"id"`
-	HouseholdID  string          `json:"household_id"`
-	StoreID      *string         `json:"store_id,omitempty"`
-	ScannedBy    *string         `json:"scanned_by,omitempty"`
-	ReceiptDate  time.Time       `json:"receipt_date"`
-	Subtotal     *decimal.Decimal `json:"subtotal,omitempty"`
-	Tax          *decimal.Decimal `json:"tax,omitempty"`
-	Total        *decimal.Decimal `json:"total,omitempty"`
-	ImagePaths   *string         `json:"image_paths,omitempty"`
-	RawLLMJSON   *string         `json:"raw_llm_json,omitempty"`
-	Status       string          `json:"status"`
-	LLMProvider  *string         `json:"llm_provider,omitempty"`
-	CreatedAt    time.Time       `json:"created_at"`
+	ID          string           `json:"id"`
+	HouseholdID string           `json:"household_id"`
+	StoreID     *string          `json:"store_id,omitempty"`
+	ScannedBy   *string          `json:"scanned_by,omitempty"`
+	ReceiptDate time.Time        `json:"receipt_date"`
+	Subtotal    *decimal.Decimal `json:"subtotal,omitempty"`
+	Tax         *decimal.Decimal `json:"tax,omitempty"`
+	Total       *decimal.Decimal `json:"total,omitempty"`
+	ImagePaths  *string          `json:"image_paths,omitempty"`
+	RawLLMJSON  *string          `json:"raw_llm_json,omitempty"`
+	Status      string           `json:"status"`
+	LLMProvider *string          `json:"llm_provider,omitempty"`
+	CreatedAt   time.Time        `json:"created_at"`
 }
 
 // LineItem represents an individual item on a receipt.
 type LineItem struct {
-	ID         string           `json:"id"`
-	ReceiptID  string           `json:"receipt_id"`
-	ProductID  *string          `json:"product_id,omitempty"`
-	RawName    string           `json:"raw_name"`
-	Quantity   decimal.Decimal  `json:"quantity"`
-	Unit       *string          `json:"unit,omitempty"`
-	UnitPrice  *decimal.Decimal `json:"unit_price,omitempty"`
-	TotalPrice decimal.Decimal  `json:"total_price"`
-	Matched    string           `json:"matched"`
-	Confidence *float64         `json:"confidence,omitempty"`
+	ID                 string           `json:"id"`
+	ReceiptID          string           `json:"receipt_id"`
+	ProductID          *string          `json:"product_id,omitempty"`
+	RawName            string           `json:"raw_name"`
+	Quantity           decimal.Decimal  `json:"quantity"`
+	Unit               *string          `json:"unit,omitempty"`
+	UnitPrice          *decimal.Decimal `json:"unit_price,omitempty"`
+	TotalPrice         decimal.Decimal  `json:"total_price"`
+	Matched            string           `json:"matched"`
+	Confidence         *float64         `json:"confidence,omitempty"`
 	LineNumber         *int             `json:"line_number,omitempty"`
 	SuggestedName      *string          `json:"suggested_name,omitempty" db:"suggested_name"`
 	SuggestedCategory  *string          `json:"suggested_category,omitempty" db:"suggested_category"`
@@ -172,11 +172,16 @@ type ProductImage struct {
 
 // ProductLink represents a back-reference to Mealie or other external sources.
 type ProductLink struct {
-	ID         string    `json:"id"`
-	ProductID  string    `json:"product_id"`
-	Source     string    `json:"source"`
-	ExternalID *string   `json:"external_id,omitempty"`
-	URL        string    `json:"url"`
-	Label      *string   `json:"label,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID               string     `json:"id"`
+	ProductID        string     `json:"product_id"`
+	Source           string     `json:"source"`
+	ExternalID       *string    `json:"external_id,omitempty"`
+	URL              string     `json:"url"`
+	Label            *string    `json:"label,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	FetchedAt        *time.Time `json:"fetched_at,omitempty"`
+	HTTPStatus       *int       `json:"http_status,omitempty"`
+	ContentHash      *string    `json:"content_hash,omitempty"`
+	LastError        *string    `json:"last_error,omitempty"`
+	SourceConfidence *float64   `json:"source_confidence,omitempty"`
 }

@@ -34,7 +34,8 @@ function manualLineItemRowsAreComplete(rows: ManualLineItemGridRow[]): boolean {
     rows.every(
       (row) =>
         row.raw_name.trim().length > 0 &&
-        row.total_price.trim().length > 0,
+        row.total_price.trim().length > 0 &&
+        ((row.pack_quantity_override?.trim() ?? '') === '' ? (row.pack_unit_override?.trim() ?? '') === '' : (row.pack_unit_override?.trim() ?? '') !== ''),
     )
   )
 }
@@ -54,6 +55,9 @@ function toManualLineItemInputs(
     unit: optionalText(row.unit),
     unit_price: optionalText(row.unit_price),
     total_price: row.total_price.trim(),
+    pack_quantity_override: optionalText(row.pack_quantity_override),
+    pack_unit_override: optionalText(row.pack_unit_override),
+    pack_override_source: optionalText(row.pack_quantity_override) && optionalText(row.pack_unit_override) ? 'user' : undefined,
   }))
 }
 
@@ -76,14 +80,17 @@ function ManualLineItemGrid({
   return (
     <div>
       <div className="hidden sm:grid grid-cols-12 gap-2 px-1">
-        <span className="col-span-5 text-small font-medium text-neutral-400 uppercase tracking-wide">
+        <span className="col-span-4 text-small font-medium text-neutral-400 uppercase tracking-wide">
           Item
         </span>
-        <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
+        <span className="col-span-1 text-small font-medium text-neutral-400 uppercase tracking-wide">
           Qty
         </span>
         <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
           Unit
+        </span>
+        <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
+          Pack
         </span>
         <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
           Price
@@ -97,7 +104,7 @@ function ManualLineItemGrid({
             key={row._key}
             className="grid grid-cols-12 gap-2 items-end p-3 rounded-xl bg-neutral-50 border border-neutral-200"
           >
-            <div className="col-span-12 sm:col-span-5">
+            <div className="col-span-12 sm:col-span-4">
               <Input
                 aria-label="Item name"
                 placeholder="e.g. Whole Milk"
@@ -106,7 +113,7 @@ function ManualLineItemGrid({
                 onChange={(event) => updateRow(row._key, { raw_name: event.target.value })}
               />
             </div>
-            <div className="col-span-4 sm:col-span-2">
+            <div className="col-span-3 sm:col-span-1">
               <Input
                 aria-label="Quantity"
                 inputMode="decimal"
@@ -116,13 +123,30 @@ function ManualLineItemGrid({
                 onChange={(event) => updateRow(row._key, { quantity: event.target.value })}
               />
             </div>
-            <div className="col-span-4 sm:col-span-2">
+            <div className="col-span-3 sm:col-span-2">
               <Input
                 aria-label="Unit"
                 placeholder="ea"
                 value={row.unit ?? ''}
                 disabled={disabled}
                 onChange={(event) => updateRow(row._key, { unit: event.target.value })}
+              />
+            </div>
+            <div className="col-span-4 sm:col-span-2 grid grid-cols-2 gap-1">
+              <Input
+                aria-label="Pack quantity"
+                inputMode="decimal"
+                placeholder="12"
+                value={row.pack_quantity_override ?? ''}
+                disabled={disabled}
+                onChange={(event) => updateRow(row._key, { pack_quantity_override: event.target.value })}
+              />
+              <Input
+                aria-label="Pack unit"
+                placeholder="oz"
+                value={row.pack_unit_override ?? ''}
+                disabled={disabled}
+                onChange={(event) => updateRow(row._key, { pack_unit_override: event.target.value })}
               />
             </div>
             <div className="col-span-3 sm:col-span-2">
