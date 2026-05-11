@@ -21,6 +21,8 @@ func TestReceiptExtractionUnmarshalAcceptsQuotedNumbers(t *testing.T) {
 		"items_sold_count": 23,
 		"items": [{
 			"raw_name": "1407506 LC SOFT TACO",
+			"store_item_code": "1407506",
+			"receipt_description": "LC SOFT TACO",
 			"suggested_name": "Soft Taco Shells",
 			"suggested_brand": "",
 			"suggested_tags": "taco,shells",
@@ -57,6 +59,12 @@ func TestReceiptExtractionUnmarshalAcceptsQuotedNumbers(t *testing.T) {
 	}
 	if item.UnitPrice == nil || *item.UnitPrice != 6.99 {
 		t.Fatalf("UnitPrice = %v, want 6.99", item.UnitPrice)
+	}
+	if item.StoreItemCode == nil || *item.StoreItemCode != "1407506" {
+		t.Fatalf("StoreItemCode = %v, want 1407506", item.StoreItemCode)
+	}
+	if item.ReceiptDescription == nil || *item.ReceiptDescription != "LC SOFT TACO" {
+		t.Fatalf("ReceiptDescription = %v, want LC SOFT TACO", item.ReceiptDescription)
 	}
 	if item.DiscountAmount == nil || *item.DiscountAmount != -3 {
 		t.Fatalf("DiscountAmount = %v, want -3", item.DiscountAmount)

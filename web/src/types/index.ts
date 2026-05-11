@@ -71,6 +71,18 @@ export interface ProductAlias {
   created_at: string
 }
 
+export interface ProductStoreCode {
+  id: string
+  store_id: string
+  store_name: string
+  store_item_code: string
+  label: string | null
+  source: 'receipt' | 'manual' | 'import' | 'backfill'
+  confidence: number | null
+  first_seen_at: string
+  last_seen_at: string
+}
+
 export interface MatchingRule {
   id: string
   household_id: string
@@ -127,11 +139,13 @@ export interface LineItem {
   product_pack_unit?: string | null
   category: string | null
   raw_name: string
+  store_item_code?: string | null
+  receipt_description?: string | null
   quantity: string
   unit: string | null
   unit_price: string | null
   total_price: string
-  matched: 'unmatched' | 'auto' | 'manual' | 'rule'
+  matched: 'unmatched' | 'auto' | 'manual' | 'rule' | 'alias' | 'fuzzy' | 'code'
   review_status: 'pending' | 'accepted'
   confidence: number | null
   regular_price: string | null
@@ -312,6 +326,7 @@ export interface StorePriceComparison {
 export interface ProductDetail {
   product: Product
   aliases: ProductAlias[]
+  store_codes: ProductStoreCode[]
   images: ProductImage[]
   links: ProductLink[]
   price_history: PriceHistoryEntry[]
@@ -444,6 +459,7 @@ export interface UpdateLineItemRequest {
   unit?: string
   unit_price?: string
   total_price?: string
+  count_contribution?: string
   pack_quantity_override?: string
   pack_unit_override?: string
   pack_override_source?: 'user' | 'import'

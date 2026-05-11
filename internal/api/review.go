@@ -25,17 +25,19 @@ type ReviewHandler struct {
 // --- Response types ---
 
 type unmatchedLineItemResponse struct {
-	ID               string                  `json:"id"`
-	ReceiptID        string                  `json:"receipt_id"`
-	ReceiptDate      string                  `json:"receipt_date"`
-	StoreID          *string                 `json:"store_id,omitempty"`
-	StoreName        *string                 `json:"store_name,omitempty"`
-	RawText          string                  `json:"raw_text"`
-	Quantity         string                  `json:"quantity"`
-	Unit             *string                 `json:"unit,omitempty"`
-	UnitPrice        *string                 `json:"unit_price,omitempty"`
-	TotalPrice       string                  `json:"total_price"`
-	PossibleListItems []possibleListItemMatch `json:"possible_list_items,omitempty"`
+	ID                 string                  `json:"id"`
+	ReceiptID          string                  `json:"receipt_id"`
+	ReceiptDate        string                  `json:"receipt_date"`
+	StoreID            *string                 `json:"store_id,omitempty"`
+	StoreName          *string                 `json:"store_name,omitempty"`
+	RawText            string                  `json:"raw_text"`
+	StoreItemCode      *string                 `json:"store_item_code,omitempty"`
+	ReceiptDescription *string                 `json:"receipt_description,omitempty"`
+	Quantity           string                  `json:"quantity"`
+	Unit               *string                 `json:"unit,omitempty"`
+	UnitPrice          *string                 `json:"unit_price,omitempty"`
+	TotalPrice         string                  `json:"total_price"`
+	PossibleListItems  []possibleListItemMatch `json:"possible_list_items,omitempty"`
 }
 
 type possibleListItemMatch struct {
@@ -141,6 +143,8 @@ func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 			r.store_id,
 			s.name,
 			li.raw_name,
+			li.store_item_code,
+			li.receipt_description,
 			li.quantity,
 			li.unit,
 			li.unit_price,
@@ -173,6 +177,8 @@ func (h *ReviewHandler) ListUnmatchedLineItems(c echo.Context) error {
 			&item.StoreID,
 			&item.StoreName,
 			&item.RawText,
+			&item.StoreItemCode,
+			&item.ReceiptDescription,
 			&item.Quantity,
 			&item.Unit,
 			&item.UnitPrice,

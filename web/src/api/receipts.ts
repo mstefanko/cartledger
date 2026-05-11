@@ -124,6 +124,8 @@ export async function reprocessReceipt(
 
 export interface RepairPreviewItem {
   raw_name: string
+  store_item_code?: string | null
+  receipt_description?: string | null
   suggested_name: string
   quantity: number
   unit: string | null

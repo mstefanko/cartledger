@@ -62,19 +62,21 @@ var receiptTool = anthropic.ToolParam{
 				"items": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"raw_name":           map[string]any{"type": "string"},
-						"suggested_name":     map[string]any{"type": "string"},
-						"suggested_brand":    map[string]any{"type": "string"},
-						"suggested_tags":     map[string]any{"type": "string"},
-						"suggested_category": map[string]any{"type": "string", "enum": []any{"Meat", "Produce", "Dairy", "Bakery", "Frozen", "Pantry", "Snacks", "Beverages", "Household", "Health", "Other"}},
-						"quantity":           map[string]any{"type": "number"},
-						"unit":               map[string]any{"type": []any{"string", "null"}},
-						"unit_price":         map[string]any{"type": []any{"number", "null"}},
-						"total_price":        map[string]any{"type": "number"},
-						"regular_price":      map[string]any{"type": []any{"number", "null"}},
-						"discount_amount":    map[string]any{"type": []any{"number", "null"}},
-						"line_number":        map[string]any{"type": "integer"},
-						"confidence":         map[string]any{"type": "number"},
+						"raw_name":            map[string]any{"type": "string"},
+						"store_item_code":     map[string]any{"type": []any{"string", "null"}, "description": "store-printed item number/SKU, such as the leading Costco item number; not a purchase quantity"},
+						"receipt_description": map[string]any{"type": []any{"string", "null"}, "description": "printed product text with the store item number/SKU removed when confident"},
+						"suggested_name":      map[string]any{"type": "string"},
+						"suggested_brand":     map[string]any{"type": "string"},
+						"suggested_tags":      map[string]any{"type": "string"},
+						"suggested_category":  map[string]any{"type": "string", "enum": []any{"Meat", "Produce", "Dairy", "Bakery", "Frozen", "Pantry", "Snacks", "Beverages", "Household", "Health", "Other"}},
+						"quantity":            map[string]any{"type": "number"},
+						"unit":                map[string]any{"type": []any{"string", "null"}},
+						"unit_price":          map[string]any{"type": []any{"number", "null"}},
+						"total_price":         map[string]any{"type": "number"},
+						"regular_price":       map[string]any{"type": []any{"number", "null"}},
+						"discount_amount":     map[string]any{"type": []any{"number", "null"}},
+						"line_number":         map[string]any{"type": "integer"},
+						"confidence":          map[string]any{"type": "number"},
 					},
 					"required": []string{"raw_name", "suggested_name", "suggested_brand", "suggested_tags", "suggested_category", "quantity", "unit", "unit_price", "total_price", "regular_price", "discount_amount", "line_number", "confidence"},
 				},
@@ -129,7 +131,7 @@ func (c *ClaudeClient) ExtractReceiptWithUsage(images [][]byte) (*ReceiptExtract
 }
 
 func (c *ClaudeClient) RepairReceiptWithUsage(images [][]byte, currentJSON, note string) (*ReceiptExtraction, int64, int64, error) {
-	return c.extractReceiptWithPrompt(images, receiptRepairPrompt(currentJSON, note), true)
+	return c.extractReceiptWithPrompt(images, receiptRepairPrompt(currentJSON, note), false)
 }
 
 func (c *ClaudeClient) extractReceiptWithPrompt(images [][]byte, prompt string, useTool bool) (*ReceiptExtraction, int64, int64, error) {

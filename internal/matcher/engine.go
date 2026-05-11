@@ -8,7 +8,7 @@ import (
 type MatchResult struct {
 	ProductID  string  `json:"product_id"`
 	Confidence float64 `json:"confidence"`
-	Method     string  `json:"method"` // "rule", "alias", "fuzzy", "unmatched"
+	Method     string  `json:"method"` // "code", "rule", "alias", "fuzzy", "unmatched"
 }
 
 // Engine implements the three-stage product matching pipeline.
@@ -92,6 +92,13 @@ func (e *Engine) MatchWithSuggestion(rawName, suggestedName, storeID, householdI
 	}
 
 	return MatchResult{Method: "unmatched", Confidence: 0}
+}
+
+func (e *Engine) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedName, storeID, householdID string) MatchResult {
+	if result := matchByCode(e.db, storeItemCode, storeID, householdID); result != nil {
+		return *result
+	}
+	return e.MatchWithSuggestion(rawName, suggestedName, storeID, householdID)
 }
 
 // matchNameExact does a case-insensitive exact match of suggestedName against product names.

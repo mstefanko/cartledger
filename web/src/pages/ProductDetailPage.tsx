@@ -658,6 +658,49 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
   )
 }
 
+function StoreCodesSection({ detail }: { detail: ProductDetail }) {
+  const codes = detail.store_codes ?? []
+  return (
+    <div className="bg-white rounded-2xl shadow-subtle p-5">
+      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Store Codes</h2>
+      {codes.length === 0 ? (
+        <p className="text-caption text-neutral-400">No store codes yet.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="border-b border-neutral-200">
+                <th className="py-2 text-small font-medium text-neutral-400">Store</th>
+                <th className="py-2 text-small font-medium text-neutral-400">Code</th>
+                <th className="py-2 text-small font-medium text-neutral-400">Source</th>
+                <th className="py-2 text-small font-medium text-neutral-400 text-right">Last Seen</th>
+              </tr>
+            </thead>
+            <tbody>
+              {codes.map((code) => (
+                <tr key={code.id} className="border-b border-neutral-100 last:border-0">
+                  <td className="py-2 text-caption text-neutral-900">{code.store_name}</td>
+                  <td className="py-2">
+                    <span className="rounded-md bg-neutral-50 px-2 py-1 font-mono text-caption text-neutral-700">
+                      {code.store_item_code}
+                    </span>
+                  </td>
+                  <td className="py-2">
+                    <Badge variant="neutral">{code.source}</Badge>
+                  </td>
+                  <td className="py-2 text-right text-caption text-neutral-500">
+                    {new Date(code.last_seen_at).toLocaleDateString()}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function formatNormalizedPrice(rawPrice: string | null, rawUnit: string, normalizedPrice: string | null | undefined, normalizedUnit: string | null | undefined): string {
   const raw = formatPrice(rawPrice, rawUnit)
   if (!normalizedPrice || !normalizedUnit) return raw
@@ -1215,6 +1258,7 @@ function ProductDetailPage() {
         <ProductGroupSection detail={detail} productId={productId} />
         <PriceTrendSection detail={detail} />
         <PhotosSection detail={detail} productId={productId} />
+        <StoreCodesSection detail={detail} />
         <AliasesSection detail={detail} productId={productId} stores={stores} />
         <PriceComparisonSection detail={detail} />
         <TransactionsSection detail={detail} />

@@ -55,20 +55,22 @@ func (r *ReceiptExtraction) UnmarshalJSON(data []byte) error {
 }
 
 type extractedItemJSON struct {
-	RawName           string        `json:"raw_name"`
-	SuggestedName     string        `json:"suggested_name"`
-	SuggestedCategory string        `json:"suggested_category"`
-	SuggestedBrand    string        `json:"suggested_brand"`
-	SuggestedTags     string        `json:"suggested_tags"`
-	Quantity          flexibleFloat `json:"quantity"`
-	Unit              *string       `json:"unit"`
-	UnitPrice         nullableFloat `json:"unit_price"`
-	TotalPrice        flexibleFloat `json:"total_price"`
-	RegularPrice      nullableFloat `json:"regular_price"`
-	DiscountAmount    nullableFloat `json:"discount_amount"`
-	CountContribution flexibleFloat `json:"count_contribution"`
-	LineNumber        int           `json:"line_number"`
-	Confidence        flexibleFloat `json:"confidence"`
+	RawName            string        `json:"raw_name"`
+	StoreItemCode      *string       `json:"store_item_code"`
+	ReceiptDescription *string       `json:"receipt_description"`
+	SuggestedName      string        `json:"suggested_name"`
+	SuggestedCategory  string        `json:"suggested_category"`
+	SuggestedBrand     string        `json:"suggested_brand"`
+	SuggestedTags      string        `json:"suggested_tags"`
+	Quantity           flexibleFloat `json:"quantity"`
+	Unit               *string       `json:"unit"`
+	UnitPrice          nullableFloat `json:"unit_price"`
+	TotalPrice         flexibleFloat `json:"total_price"`
+	RegularPrice       nullableFloat `json:"regular_price"`
+	DiscountAmount     nullableFloat `json:"discount_amount"`
+	CountContribution  flexibleFloat `json:"count_contribution"`
+	LineNumber         int           `json:"line_number"`
+	Confidence         flexibleFloat `json:"confidence"`
 }
 
 func (i *ExtractedItem) UnmarshalJSON(data []byte) error {
@@ -77,20 +79,22 @@ func (i *ExtractedItem) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*i = ExtractedItem{
-		RawName:           aux.RawName,
-		SuggestedName:     aux.SuggestedName,
-		SuggestedCategory: aux.SuggestedCategory,
-		SuggestedBrand:    aux.SuggestedBrand,
-		SuggestedTags:     aux.SuggestedTags,
-		Quantity:          float64(aux.Quantity),
-		Unit:              aux.Unit,
-		UnitPrice:         aux.UnitPrice.ptr(),
-		TotalPrice:        float64(aux.TotalPrice),
-		RegularPrice:      aux.RegularPrice.ptr(),
-		DiscountAmount:    aux.DiscountAmount.ptr(),
-		CountContribution: float64(aux.CountContribution),
-		LineNumber:        aux.LineNumber,
-		Confidence:        float64(aux.Confidence),
+		RawName:            aux.RawName,
+		StoreItemCode:      aux.StoreItemCode,
+		ReceiptDescription: aux.ReceiptDescription,
+		SuggestedName:      aux.SuggestedName,
+		SuggestedCategory:  aux.SuggestedCategory,
+		SuggestedBrand:     aux.SuggestedBrand,
+		SuggestedTags:      aux.SuggestedTags,
+		Quantity:           float64(aux.Quantity),
+		Unit:               aux.Unit,
+		UnitPrice:          aux.UnitPrice.ptr(),
+		TotalPrice:         float64(aux.TotalPrice),
+		RegularPrice:       aux.RegularPrice.ptr(),
+		DiscountAmount:     aux.DiscountAmount.ptr(),
+		CountContribution:  float64(aux.CountContribution),
+		LineNumber:         aux.LineNumber,
+		Confidence:         float64(aux.Confidence),
 	}
 	return nil
 }

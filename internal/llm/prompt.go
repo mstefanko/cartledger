@@ -6,6 +6,9 @@ const receiptExtractionPrompt = `Extract all items from this grocery receipt ima
 
 Rules:
 - raw_name must be EXACTLY as printed on receipt (preserve abbreviations)
+- store_item_code: store-printed item number/SKU if visible; Costco commonly prints this before the description
+- receipt_description: printed product text with the store item number/SKU removed only when confident
+- Store item numbers/SKUs are not purchase quantities
 - suggested_name: clean, human-readable canonical product name
   - Include brand when identifiable (e.g., "Kirkland Organic Broccoli Florets")
   - Expand store-brand abbreviations: KS = Kirkland Signature, GV = Great Value, 365 = 365 by Whole Foods
@@ -19,8 +22,9 @@ Rules:
   - Forms: fresh, frozen, canned, dried, whole, sliced, florets, ground, etc.
 - suggested_category must be one of: Meat, Produce, Dairy, Bakery, Frozen, Pantry, Snacks, Beverages, Household, Health, Other
 - If quantity and unit_price are visible, include both
-- If only total_price is visible, set unit_price to null and quantity to 1
-- If quantity/weight is embedded in the item name (e.g., "3LB" in "BNLS CHKN BRST 3LB"), extract it
+- If only total_price is visible, set unit_price to null and default packaged-goods purchase quantity to 1
+- Package text like 1GAL, 16 CT, 2 x 8 ct, or 2/31.7 is package content, not purchase quantity
+- Keep measured sold quantities like 2.34 lb in quantity/unit
 - unit should be standardized: lb, oz, gal, qt, pt, each, pack, ct
 - Omit non-grocery items (bag fees, bottle deposits) but include tax/total
 - Per-item confidence score: 0.95+ for clearly readable, 0.7-0.95 for partially obscured, <0.7 for guesses
@@ -56,6 +60,10 @@ Rules:
 - Return a full corrected extraction object using the same schema as extract_receipt.
 - Preserve existing correct items.
 - Fix only issues supported by the image or the user note.
+- Store item numbers/SKUs are not purchase quantities.
+- For Costco receipts, the leading numeric field before the description is usually the store_item_code.
+- If only total_price is visible, set packaged-goods purchase quantity to 1.
+- Package text like 1GAL, 16 CT, 2 x 8 ct, or 2/31.7 is package content, not purchase quantity.
 - Coupon, savings, discount, member price, or instant savings rows are adjustments, not products.
 - If the receipt prints an items sold count, include items_sold_count.
 - Return corrected real product items in printed order.

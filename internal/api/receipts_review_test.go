@@ -76,6 +76,51 @@ func TestUpdateLineItemReviewStatusRequiresMatchedProduct(t *testing.T) {
 	}
 }
 
+func TestUpdateLineItemRecomputesCountContribution(t *testing.T) {
+	database, householdID := newReceiptReviewTestDB(t)
+	defer database.Close()
+
+	receiptID := "receipt-count-update"
+	lineItemID := "line-count-update"
+	if _, err := database.Exec(
+		"INSERT INTO receipts (id, household_id, receipt_date, status) VALUES (?, ?, '2026-05-10', 'matched')",
+		receiptID, householdID,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO line_items
+		    (id, receipt_id, raw_name, quantity, unit, total_price, matched, count_contribution)
+		 VALUES (?, ?, 'MILK', '1', 'each', '2.99', 'unmatched', '1')`,
+		lineItemID, receiptID,
+	); err != nil {
+		t.Fatalf("insert line item: %v", err)
+	}
+
+	h := &ReceiptHandler{DB: database}
+	c, rec := receiptContext(http.MethodPut, "/receipts/"+receiptID+"/line-items/"+lineItemID, `{"quantity":"3"}`, householdID)
+	c.SetParamNames("id", "itemId")
+	c.SetParamValues(receiptID, lineItemID)
+
+	if err := h.UpdateLineItem(c); err != nil {
+		t.Fatalf("UpdateLineItem: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var quantity, countContribution string
+	if err := database.QueryRow(
+		"SELECT quantity, count_contribution FROM line_items WHERE id = ?",
+		lineItemID,
+	).Scan(&quantity, &countContribution); err != nil {
+		t.Fatalf("query line item: %v", err)
+	}
+	if quantity != "3" || countContribution != "3" {
+		t.Fatalf("quantity/count = %q/%q, want 3/3", quantity, countContribution)
+	}
+}
+
 func TestUpdateReceiptRequiresReviewedLineItems(t *testing.T) {
 	database, householdID := newReceiptReviewTestDB(t)
 	defer database.Close()
@@ -315,6 +360,99 @@ func TestCreateLineItemsBulkRecoversErrorReceipt(t *testing.T) {
 	}
 	if secondMatched != "unmatched" || secondLineNumber != 2 {
 		t.Fatalf("second line = (%q, %d), want (unmatched, 2)", secondMatched, secondLineNumber)
+	}
+}
+
+func TestCreateLineItemsBulkParsesCostcoCodeAndMatchesSecondReceiptByCode(t *testing.T) {
+	database, householdID := newReceiptReviewTestDB(t)
+	defer database.Close()
+
+	storeID := "store-costco-code"
+	productID := "product-costco-milk"
+	firstReceiptID := "receipt-costco-code-first"
+	secondReceiptID := "receipt-costco-code-second"
+	if _, err := database.Exec(
+		"INSERT INTO stores (id, household_id, name) VALUES (?, ?, 'Costco Wholesale')",
+		storeID, householdID,
+	); err != nil {
+		t.Fatalf("insert store: %v", err)
+	}
+	if _, err := database.Exec(
+		"INSERT INTO products (id, household_id, name) VALUES (?, ?, 'Costco 2% Milk 1 Gallon')",
+		productID, householdID,
+	); err != nil {
+		t.Fatalf("insert product: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO receipts (id, household_id, store_id, receipt_date, status) VALUES
+		    (?, ?, ?, '2026-05-10', 'matched'),
+		    (?, ?, ?, '2026-05-11', 'matched')`,
+		firstReceiptID, householdID, storeID,
+		secondReceiptID, householdID, storeID,
+	); err != nil {
+		t.Fatalf("insert receipts: %v", err)
+	}
+
+	h := &ReceiptHandler{DB: database}
+	body := `{"items":[{"raw_name":"8 2% MILK 1GAL","product_id":"` + productID + `","quantity":"1","unit":"each","total_price":"2.92"}]}`
+	c, rec := receiptContext(http.MethodPost, "/receipts/"+firstReceiptID+"/line-items/bulk", body, householdID)
+	c.SetParamNames("id")
+	c.SetParamValues(firstReceiptID)
+
+	if err := h.CreateLineItems(c); err != nil {
+		t.Fatalf("CreateLineItems first: %v", err)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var code, desc, matched string
+	if err := database.QueryRow(
+		`SELECT store_item_code, receipt_description, matched
+		   FROM line_items WHERE receipt_id = ?`,
+		firstReceiptID,
+	).Scan(&code, &desc, &matched); err != nil {
+		t.Fatalf("query first line: %v", err)
+	}
+	if code != "8" || desc != "2% MILK 1GAL" || matched != "manual" {
+		t.Fatalf("first line = (%q, %q, %q), want (8, 2%% MILK 1GAL, manual)", code, desc, matched)
+	}
+
+	var mappedProduct, source string
+	if err := database.QueryRow(
+		`SELECT product_id, source FROM store_product_codes
+		  WHERE store_id = ? AND store_item_code = '8'`,
+		storeID,
+	).Scan(&mappedProduct, &source); err != nil {
+		t.Fatalf("query store code: %v", err)
+	}
+	if mappedProduct != productID || source != "manual" {
+		t.Fatalf("store code mapping = (%q, %q), want (%q, manual)", mappedProduct, source, productID)
+	}
+
+	body = `{"items":[{"raw_name":"8 2% MILK 1GAL","total_price":"2.99"}]}`
+	c, rec = receiptContext(http.MethodPost, "/receipts/"+secondReceiptID+"/line-items/bulk", body, householdID)
+	c.SetParamNames("id")
+	c.SetParamValues(secondReceiptID)
+
+	if err := h.CreateLineItems(c); err != nil {
+		t.Fatalf("CreateLineItems second: %v", err)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("second status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var secondProduct string
+	if err := database.QueryRow(
+		`SELECT product_id, matched, store_item_code, receipt_description
+		   FROM line_items WHERE receipt_id = ?`,
+		secondReceiptID,
+	).Scan(&secondProduct, &matched, &code, &desc); err != nil {
+		t.Fatalf("query second line: %v", err)
+	}
+	if secondProduct != productID || matched != "code" || code != "8" || desc != "2% MILK 1GAL" {
+		t.Fatalf("second line = (%q, %q, %q, %q), want (%q, code, 8, 2%% MILK 1GAL)",
+			secondProduct, matched, code, desc, productID)
 	}
 }
 

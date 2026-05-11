@@ -27,7 +27,9 @@ import (
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
+	"github.com/mstefanko/cartledger/internal/receiptline"
 	"github.com/mstefanko/cartledger/internal/storage"
+	"github.com/mstefanko/cartledger/internal/storecodes"
 	"github.com/mstefanko/cartledger/internal/worker"
 )
 
@@ -53,6 +55,7 @@ type updateLineItemRequest struct {
 	PackQuantityOverride *string `json:"pack_quantity_override"`
 	PackUnitOverride     *string `json:"pack_unit_override"`
 	PackOverrideSource   *string `json:"pack_override_source"`
+	CountContribution    *string `json:"count_contribution"`
 	ReviewStatus         *string `json:"review_status"`
 }
 
@@ -118,6 +121,8 @@ type lineItemResponse struct {
 	ProductPackUnit      *string  `json:"product_pack_unit,omitempty"`
 	Category             *string  `json:"category,omitempty"`
 	RawName              string   `json:"raw_name"`
+	StoreItemCode        *string  `json:"store_item_code,omitempty"`
+	ReceiptDescription   *string  `json:"receipt_description,omitempty"`
 	Quantity             string   `json:"quantity"`
 	Unit                 *string  `json:"unit,omitempty"`
 	UnitPrice            *string  `json:"unit_price,omitempty"`
@@ -499,12 +504,12 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 	}
 
 	// Validate store belongs to household if provided.
+	var storeName *string
 	if req.StoreID != nil && *req.StoreID != "" {
-		var exists int
 		err := h.DB.QueryRow(
-			`SELECT 1 FROM stores WHERE id = ? AND household_id = ?`,
+			`SELECT name FROM stores WHERE id = ? AND household_id = ?`,
 			*req.StoreID, householdID,
-		).Scan(&exists)
+		).Scan(&storeName)
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "store not found"})
 		} else if err != nil {
@@ -553,10 +558,25 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 	}
 
 	engine := matcher.NewEngine(h.DB)
+	storeIDArg := ""
+	if req.StoreID != nil {
+		storeIDArg = strings.TrimSpace(*req.StoreID)
+	}
+	storeChain := storeChainFromName(storeName)
 
 	for i, it := range req.Items {
 		itemID := uuid.New().String()
 		lineNum := i + 1
+		parsed := matcher.ParseLine(it.RawName, storeChain)
+		storeItemCode := storecodes.Normalize(parsed.StoreItemCode)
+		var storeItemCodePtr *string
+		if storeItemCode != "" {
+			storeItemCodePtr = &storeItemCode
+		}
+		var receiptDescription *string
+		if parsed.ReceiptDescription != "" {
+			receiptDescription = &parsed.ReceiptDescription
+		}
 
 		var productID *string
 		matched := "unmatched"
@@ -567,13 +587,9 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			productID = it.ProductID
 			matched = "manual"
 		} else {
-			storeIDArg := ""
-			if req.StoreID != nil {
-				storeIDArg = *req.StoreID
-			}
-			result := engine.MatchWithSuggestion(it.RawName, "", storeIDArg, householdID)
+			result := engine.MatchWithCodeAndSuggestion(it.RawName, storeItemCode, "", storeIDArg, householdID)
 			switch result.Method {
-			case "rule", "alias", "fuzzy":
+			case "code", "rule", "alias", "fuzzy":
 				if result.ProductID != "" {
 					pid := result.ProductID
 					productID = &pid
@@ -593,16 +609,18 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 		if it.Quantity != nil && *it.Quantity != "" {
 			quantity = *it.Quantity
 		}
+		countContribution := receiptline.CountContribution(decimal.RequireFromString(quantity), it.Unit)
 
 		_, err = tx.ExecContext(c.Request().Context(), `
 			INSERT INTO line_items
-			    (id, receipt_id, product_id, raw_name, quantity, unit,
+			    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
+			     quantity, unit,
 			     unit_price, total_price, matched, confidence, line_number,
-			     suggested_product_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			itemID, receiptID, productID, it.RawName, quantity, it.Unit,
+			     suggested_product_id, count_contribution, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			itemID, receiptID, productID, it.RawName, storeItemCodePtr, receiptDescription, quantity, it.Unit,
 			it.UnitPrice, it.TotalPrice, matched, confidence, lineNum,
-			suggestedProductID, now,
+			suggestedProductID, countContribution.String(), now,
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
@@ -619,9 +637,18 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			).Scan(&aliasExists)
 			if aliasExists == 0 {
 				_, _ = tx.ExecContext(c.Request().Context(),
-					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
 					uuid.New().String(), *productID, normalized, *req.StoreID, now,
 				)
+			}
+			if storeItemCode != "" {
+				if matched == "manual" {
+					if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *req.StoreID, *productID, storeItemCode, receiptDescription, now); err != nil {
+						return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+					}
+				} else if err := storecodes.UpsertReceipt(c.Request().Context(), tx, householdID, *req.StoreID, *productID, storeItemCode, receiptDescription, now); err != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+				}
 			}
 			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
@@ -890,7 +917,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 	rows, err := h.DB.Query(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        p.pack_quantity, p.pack_unit,
-		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
+		        li.raw_name, li.store_item_code, li.receipt_description,
+		        li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount, li.count_contribution,
 		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
 		        li.matched, li.review_status, li.confidence, li.line_number,
@@ -916,7 +944,8 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		if err := rows.Scan(
 			&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
 			&li.ProductPackQuantity, &li.ProductPackUnit,
-			&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
+			&li.RawName, &li.StoreItemCode, &li.ReceiptDescription,
+			&quantity, &li.Unit, &unitPrice, &totalPrice,
 			&li.RegularPrice, &li.DiscountAmount, &countContribution,
 			&li.PackQuantityOverride, &li.PackUnitOverride, &li.PackOverrideSource,
 			&li.Matched, &li.ReviewStatus, &li.Confidence, &li.LineNumber,
@@ -1135,7 +1164,7 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 		unitPrice = req.UnitPrice
 	}
 
-	countContribution := deriveCountContribution(quantity, req.Unit)
+	countContribution := receiptline.CountContribution(quantity, req.Unit)
 	if req.CountContribution != nil && strings.TrimSpace(*req.CountContribution) != "" {
 		countContribution, err = decimal.NewFromString(*req.CountContribution)
 		if err != nil {
@@ -1144,19 +1173,38 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 	}
 
 	var storeID *string
+	var storeName *string
 	err = h.DB.QueryRow(
-		"SELECT store_id FROM receipts WHERE id = ? AND household_id = ?",
+		`SELECT r.store_id, s.name
+		   FROM receipts r
+		   LEFT JOIN stores s ON s.id = r.store_id
+		  WHERE r.id = ? AND r.household_id = ?`,
 		receiptID, householdID,
-	).Scan(&storeID)
+	).Scan(&storeID, &storeName)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
+	storeIDArg := ""
+	if storeID != nil {
+		storeIDArg = strings.TrimSpace(*storeID)
+	}
+	parsed := matcher.ParseLine(req.RawName, storeChainFromName(storeName))
+	storeItemCode := storecodes.Normalize(parsed.StoreItemCode)
+	var storeItemCodePtr *string
+	if storeItemCode != "" {
+		storeItemCodePtr = &storeItemCode
+	}
+	var receiptDescription *string
+	if parsed.ReceiptDescription != "" {
+		receiptDescription = &parsed.ReceiptDescription
+	}
 
 	var productID *string
 	matched := "unmatched"
+	var confidence *float64
 	if req.ProductID != nil && strings.TrimSpace(*req.ProductID) != "" {
 		var exists int
 		err := h.DB.QueryRow(
@@ -1171,6 +1219,18 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 		}
 		productID = req.ProductID
 		matched = "manual"
+	} else {
+		result := matcher.NewEngine(h.DB).MatchWithCodeAndSuggestion(req.RawName, storeItemCode, "", storeIDArg, householdID)
+		switch result.Method {
+		case "code", "rule", "alias", "fuzzy":
+			if result.ProductID != "" {
+				pid := result.ProductID
+				productID = &pid
+				matched = result.Method
+				conf := result.Confidence
+				confidence = &conf
+			}
+		}
 	}
 
 	lineNumber := 1
@@ -1194,11 +1254,13 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 
 	_, err = tx.Exec(
 		`INSERT INTO line_items
-		    (id, receipt_id, product_id, raw_name, quantity, unit, unit_price,
-		     total_price, matched, line_number, count_contribution, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		itemID, receiptID, productID, req.RawName, quantity.String(), req.Unit, unitPrice,
-		totalPrice.String(), matched, lineNumber, countContribution.String(), now,
+		    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
+		     quantity, unit, unit_price, total_price, matched, confidence, line_number,
+		     count_contribution, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		itemID, receiptID, productID, req.RawName, storeItemCodePtr, receiptDescription,
+		quantity.String(), req.Unit, unitPrice, totalPrice.String(), matched, confidence,
+		lineNumber, countContribution.String(), now,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
@@ -1213,9 +1275,18 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 		).Scan(&aliasExists)
 		if aliasExists == 0 {
 			_, _ = tx.Exec(
-				"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+				"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
 				uuid.New().String(), *productID, normalized, *storeID, now,
 			)
+		}
+		if storeItemCode != "" {
+			if matched == "manual" {
+				if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, *productID, storeItemCode, receiptDescription, now); err != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+				}
+			} else if err := storecodes.UpsertReceipt(c.Request().Context(), tx, householdID, *storeID, *productID, storeItemCode, receiptDescription, now); err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+			}
 		}
 
 		if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
@@ -1235,13 +1306,15 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 }
 
 type parsedManualLineItem struct {
-	rawName           string
-	productID         *string
-	quantity          decimal.Decimal
-	unit              *string
-	unitPrice         *string
-	totalPrice        decimal.Decimal
-	countContribution decimal.Decimal
+	rawName            string
+	storeItemCode      *string
+	receiptDescription *string
+	productID          *string
+	quantity           decimal.Decimal
+	unit               *string
+	unitPrice          *string
+	totalPrice         decimal.Decimal
+	countContribution  decimal.Decimal
 }
 
 // CreateLineItems adds multiple manually-entered line items to an existing receipt.
@@ -1259,11 +1332,15 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 	}
 
 	var storeID *string
+	var storeName *string
 	var status string
 	err := h.DB.QueryRow(
-		"SELECT store_id, status FROM receipts WHERE id = ? AND household_id = ?",
+		`SELECT r.store_id, s.name, r.status
+		   FROM receipts r
+		   LEFT JOIN stores s ON s.id = r.store_id
+		  WHERE r.id = ? AND r.household_id = ?`,
 		receiptID, householdID,
-	).Scan(&storeID, &status)
+	).Scan(&storeID, &storeName, &status)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
@@ -1278,8 +1355,9 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 	}
 
 	parsedItems := make([]parsedManualLineItem, 0, len(req.Items))
+	storeChain := storeChainFromName(storeName)
 	for i, item := range req.Items {
-		parsed, err := h.parseManualLineItem(item, householdID)
+		parsed, err := h.parseManualLineItem(item, householdID, storeChain)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{
 				"error": fmt.Sprintf("items[%d].%s", i, err.Error()),
@@ -1319,9 +1397,9 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 		if productID != nil {
 			matched = "manual"
 		} else {
-			result := engine.MatchWithSuggestion(item.rawName, "", storeIDArg, householdID)
+			result := engine.MatchWithCodeAndSuggestion(item.rawName, ptrStringValue(item.storeItemCode), "", storeIDArg, householdID)
 			switch result.Method {
-			case "rule", "alias", "fuzzy":
+			case "code", "rule", "alias", "fuzzy":
 				if result.ProductID != "" {
 					pid := result.ProductID
 					productID = &pid
@@ -1335,11 +1413,12 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 		_, err = tx.ExecContext(
 			c.Request().Context(),
 			`INSERT INTO line_items
-			    (id, receipt_id, product_id, raw_name, quantity, unit, unit_price,
-			     total_price, matched, confidence, line_number, count_contribution, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			itemID, receiptID, productID, item.rawName, item.quantity.String(), item.unit,
-			item.unitPrice, item.totalPrice.String(), matched, confidence,
+			    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
+			     quantity, unit, unit_price, total_price, matched, confidence, line_number,
+			     count_contribution, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			itemID, receiptID, productID, item.rawName, item.storeItemCode, item.receiptDescription,
+			item.quantity.String(), item.unit, item.unitPrice, item.totalPrice.String(), matched, confidence,
 			startLineNumber+i, item.countContribution.String(), now,
 		)
 		if err != nil {
@@ -1357,9 +1436,18 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 			if aliasExists == 0 {
 				_, _ = tx.ExecContext(
 					c.Request().Context(),
-					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
 					uuid.New().String(), *productID, normalized, *storeID, now,
 				)
+			}
+			if code := ptrStringValue(item.storeItemCode); code != "" {
+				if matched == "manual" {
+					if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, *productID, code, item.receiptDescription, now); err != nil {
+						return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+					}
+				} else if err := storecodes.UpsertReceipt(c.Request().Context(), tx, householdID, *storeID, *productID, code, item.receiptDescription, now); err != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+				}
 			}
 			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
@@ -1393,7 +1481,7 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 	})
 }
 
-func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, householdID string) (parsedManualLineItem, error) {
+func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, householdID string, chain matcher.Chain) (parsedManualLineItem, error) {
 	rawName := strings.TrimSpace(item.RawName)
 	if rawName == "" {
 		return parsedManualLineItem{}, fmt.Errorf("raw_name is required")
@@ -1440,14 +1528,26 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 	}
 
 	unit := trimmedStringPtr(item.Unit)
+	parsedLine := matcher.ParseLine(rawName, chain)
+	storeItemCode := storecodes.Normalize(parsedLine.StoreItemCode)
+	var storeItemCodePtr *string
+	if storeItemCode != "" {
+		storeItemCodePtr = &storeItemCode
+	}
+	var receiptDescription *string
+	if parsedLine.ReceiptDescription != "" {
+		receiptDescription = &parsedLine.ReceiptDescription
+	}
 	return parsedManualLineItem{
-		rawName:           rawName,
-		productID:         productID,
-		quantity:          quantity,
-		unit:              unit,
-		unitPrice:         unitPrice,
-		totalPrice:        totalPrice,
-		countContribution: deriveCountContribution(quantity, unit),
+		rawName:            rawName,
+		storeItemCode:      storeItemCodePtr,
+		receiptDescription: receiptDescription,
+		productID:          productID,
+		quantity:           quantity,
+		unit:               unit,
+		unitPrice:          unitPrice,
+		totalPrice:         totalPrice,
+		countContribution:  receiptline.CountContribution(quantity, unit),
 	}, nil
 }
 
@@ -1462,18 +1562,18 @@ func trimmedStringPtr(value *string) *string {
 	return &trimmed
 }
 
-func deriveCountContribution(quantity decimal.Decimal, unit *string) decimal.Decimal {
-	unitStr := ""
-	if unit != nil {
-		unitStr = strings.ToLower(strings.TrimSpace(*unit))
+func ptrStringValue(value *string) string {
+	if value == nil {
+		return ""
 	}
-	switch unitStr {
-	case "", "each", "ea", "pack", "ct", "count", "gal", "qt", "pt":
-		if quantity.GreaterThan(decimal.Zero) && quantity.Equal(quantity.Round(0)) {
-			return quantity
-		}
+	return strings.TrimSpace(*value)
+}
+
+func storeChainFromName(name *string) matcher.Chain {
+	if name == nil {
+		return matcher.ChainOther
 	}
-	return decimal.NewFromInt(1)
+	return matcher.ClassifyStore(*name)
 }
 
 func nullableTrimmedString(value string) interface{} {
@@ -1516,7 +1616,8 @@ func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemRes
 	err := h.DB.QueryRow(
 		`SELECT li.id, li.receipt_id, li.product_id, p.name, p.category,
 		        p.pack_quantity, p.pack_unit,
-		        li.raw_name, li.quantity, li.unit, li.unit_price, li.total_price,
+		        li.raw_name, li.store_item_code, li.receipt_description,
+		        li.quantity, li.unit, li.unit_price, li.total_price,
 		        li.regular_price, li.discount_amount, li.count_contribution,
 		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
 		        li.matched, li.review_status, li.confidence, li.line_number,
@@ -1530,7 +1631,8 @@ func (h *ReceiptHandler) lineItemResponse(receiptID, itemID string) (lineItemRes
 	).Scan(
 		&li.ID, &li.ReceiptID, &li.ProductID, &li.ProductName, &li.Category,
 		&li.ProductPackQuantity, &li.ProductPackUnit,
-		&li.RawName, &quantity, &li.Unit, &unitPrice, &totalPrice,
+		&li.RawName, &li.StoreItemCode, &li.ReceiptDescription,
+		&quantity, &li.Unit, &unitPrice, &totalPrice,
 		&li.RegularPrice, &li.DiscountAmount, &countContribution,
 		&li.PackQuantityOverride, &li.PackUnitOverride, &li.PackOverrideSource,
 		&li.Matched, &li.ReviewStatus, &li.Confidence, &li.LineNumber,
@@ -1636,11 +1738,15 @@ func (h *ReceiptHandler) ApplyRepair(c echo.Context) error {
 	}
 
 	var storeID *string
+	var storeName *string
 	var status string
 	err := h.DB.QueryRow(
-		"SELECT store_id, status FROM receipts WHERE id = ? AND household_id = ?",
+		`SELECT r.store_id, s.name, r.status
+		   FROM receipts r
+		   LEFT JOIN stores s ON s.id = r.store_id
+		  WHERE r.id = ? AND r.household_id = ?`,
 		receiptID, householdID,
-	).Scan(&storeID, &status)
+	).Scan(&storeID, &storeName, &status)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "receipt not found"})
 	}
@@ -1652,6 +1758,7 @@ func (h *ReceiptHandler) ApplyRepair(c echo.Context) error {
 	}
 
 	extraction.Items = worker.NormalizeExtractedItems(extraction.Items)
+	extraction.Items = worker.NormalizeExtractedItemsForStore(extraction.Items, storeChainFromName(storeName))
 	rawJSON, err := json.Marshal(extraction)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid repair preview"})
@@ -1680,7 +1787,7 @@ func (h *ReceiptHandler) ApplyRepair(c echo.Context) error {
 		if strings.TrimSpace(item.RawName) == "" {
 			continue
 		}
-		if err := insertRepairedLineItem(tx, receiptID, storeID, item, preserved, now); err != nil {
+		if err := insertRepairedLineItem(c.Request().Context(), tx, receiptID, householdID, storeID, item, preserved, now); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to apply repaired items"})
 		}
 	}
@@ -1749,14 +1856,14 @@ func loadPreservedMatches(tx *sql.Tx, receiptID string) (map[string]preservedLin
 	return matches, nil
 }
 
-func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, item llm.ExtractedItem, preserved map[string]preservedLineMatch, now time.Time) error {
+func insertRepairedLineItem(ctx context.Context, tx *sql.Tx, receiptID, householdID string, storeID *string, item llm.ExtractedItem, preserved map[string]preservedLineMatch, now time.Time) error {
 	quantity := decimal.NewFromFloat(item.Quantity)
 	if quantity.IsZero() {
 		quantity = decimal.NewFromInt(1)
 	}
 	countContribution := decimal.NewFromFloat(item.CountContribution)
 	if countContribution.IsZero() {
-		countContribution = deriveCountContribution(quantity, item.Unit)
+		countContribution = receiptline.CountContribution(quantity, item.Unit)
 	}
 	totalPrice := decimal.NewFromFloat(item.TotalPrice)
 
@@ -1808,13 +1915,13 @@ func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, item 
 	lineItemID := uuid.New().String()
 	_, err := tx.Exec(
 		`INSERT INTO line_items
-		    (id, receipt_id, product_id, raw_name, quantity, unit, unit_price,
-		     total_price, regular_price, discount_amount, count_contribution,
+		    (id, receipt_id, product_id, raw_name, store_item_code, receipt_description,
+		     quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution,
 		     suggested_name, suggested_category, suggested_brand, suggested_product_id,
 		     matched, confidence, line_number, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		lineItemID, receiptID, productID, item.RawName, quantity.String(), item.Unit, unitPrice,
-		totalPrice.String(), regularPrice, discountAmount, countContribution.String(),
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		lineItemID, receiptID, productID, item.RawName, item.StoreItemCode, item.ReceiptDescription,
+		quantity.String(), item.Unit, unitPrice, totalPrice.String(), regularPrice, discountAmount, countContribution.String(),
 		suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
 		matched, confidence, item.LineNumber, now,
 	)
@@ -1823,7 +1930,12 @@ func insertRepairedLineItem(tx *sql.Tx, receiptID string, storeID *string, item 
 	}
 
 	if productID != nil && storeID != nil {
-		err = prices.RecordProductPriceFromLineItem(context.Background(), tx, lineItemID)
+		if code := ptrStringValue(item.StoreItemCode); code != "" {
+			if err := storecodes.UpsertReceipt(ctx, tx, householdID, *storeID, *productID, code, item.ReceiptDescription, now); err != nil {
+				return err
+			}
+		}
+		err = prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID)
 	}
 	return err
 }
@@ -1899,6 +2011,10 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 	reviewSensitiveChange := false
 	settingAccepted := false
 	clearingProduct := false
+	var parsedQuantity decimal.Decimal
+	quantityChanged := false
+	unitChanged := false
+	var explicitCountContribution *decimal.Decimal
 
 	if req.ProductID != nil {
 		productID := strings.TrimSpace(*req.ProductID)
@@ -1923,11 +2039,18 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 		reviewSensitiveChange = true
 	}
 	if req.Quantity != nil {
+		var err error
+		parsedQuantity, err = decimal.NewFromString(strings.TrimSpace(*req.Quantity))
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "quantity must be a decimal"})
+		}
+		quantityChanged = true
 		setClauses = append(setClauses, "quantity = ?")
-		args = append(args, *req.Quantity)
+		args = append(args, parsedQuantity.String())
 		reviewSensitiveChange = true
 	}
 	if req.Unit != nil {
+		unitChanged = true
 		setClauses = append(setClauses, "unit = ?")
 		args = append(args, *req.Unit)
 		reviewSensitiveChange = true
@@ -1960,6 +2083,41 @@ func (h *ReceiptHandler) UpdateLineItem(c echo.Context) error {
 		setClauses = append(setClauses, "pack_override_source = ?")
 		args = append(args, nullableTrimmedString(source))
 		reviewSensitiveChange = true
+	}
+	if req.CountContribution != nil && strings.TrimSpace(*req.CountContribution) != "" {
+		countContribution, err := decimal.NewFromString(strings.TrimSpace(*req.CountContribution))
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "count_contribution must be a decimal"})
+		}
+		explicitCountContribution = &countContribution
+	}
+	if explicitCountContribution != nil {
+		setClauses = append(setClauses, "count_contribution = ?")
+		args = append(args, explicitCountContribution.String())
+		reviewSensitiveChange = true
+	} else if quantityChanged || unitChanged {
+		var currentQuantity decimal.Decimal
+		var currentUnit *string
+		err := h.DB.QueryRow(
+			"SELECT quantity, unit FROM line_items WHERE id = ? AND receipt_id = ?",
+			itemID, receiptID,
+		).Scan(&currentQuantity, &currentUnit)
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		finalQuantity := currentQuantity
+		if quantityChanged {
+			finalQuantity = parsedQuantity
+		}
+		finalUnit := currentUnit
+		if unitChanged {
+			finalUnit = trimmedStringPtr(req.Unit)
+		}
+		setClauses = append(setClauses, "count_contribution = ?")
+		args = append(args, receiptline.CountContribution(finalQuantity, finalUnit).String())
 	}
 	if req.ReviewStatus != nil {
 		status := strings.TrimSpace(*req.ReviewStatus)
@@ -2298,15 +2456,19 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 	for _, itemID := range req.LineItemIDs {
 		// Fetch line item with suggestion data.
 		var rawName string
+		var storeItemCode *string
+		var receiptDescription *string
 		var suggestedName, suggestedCategory, suggestedProductID, suggestedBrand *string
 		var unit *string
 		err := tx.QueryRow(
-			`SELECT li.raw_name, li.suggested_name, li.suggested_category, li.suggested_product_id,
+			`SELECT li.raw_name, li.store_item_code, li.receipt_description,
+			        li.suggested_name, li.suggested_category, li.suggested_product_id,
 			        li.unit, li.suggested_brand
 			 FROM line_items li
 			 WHERE li.id = ? AND li.receipt_id = ?`,
 			itemID, receiptID,
-		).Scan(&rawName, &suggestedName, &suggestedCategory, &suggestedProductID,
+		).Scan(&rawName, &storeItemCode, &receiptDescription,
+			&suggestedName, &suggestedCategory, &suggestedProductID,
 			&unit, &suggestedBrand)
 		if err == sql.ErrNoRows {
 			continue // skip invalid IDs
@@ -2410,9 +2572,15 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 			).Scan(&aliasExists)
 			if aliasExists == 0 {
 				_, _ = tx.Exec(
-					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
 					uuid.New().String(), productID, normalized, *storeID, now,
 				)
+			}
+
+			if storeItemCode != nil && strings.TrimSpace(*storeItemCode) != "" {
+				if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, productID, *storeItemCode, receiptDescription, now); err != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
+				}
 			}
 
 			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {

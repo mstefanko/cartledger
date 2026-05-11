@@ -13,6 +13,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
+	"github.com/mstefanko/cartledger/internal/storecodes"
 )
 
 // MatchingHandler holds dependencies for matching and rule endpoints.
@@ -94,14 +95,16 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 
 	// Fetch the line item and verify it belongs to the household.
 	var rawName string
+	var storeItemCode *string
+	var receiptDescription *string
 	var storeID *string
 	err := h.DB.QueryRow(
-		`SELECT li.raw_name, r.store_id
+		`SELECT li.raw_name, li.store_item_code, li.receipt_description, r.store_id
 		 FROM line_items li
 		 JOIN receipts r ON li.receipt_id = r.id
 		 WHERE li.id = ? AND r.household_id = ?`,
 		lineItemID, householdID,
-	).Scan(&rawName, &storeID)
+	).Scan(&rawName, &storeItemCode, &receiptDescription, &storeID)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
 	}
@@ -137,11 +140,17 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 	}
 	if aliasExists == 0 {
 		_, err = tx.Exec(
-			"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+			"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
 			uuid.New().String(), req.ProductID, normalized, storeID, now,
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create alias"})
+		}
+	}
+
+	if storeID != nil && storeItemCode != nil && strings.TrimSpace(*storeItemCode) != "" {
+		if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, req.ProductID, *storeItemCode, receiptDescription, now); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save store code"})
 		}
 	}
 

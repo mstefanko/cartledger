@@ -14,6 +14,8 @@ export interface UnmatchedLineItem {
   store_id?: string
   store_name?: string
   raw_text: string
+  store_item_code?: string | null
+  receipt_description?: string | null
   quantity: string
   unit?: string
   unit_price?: string

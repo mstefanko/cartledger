@@ -24,6 +24,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/storage"
+	"github.com/mstefanko/cartledger/internal/storecodes"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -654,6 +655,8 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		return fmt.Errorf("marshal extraction: %w", err)
 	}
 	extraction.Items = NormalizeExtractedItems(extraction.Items)
+	storeChain := matcher.ClassifyStore(extraction.StoreName)
+	extraction.Items = NormalizeExtractedItemsForStore(extraction.Items, storeChain)
 
 	now := time.Now().UTC()
 
@@ -846,10 +849,11 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		// otherwise. Both paths return byte-identical MatchResult per
 		// internal/matcher/session_test.go:TestSessionEquivalence.
 		var matchResult matcher.MatchResult
+		storeItemCode := ptrStringValue(item.StoreItemCode)
 		if sess != nil {
-			matchResult = sess.MatchWithSuggestion(item.RawName, item.SuggestedName)
+			matchResult = sess.MatchWithCodeAndSuggestion(item.RawName, storeItemCode, item.SuggestedName)
 		} else {
-			matchResult = w.matchEngine.MatchWithSuggestion(item.RawName, item.SuggestedName, storeID, job.HouseholdID)
+			matchResult = w.matchEngine.MatchWithCodeAndSuggestion(item.RawName, storeItemCode, item.SuggestedName, storeID, job.HouseholdID)
 		}
 
 		matched := matchResult.Method
@@ -890,9 +894,10 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		}
 
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, store_item_code, receipt_description, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
+			item.StoreItemCode, item.ReceiptDescription,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
 			regularPrice, discountAmount, countContribution.String(),
 			suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
@@ -930,11 +935,21 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			}
 			if aliasExists == 0 {
 				_, err = tx.Exec(
-					"INSERT INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
+					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
 					uuid.New().String(), *productID, normalized, storeID, now,
 				)
 				if err != nil {
 					return fmt.Errorf("insert alias: %w", err)
+				}
+			}
+
+			if storeItemCode != "" {
+				label := item.ReceiptDescription
+				if label == nil {
+					label = &item.RawName
+				}
+				if err := storecodes.UpsertReceipt(context.Background(), tx, job.HouseholdID, storeID, *productID, storeItemCode, label, now); err != nil {
+					return fmt.Errorf("upsert store product code: %w", err)
 				}
 			}
 
@@ -988,4 +1003,11 @@ func nilPtrStr(s *string) interface{} {
 		return nil
 	}
 	return *s
+}
+
+func ptrStringValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(*s)
 }

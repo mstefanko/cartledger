@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/mstefanko/cartledger/internal/llm"
+	"github.com/mstefanko/cartledger/internal/matcher"
 )
 
 func TestNormalizeExtractedItems_AttachesCostcoCouponToReferencedItem(t *testing.T) {
@@ -57,6 +58,79 @@ func TestNormalizeExtractedItems_DoesNotMergeWeightedRows(t *testing.T) {
 	got := NormalizeExtractedItems(items)
 	if len(got) != 2 {
 		t.Fatalf("len(normalized) = %d, want 2", len(got))
+	}
+}
+
+func TestNormalizeExtractedItemsForStore_CostcoCodeAndQuantityGuard(t *testing.T) {
+	items := []llm.ExtractedItem{
+		{RawName: "8 2% MILK 1GAL", Quantity: 8, Unit: strPtr("each"), TotalPrice: 2.92, CountContribution: 8},
+	}
+
+	got := NormalizeExtractedItemsForStore(items, matcher.ChainCostco)
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1", len(got))
+	}
+	if got[0].StoreItemCode == nil || *got[0].StoreItemCode != "8" {
+		t.Fatalf("StoreItemCode = %v, want 8", got[0].StoreItemCode)
+	}
+	if got[0].ReceiptDescription == nil || *got[0].ReceiptDescription != "2% MILK 1GAL" {
+		t.Fatalf("ReceiptDescription = %v, want 2%% MILK 1GAL", got[0].ReceiptDescription)
+	}
+	if got[0].Quantity != 1 {
+		t.Fatalf("Quantity = %v, want 1", got[0].Quantity)
+	}
+	if got[0].CountContribution != 1 {
+		t.Fatalf("CountContribution = %v, want 1", got[0].CountContribution)
+	}
+}
+
+func TestNormalizeExtractedItemsForStore_PreservesExplicitCostcoQuantity(t *testing.T) {
+	unitPrice := 2.92
+	tests := []llm.ExtractedItem{
+		{RawName: "8 2% MILK 1GAL", Quantity: 2, UnitPrice: &unitPrice, TotalPrice: 5.84},
+		{RawName: "123456 2 X MUFFINS", Quantity: 2, TotalPrice: 12.99},
+		{RawName: "123456 KS WATER 2x8", Quantity: 5, TotalPrice: 19.95},
+		{RawName: "123456 BAGELS @ 5.99", Quantity: 2, TotalPrice: 11.98},
+	}
+	for _, item := range tests {
+		got := NormalizeExtractedItemsForStore([]llm.ExtractedItem{item}, matcher.ChainCostco)
+		if got[0].Quantity != item.Quantity {
+			t.Fatalf("Quantity for %q = %v, want %v", item.RawName, got[0].Quantity, item.Quantity)
+		}
+	}
+}
+
+func TestNormalizeExtractedItemsForStore_DoesNotParseNonCostcoLeadingDigits(t *testing.T) {
+	items := []llm.ExtractedItem{
+		{RawName: "3 LBS BANANAS", Quantity: 3, Unit: strPtr("each"), TotalPrice: 4.50, CountContribution: 3},
+	}
+
+	got := NormalizeExtractedItemsForStore(items, matcher.ChainOther)
+	if got[0].StoreItemCode != nil || got[0].ReceiptDescription != nil {
+		t.Fatalf("store fields = %v/%v, want nil/nil", got[0].StoreItemCode, got[0].ReceiptDescription)
+	}
+	if got[0].Quantity != 3 || got[0].CountContribution != 3 {
+		t.Fatalf("quantity/count = %v/%v, want 3/3", got[0].Quantity, got[0].CountContribution)
+	}
+}
+
+func TestNormalizeExtractedItemsForStore_DoesNotOverwriteLLMFields(t *testing.T) {
+	items := []llm.ExtractedItem{
+		{
+			RawName:            "8 2% MILK 1GAL",
+			StoreItemCode:      strPtr("0008"),
+			ReceiptDescription: strPtr("MILK"),
+			Quantity:           1,
+			TotalPrice:         2.92,
+		},
+	}
+
+	got := NormalizeExtractedItemsForStore(items, matcher.ChainCostco)
+	if got[0].StoreItemCode == nil || *got[0].StoreItemCode != "0008" {
+		t.Fatalf("StoreItemCode = %v, want 0008", got[0].StoreItemCode)
+	}
+	if got[0].ReceiptDescription == nil || *got[0].ReceiptDescription != "MILK" {
+		t.Fatalf("ReceiptDescription = %v, want MILK", got[0].ReceiptDescription)
 	}
 }
 

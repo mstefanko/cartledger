@@ -1127,6 +1127,18 @@ type productAliasResponse struct {
 	StoreID *string `json:"store_id,omitempty"`
 }
 
+type productStoreCodeResponse struct {
+	ID            string   `json:"id"`
+	StoreID       string   `json:"store_id"`
+	StoreName     string   `json:"store_name"`
+	StoreItemCode string   `json:"store_item_code"`
+	Label         *string  `json:"label"`
+	Source        string   `json:"source"`
+	Confidence    *float64 `json:"confidence"`
+	FirstSeenAt   string   `json:"first_seen_at"`
+	LastSeenAt    string   `json:"last_seen_at"`
+}
+
 type productGroupInfo struct {
 	GroupID   string `json:"group_id"`
 	GroupName string `json:"group_name"`
@@ -1141,16 +1153,17 @@ type productSibling struct {
 }
 
 type productDetailResponse struct {
-	Product      productResponse        `json:"product"`
-	PricePerUnit *string                `json:"price_per_unit,omitempty"`
-	Group        *productGroupInfo      `json:"group,omitempty"`
-	Siblings     []productSibling       `json:"siblings,omitempty"`
-	Aliases      []productAliasResponse `json:"aliases"`
-	Images       []productImageResponse `json:"images"`
-	Links        []productLinkResponse  `json:"links"`
-	PriceHistory []priceHistoryEntry    `json:"price_history"`
-	StoreCompare []storeComparison      `json:"store_comparison"`
-	Stats        purchaseStats          `json:"stats"`
+	Product      productResponse            `json:"product"`
+	PricePerUnit *string                    `json:"price_per_unit,omitempty"`
+	Group        *productGroupInfo          `json:"group,omitempty"`
+	Siblings     []productSibling           `json:"siblings,omitempty"`
+	Aliases      []productAliasResponse     `json:"aliases"`
+	StoreCodes   []productStoreCodeResponse `json:"store_codes"`
+	Images       []productImageResponse     `json:"images"`
+	Links        []productLinkResponse      `json:"links"`
+	PriceHistory []priceHistoryEntry        `json:"price_history"`
+	StoreCompare []storeComparison          `json:"store_comparison"`
+	Stats        purchaseStats              `json:"stats"`
 }
 
 // Detail returns comprehensive product information including aliases, images, links,
@@ -1182,6 +1195,7 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 	resp := productDetailResponse{
 		Product:      p,
 		Aliases:      make([]productAliasResponse, 0),
+		StoreCodes:   make([]productStoreCodeResponse, 0),
 		Images:       make([]productImageResponse, 0),
 		Links:        make([]productLinkResponse, 0),
 		PriceHistory: make([]priceHistoryEntry, 0),
@@ -1242,6 +1256,31 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 			var a productAliasResponse
 			if aliasRows.Scan(&a.ID, &a.Alias, &a.StoreID) == nil {
 				resp.Aliases = append(resp.Aliases, a)
+			}
+		}
+	}
+
+	codeRows, err := h.DB.Query(
+		`SELECT spc.id, spc.store_id, s.name, spc.store_item_code, spc.label,
+		        spc.source, spc.confidence, spc.first_seen_at, spc.last_seen_at
+		   FROM store_product_codes spc
+		   JOIN stores s ON s.id = spc.store_id
+		  WHERE spc.product_id = ? AND spc.household_id = ?
+		  ORDER BY s.name COLLATE NOCASE, spc.store_item_code`,
+		productID, householdID,
+	)
+	if err == nil {
+		defer codeRows.Close()
+		for codeRows.Next() {
+			var code productStoreCodeResponse
+			var firstSeen, lastSeen time.Time
+			if codeRows.Scan(
+				&code.ID, &code.StoreID, &code.StoreName, &code.StoreItemCode,
+				&code.Label, &code.Source, &code.Confidence, &firstSeen, &lastSeen,
+			) == nil {
+				code.FirstSeenAt = firstSeen.Format(time.RFC3339)
+				code.LastSeenAt = lastSeen.Format(time.RFC3339)
+				resp.StoreCodes = append(resp.StoreCodes, code)
 			}
 		}
 	}

@@ -108,6 +108,14 @@ func sessionSeed(t *testing.T, database *sql.DB) {
 		t.Fatalf("insert rule: %v", err)
 	}
 
+	if _, err := database.Exec(
+		`INSERT INTO store_product_codes
+		 (id, household_id, store_id, product_id, store_item_code, label, source)
+		 VALUES ('spc1', 'h1', 's_main', 'p_milk_2pct', '8', '2% MILK 1GAL', 'manual')`,
+	); err != nil {
+		t.Fatalf("insert store product code: %v", err)
+	}
+
 	// Seed a product_prices row for p_yogurt at s_other — this makes
 	// productHasStoreHistory return storeHistoryOtherStore when queried with
 	// s_main as the session store. Needed for the cross_store_match path.
@@ -149,6 +157,12 @@ func TestSessionEquivalence(t *testing.T) {
 		suggested  string
 		wantMethod string // expected Method — sanity check; equivalence is the real assertion
 	}{
+		{
+			name:       "code",
+			rawName:    "UNRELATED TEXT",
+			suggested:  "",
+			wantMethod: "code",
+		},
 		// Stage 1 — rules. "ORG BANANAS" normalizes to "org bananas",
 		// which starts_with "org banana" → r1 → p_banana.
 		{
@@ -226,8 +240,12 @@ func TestSessionEquivalence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotEngine := engine.MatchWithSuggestion(tc.rawName, tc.suggested, "s_main", "h1")
-			gotSession := session.MatchWithSuggestion(tc.rawName, tc.suggested)
+			code := ""
+			if tc.wantMethod == "code" {
+				code = "8"
+			}
+			gotEngine := engine.MatchWithCodeAndSuggestion(tc.rawName, code, tc.suggested, "s_main", "h1")
+			gotSession := session.MatchWithCodeAndSuggestion(tc.rawName, code, tc.suggested)
 
 			if gotEngine.Method != tc.wantMethod {
 				t.Errorf("Engine method = %q, want %q (raw=%q sugg=%q)",

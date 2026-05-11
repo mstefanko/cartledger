@@ -168,6 +168,13 @@ func (s *Session) MatchWithSuggestion(rawName, suggestedName string) MatchResult
 	return MatchResult{Method: "unmatched", Confidence: 0}
 }
 
+func (s *Session) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedName string) MatchResult {
+	if result := matchByCode(s.db, storeItemCode, s.storeID, s.householdID); result != nil {
+		return *result
+	}
+	return s.MatchWithSuggestion(rawName, suggestedName)
+}
+
 // matchByFuzzyCached is a byte-for-byte duplicate of the scoring loop in
 // matchByFuzzy (fuzzy.go:89-127), operating on the preloaded s.candidates
 // instead of issuing two DB queries per call. Same fuzzy.RankMatchNormalizedFold

@@ -23,18 +23,20 @@ type ReceiptExtraction struct {
 
 // ExtractedItem represents a single line item extracted from a receipt.
 type ExtractedItem struct {
-	RawName           string   `json:"raw_name"`
-	SuggestedName     string   `json:"suggested_name"`
-	SuggestedCategory string   `json:"suggested_category"`
-	SuggestedBrand    string   `json:"suggested_brand"`
-	SuggestedTags     string   `json:"suggested_tags"`
-	Quantity          float64  `json:"quantity"`
-	Unit              *string  `json:"unit"`
-	UnitPrice         *float64 `json:"unit_price"`
-	TotalPrice        float64  `json:"total_price"`
-	RegularPrice      *float64 `json:"regular_price"`
-	DiscountAmount    *float64 `json:"discount_amount"`
-	CountContribution float64  `json:"count_contribution,omitempty"`
-	LineNumber        int      `json:"line_number"`
-	Confidence        float64  `json:"confidence"`
+	RawName            string   `json:"raw_name"`
+	StoreItemCode      *string  `json:"store_item_code,omitempty"`
+	ReceiptDescription *string  `json:"receipt_description,omitempty"`
+	SuggestedName      string   `json:"suggested_name"`
+	SuggestedCategory  string   `json:"suggested_category"`
+	SuggestedBrand     string   `json:"suggested_brand"`
+	SuggestedTags      string   `json:"suggested_tags"`
+	Quantity           float64  `json:"quantity"`
+	Unit               *string  `json:"unit"`
+	UnitPrice          *float64 `json:"unit_price"`
+	TotalPrice         float64  `json:"total_price"`
+	RegularPrice       *float64 `json:"regular_price"`
+	DiscountAmount     *float64 `json:"discount_amount"`
+	CountContribution  float64  `json:"count_contribution,omitempty"`
+	LineNumber         int      `json:"line_number"`
+	Confidence         float64  `json:"confidence"`
 }

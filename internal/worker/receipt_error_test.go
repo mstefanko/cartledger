@@ -13,6 +13,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/llm"
+	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
@@ -262,5 +263,100 @@ func TestProcessJobMarksEmptyLineItemExtractionAsError(t *testing.T) {
 	}
 	if !errorMessage.Valid || !strings.Contains(errorMessage.String, "33 items sold") {
 		t.Fatalf("error_message = %q, want empty line items detail", errorMessage.String)
+	}
+}
+
+func TestProcessJobStoresCostcoStoreCodeAndNormalizesQuantity(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer database.Close()
+	if err := db.RunMigrations(database); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	var householdID string
+	if err := database.QueryRow("INSERT INTO households (name) VALUES ('Test') RETURNING id").Scan(&householdID); err != nil {
+		t.Fatalf("insert household: %v", err)
+	}
+	storeID := "store-costco-worker"
+	productID := "product-costco-worker-milk"
+	if _, err := database.Exec(
+		"INSERT INTO stores (id, household_id, name) VALUES (?, ?, 'Costco Wholesale')",
+		storeID, householdID,
+	); err != nil {
+		t.Fatalf("insert store: %v", err)
+	}
+	if _, err := database.Exec(
+		"INSERT INTO products (id, household_id, name) VALUES (?, ?, 'Costco 2% Milk 1 Gallon')",
+		productID, householdID,
+	); err != nil {
+		t.Fatalf("insert product: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO store_product_codes
+		    (id, household_id, store_id, product_id, store_item_code, label, source)
+		 VALUES ('spc-worker-milk', ?, ?, ?, '8', '2% MILK 1GAL', 'manual')`,
+		householdID, storeID, productID,
+	); err != nil {
+		t.Fatalf("insert store code: %v", err)
+	}
+	receiptID := "receipt-costco-code"
+	if _, err := database.Exec(
+		"INSERT INTO receipts (id, household_id, receipt_date, total, status) VALUES (?, ?, '2026-05-08', '10.00', 'processing')",
+		receiptID, householdID,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+
+	imageDir := filepath.Join(dir, "receipts", receiptID)
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		t.Fatalf("mkdir image dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(imageDir, "1.jpg"), []byte("fake image"), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	w := &ReceiptWorker{
+		llmClient: staticLLM{extraction: &llm.ReceiptExtraction{
+			StoreName:  "Costco Wholesale",
+			Date:       "2026-05-04",
+			Items:      []llm.ExtractedItem{{RawName: "8 2% MILK 1GAL", SuggestedName: "2% Milk", SuggestedCategory: "Dairy", Quantity: 8, Unit: strPtr("each"), TotalPrice: 2.92, LineNumber: 1, Confidence: 0.95}},
+			Subtotal:   2.92,
+			Total:      2.92,
+			Confidence: 0.95,
+		}},
+		matchEngine: matcher.NewEngine(database),
+		db:          database,
+		hub:         ws.NewHub(),
+	}
+
+	if err := w.processJob(ReceiptJob{
+		ReceiptID:   receiptID,
+		HouseholdID: householdID,
+		ImageDir:    imageDir,
+	}); err != nil {
+		t.Fatalf("processJob: %v", err)
+	}
+
+	var storeItemCode, receiptDescription, quantity, countContribution, gotProductID, matched string
+	var confidence sql.NullFloat64
+	if err := database.QueryRow(
+		`SELECT store_item_code, receipt_description, quantity, count_contribution,
+		        product_id, matched, confidence
+		   FROM line_items WHERE receipt_id = ?`,
+		receiptID,
+	).Scan(&storeItemCode, &receiptDescription, &quantity, &countContribution, &gotProductID, &matched, &confidence); err != nil {
+		t.Fatalf("query line item: %v", err)
+	}
+	if storeItemCode != "8" || receiptDescription != "2% MILK 1GAL" || quantity != "1" || countContribution != "1" {
+		t.Fatalf("line item = code %q desc %q qty %q count %q, want 8 / 2%% MILK 1GAL / 1 / 1",
+			storeItemCode, receiptDescription, quantity, countContribution)
+	}
+	if gotProductID != productID || matched != "code" || !confidence.Valid || confidence.Float64 != 0.99 {
+		t.Fatalf("match = product %q method %q confidence %v, want %q/code/0.99",
+			gotProductID, matched, confidence, productID)
 	}
 }

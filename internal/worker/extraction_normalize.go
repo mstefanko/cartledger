@@ -6,12 +6,16 @@ import (
 	"strings"
 
 	"github.com/mstefanko/cartledger/internal/llm"
+	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/receiptline"
+	"github.com/mstefanko/cartledger/internal/storecodes"
 )
 
 var couponItemRefPattern = regexp.MustCompile(`/(\d{4,})\b`)
 var paymentMaskedLast4Pattern = regexp.MustCompile(`(?i)(?:[x*.#][\s-]*){2,}([0-9]{4})\b`)
 var paymentBareLast4Pattern = regexp.MustCompile(`(?i)\b(?:acct|account|card|pan)\b[^0-9]{0,16}([0-9]{4})\b`)
 var paymentBrandPattern = regexp.MustCompile(`(?i)\b(american express|amex|master\s*card|mastercard|visa|discover|debit|ebt|cash|check)\b`)
+var explicitPurchaseMultiplierPattern = regexp.MustCompile(`(?i)(^|\s)[0-9]+(\.[0-9]+)?\s*x\s*[[:alnum:]]+|(\s|^)x\s+`)
 
 // NormalizeExtractedPayment keeps tender metadata conservative. The LLM is
 // good at seeing the card brand, but it sometimes copies nearby auth/sequence
@@ -34,7 +38,7 @@ func NormalizeExtractedItems(items []llm.ExtractedItem) []llm.ExtractedItem {
 		}
 
 		if item.CountContribution <= 0 {
-			item.CountContribution = defaultCountContribution(item)
+			item.CountContribution = receiptline.CountContributionFloat(item.Quantity, item.Unit)
 		}
 
 		if len(normalized) > 0 && canMergeCountableDuplicate(normalized[len(normalized)-1], item) {
@@ -45,6 +49,62 @@ func NormalizeExtractedItems(items []llm.ExtractedItem) []llm.ExtractedItem {
 		normalized = append(normalized, item)
 	}
 	return normalized
+}
+
+func NormalizeExtractedItemsForStore(items []llm.ExtractedItem, chain matcher.Chain) []llm.ExtractedItem {
+	normalized := make([]llm.ExtractedItem, len(items))
+	copy(normalized, items)
+
+	for i := range normalized {
+		item := &normalized[i]
+		parsed := matcher.ParseLine(item.RawName, chain)
+		parsedCode := storecodes.Normalize(parsed.StoreItemCode)
+
+		if item.StoreItemCode != nil {
+			trimmed := storecodes.Normalize(*item.StoreItemCode)
+			if trimmed == "" {
+				item.StoreItemCode = nil
+			} else {
+				item.StoreItemCode = stringPtr(trimmed)
+			}
+		}
+		if item.StoreItemCode == nil && parsedCode != "" {
+			item.StoreItemCode = stringPtr(parsedCode)
+		}
+
+		if item.ReceiptDescription != nil {
+			trimmed := strings.TrimSpace(*item.ReceiptDescription)
+			if trimmed == "" {
+				item.ReceiptDescription = nil
+			} else {
+				item.ReceiptDescription = stringPtr(trimmed)
+			}
+		}
+		if item.ReceiptDescription == nil && parsed.ReceiptDescription != "" {
+			item.ReceiptDescription = stringPtr(parsed.ReceiptDescription)
+		}
+
+		if shouldResetCostcoPurchaseQuantity(*item, parsedCode) {
+			item.Quantity = 1
+			item.CountContribution = receiptline.CountContributionFloat(item.Quantity, item.Unit)
+		}
+	}
+
+	return normalized
+}
+
+func shouldResetCostcoPurchaseQuantity(item llm.ExtractedItem, parsedCode string) bool {
+	if parsedCode == "" || item.UnitPrice != nil || !isWholeNumber(item.Quantity) || item.Quantity <= 1 {
+		return false
+	}
+	description := item.RawName
+	if item.ReceiptDescription != nil && strings.TrimSpace(*item.ReceiptDescription) != "" {
+		description = *item.ReceiptDescription
+	}
+	if strings.Contains(description, "@") || explicitPurchaseMultiplierPattern.MatchString(description) {
+		return false
+	}
+	return true
 }
 
 func normalizePaymentCardType(cardType, raw *string) *string {
@@ -341,13 +401,6 @@ func itemContainsReference(rawName, ref string) bool {
 		}
 	}
 	return false
-}
-
-func defaultCountContribution(item llm.ExtractedItem) float64 {
-	if isCountableUnit(item.Unit) && isWholeNumber(item.Quantity) && item.Quantity > 0 {
-		return item.Quantity
-	}
-	return 1
 }
 
 func canMergeCountableDuplicate(a, b llm.ExtractedItem) bool {

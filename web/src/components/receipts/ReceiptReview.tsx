@@ -190,6 +190,15 @@ function productPackLabel(item: LineItem): string | null {
   return `${formatProductPackQuantity(item.product_pack_quantity)} ${item.product_pack_unit}`
 }
 
+function materiallyDifferentReceiptDescription(item: LineItem): string | null {
+  const description = item.receipt_description?.trim()
+  if (!description) return null
+  const raw = item.raw_name.trim()
+  const normalizedDescription = description.toLowerCase().replace(/\s+/g, ' ')
+  const normalizedRaw = raw.toLowerCase().replace(/\s+/g, ' ')
+  return normalizedDescription !== normalizedRaw ? description : null
+}
+
 function packageSizeStatus(item: LineItem): PackageSizeStatus {
   if (item.pack_quantity_override && item.pack_unit_override) {
     return { kind: 'label', label: `${item.pack_quantity_override} ${item.pack_unit_override}` }
@@ -705,17 +714,37 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         size: 200,
         cell: ({ row }) => {
           const item = row.original
+          const cleanedDescription = materiallyDifferentReceiptDescription(item)
           return (
-            <div>
-              <span>{item.raw_name}</span>
+            <div className="min-w-0">
+              <span className="block truncate">{item.raw_name}</span>
+              {(item.store_item_code || cleanedDescription) && (
+                <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                  {item.store_item_code && (
+                    <span className="rounded-md bg-neutral-50 px-1.5 py-0.5 text-small text-neutral-500">
+                      Store code {item.store_item_code}
+                    </span>
+                  )}
+                  {cleanedDescription && (
+                    <span className="text-small text-neutral-400">
+                      {cleanedDescription}
+                    </span>
+                  )}
+                </div>
+              )}
               {item.product_id && item.product_name && (
-                <Link
-                  to={`/products/${item.product_id}`}
-                  className="block text-xs text-brand hover:underline mt-0.5"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {item.product_name}
-                </Link>
+                <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                  <Link
+                    to={`/products/${item.product_id}`}
+                    className="text-xs text-brand hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {item.product_name}
+                  </Link>
+                  {item.matched === 'code' && (
+                    <Badge variant="neutral">code match</Badge>
+                  )}
+                </div>
               )}
             </div>
           )
