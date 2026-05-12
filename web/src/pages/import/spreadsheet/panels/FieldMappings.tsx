@@ -13,6 +13,7 @@ const ROLES: { key: string; label: string }[] = [
   { key: 'date', label: 'Date' },
   { key: 'store', label: 'Store' },
   { key: 'item', label: 'Item' },
+  { key: 'upc', label: 'UPC' },
   { key: 'qty', label: 'Qty' },
   { key: 'unit', label: 'Unit' },
   { key: 'unit_price', label: 'Unit Price' },

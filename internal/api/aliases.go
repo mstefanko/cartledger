@@ -135,7 +135,7 @@ func (h *AliasHandler) Create(c echo.Context) error {
 		AcceptedAt:  &now,
 		CreatedAt:   now,
 	}); err != nil {
-		if errors.Is(err, matcher.ErrAliasConflict) || strings.Contains(err.Error(), "UNIQUE constraint") {
+		if errors.Is(err, matcher.ErrAliasConflict) || isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "alias already exists"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})

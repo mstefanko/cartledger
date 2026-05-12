@@ -162,4 +162,5 @@ CREATE INDEX idx_line_items_upc
     ON line_items(receipt_id, upc)
     WHERE upc IS NOT NULL AND upc != '';
 
+PRAGMA foreign_key_check;
 PRAGMA foreign_keys = ON;

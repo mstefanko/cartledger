@@ -30,6 +30,7 @@ const (
 	RoleDate       Role = "date"
 	RoleStore      Role = "store"
 	RoleItem       Role = "item"
+	RoleUPC        Role = "upc"
 	RoleQty        Role = "qty"
 	RoleUnit       Role = "unit"
 	RoleUnitPrice  Role = "unit_price"
@@ -137,11 +138,11 @@ type TypeCoverage struct {
 // It lives in staging_json; preview/commit run their transform chain on a
 // shallow copy of Rows and never re-parse the source file.
 type ParsedSheet struct {
-	Name          string                  `json:"name"`
-	Headers       []string                `json:"headers"`
-	Rows          []RawRow                `json:"rows"`
-	ColumnSamples map[int][]string        `json:"column_samples"`
-	TypeCoverage  map[int]TypeCoverage    `json:"type_coverage"`
+	Name          string               `json:"name"`
+	Headers       []string             `json:"headers"`
+	Rows          []RawRow             `json:"rows"`
+	ColumnSamples map[int][]string     `json:"column_samples"`
+	TypeCoverage  map[int]TypeCoverage `json:"type_coverage"`
 }
 
 // Transform is a single edit applied on top of the parsed rows. v1 implements
@@ -186,9 +187,10 @@ type SkipRowPayload struct {
 // parse, rather than dumping a row-level error string.
 type ParsedValue struct {
 	RowIndex       int             `json:"row_index"`
-	Date           string          `json:"date"`             // "YYYY-MM-DD" or ""
-	Store          string          `json:"store"`            // normalized via NormalizeStoreName
+	Date           string          `json:"date"`  // "YYYY-MM-DD" or ""
+	Store          string          `json:"store"` // normalized via NormalizeStoreName
 	Item           string          `json:"item"`
+	UPC            string          `json:"upc,omitempty"`
 	Qty            float64         `json:"qty"`
 	Unit           string          `json:"unit"`
 	UnitPriceCents int64           `json:"unit_price_cents"`

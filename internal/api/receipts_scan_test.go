@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -117,6 +118,57 @@ func TestAllReceiptPageSourcesPhoto(t *testing.T) {
 	}
 	if allReceiptPageSourcesPhoto(nil) {
 		t.Fatalf("empty source list should not be treated as all-photo")
+	}
+}
+
+func TestInsertDuplicateCandidatesByStoredImageHashesMatchesExistingReceiptImages(t *testing.T) {
+	database, householdID := newReceiptReviewTestDB(t)
+	defer database.Close()
+
+	if _, err := database.Exec(
+		`INSERT INTO receipts (id, household_id, receipt_date, status)
+		 VALUES ('existing-receipt', ?, '2026-05-10', 'reviewed'),
+		        ('new-receipt', ?, '2026-05-12', 'pending')`,
+		householdID, householdID,
+	); err != nil {
+		t.Fatalf("insert receipts: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO receipt_images
+		    (id, receipt_id, kind, page_number, storage_key, mime_type, size_bytes, sha256, created_at)
+		 VALUES
+		    ('img-1', 'existing-receipt', 'original', 1, 'receipts/existing/1.jpg', 'image/jpeg', 10, 'hash-a', CURRENT_TIMESTAMP),
+		    ('img-2', 'existing-receipt', 'original', 2, 'receipts/existing/2.jpg', 'image/jpeg', 10, 'hash-b', CURRENT_TIMESTAMP)`,
+	); err != nil {
+		t.Fatalf("insert receipt images: %v", err)
+	}
+
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	count, err := insertDuplicateCandidatesByStoredImageHashes(
+		context.Background(), tx, householdID, "new-receipt", []string{"hash-a", "hash-b"},
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insertDuplicateCandidatesByStoredImageHashes: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("inserted candidates = %d, want 1", count)
+	}
+
+	var candidateID string
+	if err := database.QueryRow(
+		`SELECT candidate_id FROM receipt_duplicate_candidates WHERE receipt_id = 'new-receipt'`,
+	).Scan(&candidateID); err != nil {
+		t.Fatalf("query candidate: %v", err)
+	}
+	if candidateID != "existing-receipt" {
+		t.Fatalf("candidate_id = %q, want existing-receipt", candidateID)
 	}
 }
 

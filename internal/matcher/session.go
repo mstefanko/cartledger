@@ -138,7 +138,9 @@ func (s *Session) MatchInput(ctx context.Context, input Input) MatchResult {
 	}
 	normalized := Normalize(input.RawName)
 
-	if result := matchByIdentifier(ctx, s.db, input.HouseholdID, input.Identifiers); result != nil {
+	if result, err := matchByIdentifier(ctx, s.db, input.HouseholdID, input.Identifiers); err != nil {
+		return MatchResult{Method: "unmatched", Err: err}
+	} else if result != nil {
 		return *result
 	}
 
@@ -166,7 +168,9 @@ func (s *Session) matchSuggestion(input Input, result MatchResult) MatchResult {
 		return result
 	}
 
-	if r := matchNameExact(s.db, input.SuggestedName, input.HouseholdID); r != nil {
+	if r, err := matchNameExact(s.db, input.SuggestedName, input.HouseholdID); err != nil {
+		return MatchResult{Method: "unmatched", Err: err}
+	} else if r != nil {
 		if hist := s.productHasStoreHistoryCached(r.ProductID); hist == storeHistoryOtherStore {
 			r.Confidence = 0.7
 			r.Method = "cross_store_match"

@@ -98,6 +98,7 @@ var roleKeywords = map[Role][]string{
 	RoleDate:       {"date", "purchase date", "dt", "when", "day", "txn date"},
 	RoleStore:      {"store", "merchant", "vendor", "shop", "where", "location"},
 	RoleItem:       {"item", "product", "description", "name", "what"},
+	RoleUPC:        {"upc", "gtin", "barcode", "bar code", "ean"},
 	RoleQty:        {"quantity", "qty", "count", "#"},
 	RoleUnit:       {"unit", "uom", "measure"},
 	RoleUnitPrice:  {"unit price", "price per", "per unit", "unit cost", "each", "price each"},
@@ -151,8 +152,8 @@ func SuggestMapping(sheet *ParsedSheet) Mapping {
 	// Sort: longest keyword match first; break ties by role priority then column
 	// index so results are deterministic across runs.
 	rolePriority := map[Role]int{
-		RoleDate: 0, RoleStore: 1, RoleItem: 2, RoleQty: 3, RoleUnit: 4,
-		RoleUnitPrice: 5, RoleTotalPrice: 6, RoleTripID: 7, RoleNotes: 8,
+		RoleDate: 0, RoleStore: 1, RoleItem: 2, RoleUPC: 3, RoleQty: 4, RoleUnit: 5,
+		RoleUnitPrice: 6, RoleTotalPrice: 7, RoleTripID: 8, RoleNotes: 9,
 	}
 	sortCands(cands, func(a, b cand) bool {
 		if a.kwLn != b.kwLn {

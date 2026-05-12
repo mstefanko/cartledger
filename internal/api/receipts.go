@@ -325,6 +325,7 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 		pageNumber int
 		sizeBytes  int64
 		sha256     string
+		sourceSHA  string
 	}
 	savedImages := make([]savedReceiptImage, 0, len(files))
 	var imagePaths []string
@@ -376,13 +377,14 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 			pageNumber: i + 1,
 			sizeBytes:  int64(len(scrubbed)),
 			sha256:     storage.SHA256Hex(scrubbed),
+			sourceSHA:  storage.SHA256Hex(raw),
 		})
 	}
 
 	imagePathsStr := strings.Join(imagePaths, ",")
 	pageHashes := make([]string, 0, len(savedImages))
 	for _, img := range savedImages {
-		pageHashes = append(pageHashes, img.sha256)
+		pageHashes = append(pageHashes, img.sourceSHA)
 	}
 	sourceFingerprint := receiptfingerprint.SourceFingerprint(pageHashes)
 
@@ -424,6 +426,18 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 			slog.Warn("receipt scan duplicate candidate insert failed", "receipt_id", receiptID, "err", err)
 		} else {
 			duplicateCandidates = count
+		}
+	}
+	storedHashes := make([]string, 0, len(savedImages))
+	for _, img := range savedImages {
+		storedHashes = append(storedHashes, img.sha256)
+	}
+	if len(storedHashes) > 0 {
+		count, err := insertDuplicateCandidatesByStoredImageHashes(c.Request().Context(), tx, householdID, receiptID, storedHashes)
+		if err != nil {
+			slog.Warn("receipt scan legacy duplicate candidate insert failed", "receipt_id", receiptID, "err", err)
+		} else {
+			duplicateCandidates += count
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -492,55 +506,59 @@ func allReceiptPageSourcesPhoto(sources []string) bool {
 }
 
 func insertDuplicateCandidates(ctx context.Context, tx *sql.Tx, householdID, receiptID, fingerprint string) (int, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT id, status
-		   FROM receipts
-		  WHERE household_id = ?
-		    AND id != ?
-		    AND source_fingerprint = ?`,
-		householdID, receiptID, fingerprint,
+	res, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO receipt_duplicate_candidates
+		    (household_id, receipt_id, candidate_id, kind, confidence, status, evidence_json, created_at, updated_at)
+		 SELECT ?, ?, r.id, 'exact_image', 1.0, 'pending',
+		        json_object('source_fingerprint', ?, 'candidate_status', r.status),
+		        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		   FROM receipts r
+		  WHERE r.household_id = ?
+		    AND r.id != ?
+		    AND r.source_fingerprint = ?`,
+		householdID, receiptID, fingerprint, householdID, receiptID, fingerprint,
 	)
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
 
-	type candidate struct {
-		id     string
-		status string
+func insertDuplicateCandidatesByStoredImageHashes(ctx context.Context, tx *sql.Tx, householdID, receiptID string, hashes []string) (int, error) {
+	hashSequence := strings.Join(hashes, "\n")
+	if hashSequence == "" {
+		return 0, nil
 	}
-	candidates := make([]candidate, 0)
-	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.id, &c.status); err != nil {
-			return 0, err
-		}
-		candidates = append(candidates, c)
-	}
-	if err := rows.Err(); err != nil {
+	res, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO receipt_duplicate_candidates
+		    (household_id, receipt_id, candidate_id, kind, confidence, status, evidence_json, created_at, updated_at)
+		 SELECT ?, ?, r.id, 'exact_image', 1.0, 'pending',
+		        json_object('match', 'stored_original_sha256', 'candidate_status', r.status),
+		        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		   FROM receipts r
+		  WHERE r.household_id = ?
+		    AND r.id != ?
+		    AND (
+		        SELECT GROUP_CONCAT(sha256, char(10))
+		          FROM (
+		              SELECT ri.sha256 AS sha256
+		                FROM receipt_images ri
+		               WHERE ri.receipt_id = r.id
+		                 AND ri.kind = 'original'
+		                 AND ri.deleted_at IS NULL
+		                 AND ri.sha256 IS NOT NULL
+		                 AND ri.sha256 != ''
+		               ORDER BY ri.page_number
+		          )
+		    ) = ?`,
+		householdID, receiptID, householdID, receiptID, hashSequence,
+	)
+	if err != nil {
 		return 0, err
 	}
-
-	inserted := 0
-	for _, c := range candidates {
-		evidence, _ := json.Marshal(map[string]string{
-			"source_fingerprint": fingerprint,
-			"candidate_status":   c.status,
-		})
-		res, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO receipt_duplicate_candidates
-			    (household_id, receipt_id, candidate_id, kind, confidence, status, evidence_json, created_at, updated_at)
-			 VALUES (?, ?, ?, 'exact_image', 1.0, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-			householdID, receiptID, c.id, string(evidence),
-		)
-		if err != nil {
-			return inserted, err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			inserted++
-		}
-	}
-	return inserted, nil
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // CreateManual handles manually-entered receipts (no image, no LLM).
@@ -706,6 +724,9 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 				HouseholdID:   householdID,
 				Identifiers:   identifierObservations,
 			})
+			if result.Err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "matching failed"})
+			}
 			switch result.Method {
 			case "identifier", "code", "rule", "alias", "fuzzy":
 				if result.ProductID != "" {
@@ -1397,6 +1418,9 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 			HouseholdID:   householdID,
 			Identifiers:   identifierObservations,
 		})
+		if result.Err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "matching failed"})
+		}
 		switch result.Method {
 		case "identifier", "code", "rule", "alias", "fuzzy":
 			if result.ProductID != "" {
@@ -1588,6 +1612,9 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 				HouseholdID:   householdID,
 				Identifiers:   identifierObservations,
 			})
+			if result.Err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "matching failed"})
+			}
 			switch result.Method {
 			case "identifier", "code", "rule", "alias", "fuzzy":
 				if result.ProductID != "" {

@@ -3,6 +3,7 @@ package matcher
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/mstefanko/cartledger/internal/identifiers"
 )
@@ -11,7 +12,8 @@ import (
 type MatchResult struct {
 	ProductID  string  `json:"product_id"`
 	Confidence float64 `json:"confidence"`
-	Method     string  `json:"method"` // "code", "rule", "alias", "fuzzy", "unmatched"
+	Method     string  `json:"method"` // "identifier", "code", "rule", "alias", "fuzzy", "suggested", "unmatched"
+	Err        error   `json:"-"`
 }
 
 // Engine implements the three-stage product matching pipeline.
@@ -78,7 +80,9 @@ func (e *Engine) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedNam
 func (e *Engine) MatchInput(ctx context.Context, input Input) MatchResult {
 	normalized := Normalize(input.RawName)
 
-	if result := matchByIdentifier(ctx, e.db, input.HouseholdID, input.Identifiers); result != nil {
+	if result, err := matchByIdentifier(ctx, e.db, input.HouseholdID, input.Identifiers); err != nil {
+		return MatchResult{Method: "unmatched", Err: err}
+	} else if result != nil {
 		return *result
 	}
 
@@ -106,7 +110,9 @@ func (e *Engine) matchSuggestion(input Input, result MatchResult) MatchResult {
 		return result
 	}
 
-	if r := matchNameExact(e.db, input.SuggestedName, input.HouseholdID); r != nil {
+	if r, err := matchNameExact(e.db, input.SuggestedName, input.HouseholdID); err != nil {
+		return MatchResult{Method: "unmatched", Err: err}
+	} else if r != nil {
 		if hist := productHasStoreHistory(e.db, r.ProductID, input.StoreID); hist == storeHistoryOtherStore {
 			r.Confidence = 0.7
 			r.Method = "cross_store_match"
@@ -129,15 +135,16 @@ func (e *Engine) matchSuggestion(input Input, result MatchResult) MatchResult {
 }
 
 // matchNameExact does a case-insensitive exact match of suggestedName against product names.
-func matchNameExact(db *sql.DB, suggestedName string, householdID string) *MatchResult {
+func matchNameExact(db *sql.DB, suggestedName string, householdID string) (*MatchResult, error) {
 	var productID string
 	normalizedName := NormalizeProductName(suggestedName)
 	err := db.QueryRow(
 		`SELECT id
 		   FROM products
-		  WHERE household_id = ?
-		    AND (name_normalized = ? OR (name_normalized IS NULL AND LOWER(name) = LOWER(?)))
-		  LIMIT 1`,
+			  WHERE household_id = ?
+			    AND (name_normalized = ? OR (name_normalized IS NULL AND LOWER(name) = LOWER(?)))
+			  ORDER BY updated_at DESC, id ASC
+			  LIMIT 1`,
 		householdID, normalizedName, suggestedName,
 	).Scan(&productID)
 	if err == nil {
@@ -145,7 +152,10 @@ func matchNameExact(db *sql.DB, suggestedName string, householdID string) *Match
 			ProductID:  productID,
 			Confidence: 0.92,
 			Method:     "suggested",
-		}
+		}, nil
 	}
-	return nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	return nil, nil
 }

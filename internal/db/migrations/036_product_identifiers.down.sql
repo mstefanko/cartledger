@@ -119,4 +119,5 @@ DROP INDEX IF EXISTS idx_product_identifiers_product;
 DROP INDEX IF EXISTS idx_product_identifiers_household_kind_authority_value;
 DROP TABLE IF EXISTS product_identifiers;
 
+PRAGMA foreign_key_check;
 PRAGMA foreign_keys = ON;

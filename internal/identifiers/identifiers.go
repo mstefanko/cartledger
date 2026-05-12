@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mstefanko/cartledger/internal/sqliteutil"
 )
 
 type Kind string
@@ -213,6 +215,7 @@ func UpsertProductIdentifier(ctx context.Context, db DBTX, row ProductIdentifier
 		    AND kind = ?
 		    AND authority = ?
 		    AND normalized_value = ?
+		  ORDER BY last_seen_at DESC, updated_at DESC, product_id ASC
 		  LIMIT 1`,
 		row.HouseholdID, row.Kind, row.Authority, row.NormalizedValue,
 	).Scan(&existingID, &existingProductID)
@@ -243,7 +246,7 @@ func UpsertProductIdentifier(ctx context.Context, db DBTX, row ProductIdentifier
 		)
 	}
 	if err != nil {
-		if isUniqueConstraint(err) {
+		if sqliteutil.IsUniqueConstraint(err) {
 			return &IdentifierConflictError{}
 		}
 		return err
@@ -252,13 +255,9 @@ func UpsertProductIdentifier(ctx context.Context, db DBTX, row ProductIdentifier
 	if row.SetPrimaryProduct && row.Kind == KindGTIN && row.Authority == "" {
 		_, err = db.ExecContext(ctx,
 			`UPDATE products
-			    SET upc = CASE
-			            WHEN upc IS NULL OR TRIM(upc) = '' OR upc = ? THEN ?
-			            ELSE upc
-			        END,
-			        updated_at = ?
+			    SET upc = ?, updated_at = ?
 			  WHERE id = ? AND household_id = ?`,
-			row.NormalizedValue, row.NormalizedValue, now, row.ProductID, row.HouseholdID,
+			row.NormalizedValue, now, row.ProductID, row.HouseholdID,
 		)
 	}
 	return err
@@ -315,9 +314,14 @@ func SetProductPrimaryGTIN(ctx context.Context, db DBTX, householdID, productID,
 	if err != nil {
 		return nil, err
 	}
+	_, err = db.ExecContext(ctx,
+		`UPDATE products
+		    SET upc = ?, updated_at = ?
+		  WHERE id = ? AND household_id = ?`,
+		normalized, now, productID, householdID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &normalized, nil
-}
-
-func isUniqueConstraint(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint")
 }

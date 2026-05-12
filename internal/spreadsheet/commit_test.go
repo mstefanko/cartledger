@@ -50,7 +50,8 @@ type fakeMatchEngine struct {
 	panicRawNames map[string]bool
 }
 
-func (f *fakeMatchEngine) MatchWithSuggestion(rawName, _, _, _ string) matcher.MatchResult {
+func (f *fakeMatchEngine) MatchInput(_ context.Context, input matcher.Input) matcher.MatchResult {
+	rawName := input.RawName
 	if f.panicRawNames[rawName] {
 		panic("simulated matcher failure for " + rawName)
 	}
@@ -61,7 +62,7 @@ func (f *fakeMatchEngine) MatchWithSuggestion(rawName, _, _, _ string) matcher.M
 }
 
 // NewSession deliberately errors so commit falls through to the per-call
-// MatchWithSuggestion path above — that's what every fakeMatchEngine-backed
+// MatchInput path above — that's what every fakeMatchEngine-backed
 // test expects. Session-path coverage lives in internal/matcher/session_test.go.
 func (f *fakeMatchEngine) NewSession(_, _ string) (*matcher.Session, error) {
 	return nil, errors.New("fakeMatchEngine: session unsupported")
@@ -227,6 +228,74 @@ func TestCommit_HappyPath(t *testing.T) {
 	_ = database.QueryRow(`SELECT purchase_count FROM products WHERE id = 'prod-milk'`).Scan(&pc)
 	if pc != 1 {
 		t.Errorf("purchase_count = %d, want 1", pc)
+	}
+}
+
+func TestCommit_UPCColumnUsesIdentifierMatchAndPersistsObservation(t *testing.T) {
+	database := newCommitTestDB(t)
+	const upc = "036000291452"
+	if _, err := database.Exec(
+		`INSERT INTO products (id, household_id, name, upc) VALUES ('prod-upc', 'h1', 'Known UPC Product', ?)`,
+		upc,
+	); err != nil {
+		t.Fatalf("insert product: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO product_identifiers
+		    (household_id, product_id, kind, authority, value, normalized_value, source, confidence)
+		 VALUES ('h1', 'prod-upc', 'gtin', '', ?, ?, 'manual', 1.0)`,
+		upc, upc,
+	); err != nil {
+		t.Fatalf("insert identifier: %v", err)
+	}
+
+	sheet := &ParsedSheet{
+		Name:    "Sheet1",
+		Headers: []string{"date", "store", "item", "upc", "qty", "unit_price", "total"},
+		Rows: []RawRow{{
+			Index: 0,
+			Cells: []string{"2026-03-10", "Whole Foods", "Receipt Shorthand", upc, "1", "3.99", "3.99"},
+		}},
+	}
+	in := stdInput(sheet)
+	in.Mapping = Mapping{
+		RoleDate:       0,
+		RoleStore:      1,
+		RoleItem:       2,
+		RoleUPC:        3,
+		RoleQty:        4,
+		RoleUnitPrice:  5,
+		RoleTotalPrice: 6,
+	}
+
+	res, err := Commit(context.Background(), database, matcher.NewEngine(database), in)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if res.UnmatchedLineItems != 0 {
+		t.Fatalf("UnmatchedLineItems = %d, want 0", res.UnmatchedLineItems)
+	}
+
+	var productID, matched, lineUPC string
+	if err := database.QueryRow(
+		`SELECT product_id, matched, upc FROM line_items LIMIT 1`,
+	).Scan(&productID, &matched, &lineUPC); err != nil {
+		t.Fatalf("query line item: %v", err)
+	}
+	if productID != "prod-upc" || matched != "identifier" || lineUPC != upc {
+		t.Fatalf("line item = product_id %q matched %q upc %q, want prod-upc/identifier/%s", productID, matched, lineUPC, upc)
+	}
+
+	var obsCount int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM line_item_identifier_observations
+		  WHERE kind = 'gtin' AND normalized_value = ? AND source = 'import'`,
+		upc,
+	).Scan(&obsCount); err != nil {
+		t.Fatalf("query observations: %v", err)
+	}
+	if obsCount != 1 {
+		t.Fatalf("identifier observations = %d, want 1", obsCount)
 	}
 }
 
@@ -463,7 +532,8 @@ type flakyEngine struct {
 	realID     string
 }
 
-func (f *flakyEngine) MatchWithSuggestion(rawName, _, _, _ string) matcher.MatchResult {
+func (f *flakyEngine) MatchInput(_ context.Context, input matcher.Input) matcher.MatchResult {
+	rawName := input.RawName
 	if rawName == f.badRawName {
 		// Pointing at a non-existent product_id triggers a FK violation on
 		// line_items INSERT — commitGroup's tx rolls back, and Commit
@@ -477,7 +547,7 @@ func (f *flakyEngine) MatchWithSuggestion(rawName, _, _, _ string) matcher.Match
 }
 
 // NewSession errors so commit falls through to the per-call
-// MatchWithSuggestion path — the flakyEngine test fixture is built around
+// MatchInput path — the flakyEngine test fixture is built around
 // return values from that method.
 func (f *flakyEngine) NewSession(_, _ string) (*matcher.Session, error) {
 	return nil, errors.New("flakyEngine: session unsupported")

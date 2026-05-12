@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -141,7 +142,7 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 		Confidence:  &conf,
 		AcceptedAt:  &now,
 		CreatedAt:   now,
-	}); err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+	}); err != nil && !errors.Is(err, matcher.ErrAliasConflict) && !isUniqueConstraintError(err) {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create alias"})
 	}
 

@@ -885,6 +885,9 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 				Identifiers:   identifierObservations,
 			})
 		}
+		if matchResult.Err != nil {
+			return fmt.Errorf("match line item %q: %w", item.RawName, matchResult.Err)
+		}
 
 		matched := matchResult.Method
 		if matched == "unmatched" || matched == "suggested" || matched == "cross_store_match" {

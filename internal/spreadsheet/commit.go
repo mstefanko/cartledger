@@ -3,6 +3,7 @@ package spreadsheet
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
 )
@@ -19,17 +21,17 @@ import (
 // MatchEngine is the minimal surface this package needs from matcher.Engine.
 // Defined as an interface so commit tests can inject a fake that errors on
 // demand without spinning up the full fuzzy-match pipeline. The real
-// *matcher.Engine satisfies this interface by virtue of its own
-// MatchWithSuggestion method and NewSession factory.
+// *matcher.Engine satisfies this interface by virtue of its MatchInput method
+// and NewSession factory.
 //
 // NewSession returns a batched match session — see internal/matcher/session.go
 // for the contract. Callers SHOULD prefer the session path for in-loop
 // matching (it collapses the per-item fuzzy queries to a per-batch preload),
-// and MUST gracefully fall back to per-call MatchWithSuggestion when
+// and MUST gracefully fall back to per-call MatchInput when
 // NewSession returns an error. Test fakes typically return an error from
 // NewSession to force the fallback path and keep existing tests green.
 type MatchEngine interface {
-	MatchWithSuggestion(rawName, suggestedName, storeID, householdID string) matcher.MatchResult
+	MatchInput(ctx context.Context, input matcher.Input) matcher.MatchResult
 	NewSession(householdID, storeID string) (*matcher.Session, error)
 }
 
@@ -262,7 +264,7 @@ func commitGroup(
 	// prior per-call path: aliases written by earlier groups' txs are visible
 	// to this group because we open the session AFTER those txs committed.
 	//
-	// On NewSession error we fall through to the one-shot MatchWithSuggestion
+	// On NewSession error we fall through to the one-shot MatchInput
 	// path — test fakes deliberately return an error here to exercise the
 	// fallback and keep their fixture behavior intact. The group itself
 	// continues either way.
@@ -346,20 +348,41 @@ func commitGroup(
 		}
 		totalPriceStr := centsToDecimalString(pv.TotalCents)
 
-		// Matcher: spreadsheet rows don't carry a "suggested name" from an
-		// LLM — pass "" for suggestedName. MatchWithSuggestion degenerates
-		// to the 3-stage raw-name pipeline in that case (see
-		// matcher/engine.go:60-67). Prefer the per-group session when it
-		// opened cleanly; fall back to the per-call engine path otherwise.
+		var itemIdentifier *identifiers.Observation
+		var identifierObservations []identifiers.Observation
+		var itemUPC *string
+		if strings.TrimSpace(pv.UPC) != "" {
+			if obs, err := identifiers.Normalize(pv.UPC, identifiers.KindGTIN, ""); err == nil && obs.NormalizedValue != "" {
+				obs.Source = "import"
+				itemIdentifier = &obs
+				identifierObservations = append(identifierObservations, obs)
+				itemUPC = &obs.NormalizedValue
+			} else if err != nil {
+				slog.Warn("spreadsheet commit: upc ignored", "row_index", pv.RowIndex, "value", pv.UPC, "err", err)
+			}
+		}
+
+		// Matcher: spreadsheet rows don't carry a suggested name from an LLM.
+		// Use MatchInput so mapped UPC/GTIN columns participate in the
+		// identifier-first stage before code/rule/alias/fuzzy matching.
 		var matchResult matcher.MatchResult
-		if strings.TrimSpace(rawName) != "" {
+		if strings.TrimSpace(rawName) != "" || len(identifierObservations) > 0 {
+			input := matcher.Input{
+				RawName:     rawName,
+				StoreID:     storeID,
+				HouseholdID: in.HouseholdID,
+				Identifiers: identifierObservations,
+			}
 			if sess != nil {
-				matchResult = sess.MatchWithSuggestion(rawName, "")
+				matchResult = sess.MatchInput(ctx, input)
 			} else {
-				matchResult = matchEngine.MatchWithSuggestion(rawName, "", storeID, in.HouseholdID)
+				matchResult = matchEngine.MatchInput(ctx, input)
 			}
 		} else {
 			matchResult = matcher.MatchResult{Method: "unmatched"}
+		}
+		if matchResult.Err != nil {
+			return "", nil, 0, 0, fmt.Errorf("match spreadsheet row %d: %w", ri, matchResult.Err)
 		}
 
 		var productID *string
@@ -386,15 +409,20 @@ func commitGroup(
 
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO line_items
-			 (id, receipt_id, product_id, raw_name, quantity, unit,
-			  unit_price, total_price, matched, confidence, line_number,
-			  import_batch_id, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 (id, receipt_id, product_id, raw_name, quantity, unit,
+				  unit_price, total_price, matched, confidence, line_number,
+				  import_batch_id, upc, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, receiptID, productID, rawName, qtyStr, unit,
 			unitPriceStr, totalPriceStr, matched, confidence, lineNum+1,
-			batchID, now,
+			batchID, itemUPC, now,
 		); err != nil {
 			return "", nil, 0, 0, fmt.Errorf("insert line_item row %d: %w", ri, err)
+		}
+		if itemIdentifier != nil {
+			if err := identifiers.InsertLineItemObservation(ctx, tx, lineItemID, *itemIdentifier); err != nil {
+				return "", nil, 0, 0, fmt.Errorf("insert identifier observation row %d: %w", ri, err)
+			}
 		}
 
 		lineItemIDs = append(lineItemIDs, lineItemID)
@@ -423,6 +451,25 @@ func commitGroup(
 				CreatedAt:   now,
 			}); err != nil {
 				slog.Warn("spreadsheet commit: alias upsert skipped", "product_id", *productID, "err", err)
+			}
+			if itemIdentifier != nil {
+				if err := identifiers.UpsertProductIdentifier(ctx, tx, identifiers.ProductIdentifier{
+					HouseholdID:       in.HouseholdID,
+					ProductID:         *productID,
+					Kind:              itemIdentifier.Kind,
+					Authority:         itemIdentifier.Authority,
+					Value:             itemIdentifier.RawValue,
+					NormalizedValue:   itemIdentifier.NormalizedValue,
+					Source:            "import",
+					Confidence:        confidence,
+					SetPrimaryProduct: true,
+				}); err != nil {
+					if errors.Is(err, identifiers.ErrIdentifierConflict) {
+						slog.Warn("spreadsheet commit: identifier conflict skipped", "product_id", *productID, "upc", itemIdentifier.NormalizedValue, "err", err)
+					} else {
+						return "", nil, 0, 0, fmt.Errorf("upsert product identifier row %d: %w", ri, err)
+					}
+				}
 			}
 
 			if err := prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID); err != nil {

@@ -51,6 +51,7 @@ func NormalizeRow(raw RawRow, m Mapping, opts UnitOptions, g Grouping, df DateFo
 
 	// Item, Trip ID, Notes — free text.
 	pv.Item = cell(RoleItem)
+	pv.UPC = cell(RoleUPC)
 	pv.TripID = cell(RoleTripID)
 	pv.Notes = cell(RoleNotes)
 

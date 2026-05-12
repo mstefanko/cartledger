@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/mstefanko/cartledger/internal/sqliteutil"
 )
 
 type AliasSource string
@@ -41,6 +43,7 @@ func (e *AliasConflictError) Is(target error) bool {
 
 type AliasDBTX interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
@@ -78,37 +81,12 @@ func UpsertAlias(ctx context.Context, db AliasDBTX, row AliasUpsert) error {
 		now = time.Now().UTC()
 	}
 
-	var existingID, existingProductID string
-	var err error
-	if row.StoreID != nil && strings.TrimSpace(*row.StoreID) != "" {
-		storeID := strings.TrimSpace(*row.StoreID)
-		err = db.QueryRowContext(ctx,
-			`SELECT id, product_id
-			   FROM product_aliases
-			  WHERE household_id = ?
-			    AND store_id = ?
-			    AND alias_normalized = ?
-			  LIMIT 1`,
-			row.HouseholdID, storeID, normalized,
-		).Scan(&existingID, &existingProductID)
-		row.StoreID = &storeID
-	} else {
-		row.StoreID = nil
-		err = db.QueryRowContext(ctx,
-			`SELECT id, product_id
-			   FROM product_aliases
-			  WHERE household_id = ?
-			    AND store_id IS NULL
-			    AND alias_normalized = ?
-			  LIMIT 1`,
-			row.HouseholdID, normalized,
-		).Scan(&existingID, &existingProductID)
-	}
-	if err == nil && existingProductID != row.ProductID {
-		return &AliasConflictError{ExistingProductID: existingProductID}
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	existingID, existingProductID, err := findAliasByNormalized(ctx, db, row, normalized)
+	if err != nil {
 		return err
+	}
+	if existingID != "" && existingProductID != row.ProductID {
+		return &AliasConflictError{ExistingProductID: existingProductID}
 	}
 	if existingID != "" {
 		_, err = db.ExecContext(ctx,
@@ -122,6 +100,13 @@ func UpsertAlias(ctx context.Context, db AliasDBTX, row AliasUpsert) error {
 		return err
 	}
 
+	if row.StoreID != nil && strings.TrimSpace(*row.StoreID) != "" {
+		storeID := strings.TrimSpace(*row.StoreID)
+		row.StoreID = &storeID
+	} else {
+		row.StoreID = nil
+	}
+
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO product_aliases
 		    (id, product_id, household_id, alias, alias_normalized, store_id,
@@ -130,8 +115,48 @@ func UpsertAlias(ctx context.Context, db AliasDBTX, row AliasUpsert) error {
 		uuid.New().String(), row.ProductID, row.HouseholdID, row.Alias, normalized,
 		row.StoreID, row.Source, row.Confidence, row.AcceptedAt, now, now,
 	)
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+	if sqliteutil.IsUniqueConstraint(err) {
 		return &AliasConflictError{}
 	}
 	return err
+}
+
+func findAliasByNormalized(ctx context.Context, db AliasDBTX, row AliasUpsert, normalized string) (string, string, error) {
+	args := []interface{}{row.HouseholdID, normalized}
+	storeClause := "store_id IS NULL"
+	if row.StoreID != nil && strings.TrimSpace(*row.StoreID) != "" {
+		storeClause = "store_id = ?"
+		args = []interface{}{row.HouseholdID, strings.TrimSpace(*row.StoreID), normalized}
+	}
+	rows, err := db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT id, product_id, alias, alias_normalized
+		               FROM product_aliases
+		              WHERE household_id = ?
+		                AND %s
+		              ORDER BY CASE WHEN alias_normalized = ? THEN 0 ELSE 1 END,
+		                       alias_normalized IS NULL, created_at, id`, storeClause),
+		args...,
+	)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, productID, alias string
+		var aliasNormalized sql.NullString
+		if err := rows.Scan(&id, &productID, &alias, &aliasNormalized); err != nil {
+			return "", "", err
+		}
+		if aliasNormalized.Valid && aliasNormalized.String == normalized {
+			return id, productID, nil
+		}
+		if NormalizeProductName(alias) == normalized {
+			return id, productID, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", err
+	}
+	return "", "", nil
 }
