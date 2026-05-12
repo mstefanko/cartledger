@@ -21,6 +21,14 @@ function MemberRow({ member, isBestDeal, onRemove, removing }: {
   onRemove: () => void
   removing: boolean
 }) {
+  const comparison = member.normalized_price && member.normalized_unit
+    ? `${formatPrice(member.normalized_price)} / ${member.normalized_unit}`
+    : formatPrice(member.price_per_unit)
+  const basis = member.price_basis === 'normalized'
+    ? 'Comparable'
+    : member.price_basis === 'missing_package'
+      ? 'Needs package'
+      : 'Raw'
   return (
     <tr className={`border-b border-neutral-200 last:border-0 ${isBestDeal ? 'bg-success-subtle/30' : ''}`}>
       <td className="py-2.5 text-body-medium text-neutral-900">
@@ -37,7 +45,8 @@ function MemberRow({ member, isBestDeal, onRemove, removing }: {
         {formatPrice(member.latest_price)}
       </td>
       <td className={`py-2.5 text-right font-medium ${isBestDeal ? 'text-success-dark' : 'text-neutral-600'}`}>
-        {formatPrice(member.price_per_unit)}
+        <div>{comparison}</div>
+        <div className="mt-1 text-small font-normal text-neutral-400">{basis}</div>
         {isBestDeal && <Badge variant="success" className="ml-2">Best</Badge>}
       </td>
       <td className="py-2.5 text-right text-caption text-neutral-400">
@@ -218,12 +227,12 @@ function ProductGroupPage() {
   const members = group.members ?? []
   const existingMemberIds = new Set(members.map((m) => m.id))
 
-  // Find best deal (lowest price_per_unit)
+  // Find best comparable deal.
   let bestDealId: string | null = null
   let lowestPPU = Infinity
   for (const m of members) {
-    if (m.price_per_unit) {
-      const ppu = parseFloat(m.price_per_unit)
+    if (m.price_basis === 'normalized' && m.normalized_price) {
+      const ppu = parseFloat(m.normalized_price)
       if (!isNaN(ppu) && ppu < lowestPPU) {
         lowestPPU = ppu
         bestDealId = m.id

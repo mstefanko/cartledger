@@ -1,6 +1,7 @@
 package matcher
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/lithammer/fuzzysearch/fuzzy"
@@ -70,7 +71,7 @@ func (e *Engine) NewSession(householdID, storeID string) (*Session, error) {
 	// Aliases (store-specific OR global), scoped to household via products.
 	// Mirrors matchByFuzzy at fuzzy.go:57-62.
 	aliasRows, err := e.db.Query(
-		`SELECT pa.product_id, LOWER(pa.alias) FROM product_aliases pa
+		`SELECT pa.product_id, COALESCE(pa.alias_normalized, LOWER(pa.alias)) FROM product_aliases pa
 		 JOIN products p ON pa.product_id = p.id
 		 WHERE (pa.store_id = ? OR pa.store_id IS NULL) AND p.household_id = ?`,
 		storeID, householdID,
@@ -88,7 +89,7 @@ func (e *Engine) NewSession(householdID, storeID string) (*Session, error) {
 
 	// Product names, scoped to household. Mirrors matchByFuzzy at fuzzy.go:74.
 	prodRows, err := e.db.Query(
-		`SELECT id, LOWER(name) FROM products WHERE household_id = ?`,
+		`SELECT id, COALESCE(name_normalized, LOWER(name)) FROM products WHERE household_id = ?`,
 		householdID,
 	)
 	if err != nil {
@@ -109,24 +110,7 @@ func (e *Engine) NewSession(householdID, storeID string) (*Session, error) {
 // Stages 1 (rules) and 2 (alias-exact) continue to query the DB — they are
 // already indexed lookups with negligible per-call cost.
 func (s *Session) Match(rawName string) MatchResult {
-	normalized := Normalize(rawName)
-
-	// Stage 1: Rules.
-	if result := matchByRules(s.db, normalized, s.storeID, s.householdID); result != nil {
-		return *result
-	}
-
-	// Stage 2: Alias exact match.
-	if result := matchByAlias(s.db, normalized, s.storeID, s.householdID); result != nil {
-		return *result
-	}
-
-	// Stage 3: Fuzzy matching against cached candidates.
-	if result := s.matchByFuzzyCached(normalized); result != nil {
-		return *result
-	}
-
-	return MatchResult{Method: "unmatched", Confidence: 0}
+	return s.MatchInput(context.Background(), Input{RawName: rawName})
 }
 
 // MatchWithSuggestion mirrors Engine.MatchWithSuggestion. Stages 1-3 go through
@@ -134,18 +118,55 @@ func (s *Session) Match(rawName string) MatchResult {
 // on name, small result); stage 5 uses the cached fuzzy candidates. The
 // productHasStoreHistory check is served from the per-session lazy cache.
 func (s *Session) MatchWithSuggestion(rawName, suggestedName string) MatchResult {
-	// Stages 1-3: standard pipeline on raw_name.
-	result := s.Match(rawName)
-	if result.Method != "unmatched" {
+	return s.MatchInput(context.Background(), Input{RawName: rawName, SuggestedName: suggestedName})
+}
+
+func (s *Session) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedName string) MatchResult {
+	return s.MatchInput(context.Background(), Input{
+		RawName:       rawName,
+		StoreItemCode: storeItemCode,
+		SuggestedName: suggestedName,
+	})
+}
+
+func (s *Session) MatchInput(ctx context.Context, input Input) MatchResult {
+	if input.StoreID == "" {
+		input.StoreID = s.storeID
+	}
+	if input.HouseholdID == "" {
+		input.HouseholdID = s.householdID
+	}
+	normalized := Normalize(input.RawName)
+
+	if result := matchByIdentifier(ctx, s.db, input.HouseholdID, input.Identifiers); result != nil {
+		return *result
+	}
+
+	if result := matchByCode(s.db, input.StoreItemCode, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	if result := matchByRules(s.db, normalized, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	if result := matchByAlias(s.db, normalized, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	if result := s.matchByFuzzyCached(normalized); result != nil {
+		return *result
+	}
+
+	return s.matchSuggestion(input, MatchResult{Method: "unmatched", Confidence: 0})
+}
+
+func (s *Session) matchSuggestion(input Input, result MatchResult) MatchResult {
+	if input.SuggestedName == "" {
 		return result
 	}
 
-	if suggestedName == "" {
-		return result
-	}
-
-	// Stage 4: Exact match suggested_name against product names.
-	if r := matchNameExact(s.db, suggestedName, s.householdID); r != nil {
+	if r := matchNameExact(s.db, input.SuggestedName, input.HouseholdID); r != nil {
 		if hist := s.productHasStoreHistoryCached(r.ProductID); hist == storeHistoryOtherStore {
 			r.Confidence = 0.7
 			r.Method = "cross_store_match"
@@ -153,8 +174,7 @@ func (s *Session) MatchWithSuggestion(rawName, suggestedName string) MatchResult
 		return *r
 	}
 
-	// Stage 5: Fuzzy match suggested_name against cached candidates.
-	normalizedSuggestion := Normalize(suggestedName)
+	normalizedSuggestion := Normalize(input.SuggestedName)
 	if r := s.matchByFuzzyCached(normalizedSuggestion); r != nil {
 		if hist := s.productHasStoreHistoryCached(r.ProductID); hist == storeHistoryOtherStore {
 			r.Confidence = 0.6
@@ -165,14 +185,7 @@ func (s *Session) MatchWithSuggestion(rawName, suggestedName string) MatchResult
 		return *r
 	}
 
-	return MatchResult{Method: "unmatched", Confidence: 0}
-}
-
-func (s *Session) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedName string) MatchResult {
-	if result := matchByCode(s.db, storeItemCode, s.storeID, s.householdID); result != nil {
-		return *result
-	}
-	return s.MatchWithSuggestion(rawName, suggestedName)
+	return result
 }
 
 // matchByFuzzyCached is a byte-for-byte duplicate of the scoring loop in

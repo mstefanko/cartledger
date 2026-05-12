@@ -12,24 +12,26 @@ import (
 )
 
 type BackfillOptions struct {
-	Apply       bool
-	ProductID   string
-	SampleLimit int
+	Apply          bool
+	ProductID      string
+	ProductGroupID string
+	SampleLimit    int
 }
 
 type BackfillSummary struct {
-	TotalRows              int
-	AlreadyNormalized      int
-	ReceiptUnitNormalized  int
-	LineOverrideNormalized int
-	ProductPackNormalized  int
-	MissingPackSkipped     int
-	AmbiguousUnitSkipped   int
-	InvalidSkipped         int
-	LinkableRows           int
-	LinkedRows             int
-	AmbiguousLinkSkipped   int
-	Samples                []BackfillSkippedSample
+	TotalRows                     int
+	AlreadyNormalized             int
+	ReceiptUnitNormalized         int
+	LineOverrideNormalized        int
+	ProductPackNormalized         int
+	GroupComparisonUnitNormalized int
+	MissingPackSkipped            int
+	AmbiguousUnitSkipped          int
+	InvalidSkipped                int
+	LinkableRows                  int
+	LinkedRows                    int
+	AmbiguousLinkSkipped          int
+	Samples                       []BackfillSkippedSample
 }
 
 type BackfillSkippedSample struct {
@@ -43,19 +45,22 @@ type BackfillSkippedSample struct {
 }
 
 type backfillPriceRow struct {
-	ID                 string
-	ProductID          string
-	ProductName        string
-	ReceiptID          string
-	ReceiptDate        string
-	Quantity           string
-	Unit               string
-	UnitPrice          string
-	NormalizedPriceSet bool
-	NormalizedUnitSet  bool
-	LineItemID         sql.NullString
-	PackQuantity       sql.NullFloat64
-	PackUnit           sql.NullString
+	ID                  string
+	ProductID           string
+	HouseholdID         string
+	ProductName         string
+	ProductGroupID      sql.NullString
+	GroupComparisonUnit sql.NullString
+	ReceiptID           string
+	ReceiptDate         string
+	Quantity            string
+	Unit                string
+	UnitPrice           string
+	NormalizedPriceSet  bool
+	NormalizedUnitSet   bool
+	LineItemID          sql.NullString
+	PackQuantity        sql.NullFloat64
+	PackUnit            sql.NullString
 }
 
 type backfillLineItem struct {
@@ -80,11 +85,11 @@ func BackfillNormalizedPrices(ctx context.Context, database *sql.DB, opts Backfi
 	defer tx.Rollback()
 
 	summary := BackfillSummary{}
-	if err := tx.QueryRowContext(ctx, backfillCountQuery(opts.ProductID), backfillCountArgs(opts.ProductID)...).Scan(&summary.TotalRows, &summary.AlreadyNormalized); err != nil {
+	if err := tx.QueryRowContext(ctx, backfillCountQuery(opts), backfillArgs(opts)...).Scan(&summary.TotalRows, &summary.AlreadyNormalized); err != nil {
 		return BackfillSummary{}, fmt.Errorf("count product prices: %w", err)
 	}
 
-	rows, err := tx.QueryContext(ctx, backfillRowsQuery(opts.ProductID), backfillRowsArgs(opts.ProductID)...)
+	rows, err := tx.QueryContext(ctx, backfillRowsQuery(opts), backfillArgs(opts)...)
 	if err != nil {
 		return BackfillSummary{}, fmt.Errorf("query product prices: %w", err)
 	}
@@ -96,7 +101,10 @@ func BackfillNormalizedPrices(ctx context.Context, database *sql.DB, opts Backfi
 		if err := rows.Scan(
 			&row.ID,
 			&row.ProductID,
+			&row.HouseholdID,
 			&row.ProductName,
+			&row.ProductGroupID,
+			&row.GroupComparisonUnit,
 			&row.ReceiptID,
 			&row.ReceiptDate,
 			&row.Quantity,
@@ -159,7 +167,7 @@ func processBackfillRow(ctx context.Context, tx *sql.Tx, row backfillPriceRow, o
 		line = loaded
 	}
 
-	normalized, sample, err := normalizeBackfillRow(row, line)
+	normalized, sample, err := normalizeBackfillRow(ctx, tx, row, line)
 	if err != nil {
 		summary.InvalidSkipped++
 		addBackfillSample(summary, opts.SampleLimit, sample, "invalid quantity or price")
@@ -182,6 +190,9 @@ func processBackfillRow(ctx context.Context, tx *sql.Tx, row backfillPriceRow, o
 		}
 		addBackfillSample(summary, opts.SampleLimit, sample, reason)
 		return nil
+	}
+	if row.GroupComparisonUnit.Valid && normalized.NormalizedUnit != nil && strings.EqualFold(*normalized.NormalizedUnit, units.NormalizeUnit(row.GroupComparisonUnit.String)) {
+		summary.GroupComparisonUnitNormalized++
 	}
 
 	if !opts.Apply {
@@ -217,7 +228,7 @@ func processBackfillRow(ctx context.Context, tx *sql.Tx, row backfillPriceRow, o
 	return nil
 }
 
-func normalizeBackfillRow(row backfillPriceRow, line *backfillLineItem) (NormalizedLinePrice, BackfillSkippedSample, error) {
+func normalizeBackfillRow(ctx context.Context, tx *sql.Tx, row backfillPriceRow, line *backfillLineItem) (NormalizedLinePrice, BackfillSkippedSample, error) {
 	sample := BackfillSkippedSample{
 		ProductName: row.ProductName,
 		ReceiptDate: row.ReceiptDate,
@@ -266,7 +277,16 @@ func normalizeBackfillRow(row backfillPriceRow, line *backfillLineItem) (Normali
 
 	productPackQuantity := decimalPtrFromFloat(row.PackQuantity)
 	productPackUnit := stringPtrFromNullString(row.PackUnit)
-	normalized, err := NormalizeLineItemPrice(
+	scope := units.ConversionScope{
+		HouseholdID: row.HouseholdID,
+		ProductID:   row.ProductID,
+	}
+	if row.ProductGroupID.Valid {
+		scope.ProductGroupID = row.ProductGroupID.String
+	}
+	normalized, err := NormalizeLineItemPriceWithScope(
+		ctx,
+		tx,
 		totalPrice,
 		lineQuantity,
 		lineUnit,
@@ -274,6 +294,8 @@ func normalizeBackfillRow(row backfillPriceRow, line *backfillLineItem) (Normali
 		productPackUnit,
 		overrideQuantity,
 		overrideUnit,
+		stringPtrFromNullString(row.GroupComparisonUnit),
+		scope,
 	)
 	return normalized, sample, err
 }
@@ -426,45 +448,58 @@ func addBackfillSample(summary *BackfillSummary, limit int, sample BackfillSkipp
 	summary.Samples = append(summary.Samples, sample)
 }
 
-func backfillCountQuery(productID string) string {
+func backfillCountQuery(opts BackfillOptions) string {
 	query := `SELECT COUNT(*),
 	                COUNT(CASE WHEN pp.normalized_price IS NOT NULL
 	                          AND pp.normalized_unit IS NOT NULL
 	                          AND TRIM(pp.normalized_unit) <> '' THEN 1 END)
-	            FROM product_prices pp`
-	if strings.TrimSpace(productID) != "" {
-		query += ` WHERE pp.product_id = ?`
+	            FROM product_prices pp
+	            JOIN products p ON p.id = pp.product_id`
+	clauses := backfillWhereClauses(opts)
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, ` AND `)
 	}
 	return query
 }
 
-func backfillCountArgs(productID string) []any {
-	if strings.TrimSpace(productID) == "" {
-		return nil
-	}
-	return []any{productID}
-}
-
-func backfillRowsQuery(productID string) string {
-	query := `SELECT pp.id, pp.product_id, p.name, pp.receipt_id, pp.receipt_date,
+func backfillRowsQuery(opts BackfillOptions) string {
+	query := `SELECT pp.id, pp.product_id, p.household_id, p.name, p.product_group_id, pg.comparison_unit,
+	                 pp.receipt_id, pp.receipt_date,
 	                 pp.quantity, pp.unit, pp.unit_price,
 	                 pp.normalized_price IS NOT NULL,
 	                 pp.normalized_unit IS NOT NULL AND TRIM(pp.normalized_unit) <> '',
 	                 pp.line_item_id, p.pack_quantity, p.pack_unit
 	            FROM product_prices pp
-	            JOIN products p ON p.id = pp.product_id`
-	if strings.TrimSpace(productID) != "" {
-		query += ` WHERE pp.product_id = ?`
+	            JOIN products p ON p.id = pp.product_id
+	            LEFT JOIN product_groups pg ON pg.id = p.product_group_id`
+	clauses := backfillWhereClauses(opts)
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, ` AND `)
 	}
 	query += ` ORDER BY pp.receipt_date, pp.id`
 	return query
 }
 
-func backfillRowsArgs(productID string) []any {
-	if strings.TrimSpace(productID) == "" {
-		return nil
+func backfillWhereClauses(opts BackfillOptions) []string {
+	clauses := make([]string, 0, 2)
+	if strings.TrimSpace(opts.ProductID) != "" {
+		clauses = append(clauses, `pp.product_id = ?`)
 	}
-	return []any{productID}
+	if strings.TrimSpace(opts.ProductGroupID) != "" {
+		clauses = append(clauses, `p.product_group_id = ?`)
+	}
+	return clauses
+}
+
+func backfillArgs(opts BackfillOptions) []any {
+	args := make([]any, 0, 2)
+	if strings.TrimSpace(opts.ProductID) != "" {
+		args = append(args, opts.ProductID)
+	}
+	if strings.TrimSpace(opts.ProductGroupID) != "" {
+		args = append(args, opts.ProductGroupID)
+	}
+	return args
 }
 
 func decimalPtrFromFloat(value sql.NullFloat64) *decimal.Decimal {

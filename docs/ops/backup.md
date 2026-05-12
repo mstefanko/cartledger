@@ -30,8 +30,8 @@ The archive is plain `tar.gz` — `tar tf backup-*.tar.gz` lists the entries wit
 
 ## What's NOT in a backup
 
-- **Environment variables.** `ANTHROPIC_API_KEY`, `JWT_SECRET`, `INTEGRATIONS_KEY`, `DATA_DIR`, `PORT`, `ALLOWED_ORIGINS`, etc. are process-level config — they live in your systemd unit / docker-compose file / `.env`, not in `DATA_DIR`. You restore these separately.
-- **Integration tokens in plaintext.** Mealie and other integration tokens are stored encrypted-at-rest in the DB with `INTEGRATIONS_KEY`. The archive contains the ciphertext. Without `INTEGRATIONS_KEY` an attacker who steals the backup cannot decrypt those tokens — but this also means you must preserve `INTEGRATIONS_KEY` across a restore or integrations will fail to authenticate.
+- **Environment variables.** `ANTHROPIC_API_KEY`, `JWT_SECRET`, `DATA_DIR`, `PORT`, `ALLOWED_ORIGINS`, etc. are process-level config — they live in your systemd unit / docker-compose file / `.env`, not in `DATA_DIR`. You restore these separately.
+- **Standalone LLM/API keys.** Provider keys such as `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` are not stored in the DB or backup archive.
 - **Pruned original images.** The retention janitor (see `IMAGE_RETENTION_DAYS`) may remove originals older than N days and marks their `receipt_images` rows as pruned. Processed display images stay active. Pruned originals are not counted as missing active images; `missing_images` is reserved for active image rows whose files are unexpectedly absent.
 - **WAL/SHM sidecar files.** Backup runs a checkpoint first, so the archive's `cartledger.db` is fully self-contained — no `-wal` or `-shm` files needed.
 - **The `backups/` subdirectory itself.** Backups do not include prior backups (no recursive archiving).
@@ -42,7 +42,7 @@ The archive is plain `tar.gz` — `tar tf backup-*.tar.gz` lists the entries wit
 
 - Bcrypt password hashes. Slow to crack, but weak passwords are still at risk from an exposed hash.
 - Receipt images, which may contain store loyalty numbers, last-4 payment digits, household address (in store banners), etc.
-- Encrypted integration tokens (safe without `INTEGRATIONS_KEY`, but a motivated attacker who also controls your host can decrypt them).
+- Integration tokens, if configured. The API masks them, but the current DB stores them inside `integrations.config`, so backup archives should be treated as containing those bearer credentials.
 
 **If you back up to trusted local storage** (NAS in the same closet, attached USB, a private LAN server), this is fine as-is.
 

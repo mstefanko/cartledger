@@ -1,6 +1,7 @@
 package units
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 
@@ -11,6 +12,12 @@ import (
 // unit conversion lookups to participate in an existing transaction.
 type Querier interface {
 	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+type ConversionScope struct {
+	HouseholdID    string
+	ProductGroupID string
+	ProductID      string
 }
 
 // Standard base units for each measurement category.
@@ -104,6 +111,11 @@ func StandardUnit(unit string) string {
 //
 // If db is nil, only built-in conversions are used.
 func Convert(qty decimal.Decimal, fromUnit, toUnit string, productID string, db Querier) (decimal.Decimal, error) {
+	return ConvertScoped(context.Background(), db, qty, fromUnit, toUnit, ConversionScope{ProductID: productID})
+}
+
+func ConvertScoped(ctx context.Context, db Querier, qty decimal.Decimal, fromUnit, toUnit string, scope ConversionScope) (decimal.Decimal, error) {
+	_ = ctx
 	fromUnit = NormalizeUnit(fromUnit)
 	toUnit = NormalizeUnit(toUnit)
 
@@ -113,12 +125,12 @@ func Convert(qty decimal.Decimal, fromUnit, toUnit string, productID string, db 
 
 	// Check database for product-specific or generic conversions.
 	if db != nil {
-		factor, err := lookupConversion(db, fromUnit, toUnit, productID)
+		factor, err := lookupConversionScoped(db, fromUnit, toUnit, scope)
 		if err == nil {
 			return qty.Mul(factor), nil
 		}
 		// Also check the reverse direction.
-		factor, err = lookupConversion(db, toUnit, fromUnit, productID)
+		factor, err = lookupConversionScoped(db, toUnit, fromUnit, scope)
 		if err == nil {
 			return qty.Div(factor), nil
 		}
@@ -150,24 +162,56 @@ func Convert(qty decimal.Decimal, fromUnit, toUnit string, productID string, db 
 // lookupConversion checks the unit_conversions table for a matching factor.
 // It first checks product-specific conversions, then generic (NULL product_id).
 func lookupConversion(db Querier, fromUnit, toUnit, productID string) (decimal.Decimal, error) {
+	return lookupConversionScoped(db, fromUnit, toUnit, ConversionScope{ProductID: productID})
+}
+
+func lookupConversionScoped(db Querier, fromUnit, toUnit string, scope ConversionScope) (decimal.Decimal, error) {
 	var factorStr string
 
 	// Product-specific conversion first.
-	if productID != "" {
+	if scope.ProductID != "" {
 		err := db.QueryRow(
 			`SELECT factor FROM unit_conversions
 			 WHERE from_unit = ? AND to_unit = ? AND product_id = ?`,
-			fromUnit, toUnit, productID,
+			fromUnit, toUnit, scope.ProductID,
 		).Scan(&factorStr)
 		if err == nil {
 			return decimal.RequireFromString(factorStr), nil
 		}
 	}
 
-	// Generic conversion (product_id IS NULL).
+	if scope.ProductGroupID != "" {
+		err := db.QueryRow(
+			`SELECT factor FROM unit_conversions
+			 WHERE from_unit = ? AND to_unit = ? AND product_group_id = ?`,
+			fromUnit, toUnit, scope.ProductGroupID,
+		).Scan(&factorStr)
+		if err == nil {
+			return decimal.RequireFromString(factorStr), nil
+		}
+	}
+
+	if scope.HouseholdID != "" {
+		err := db.QueryRow(
+			`SELECT factor FROM unit_conversions
+			 WHERE from_unit = ? AND to_unit = ?
+			   AND household_id = ?
+			   AND product_id IS NULL
+			   AND product_group_id IS NULL`,
+			fromUnit, toUnit, scope.HouseholdID,
+		).Scan(&factorStr)
+		if err == nil {
+			return decimal.RequireFromString(factorStr), nil
+		}
+	}
+
+	// Legacy generic conversion (all scope columns NULL).
 	err := db.QueryRow(
 		`SELECT factor FROM unit_conversions
-		 WHERE from_unit = ? AND to_unit = ? AND product_id IS NULL`,
+		 WHERE from_unit = ? AND to_unit = ?
+		   AND product_id IS NULL
+		   AND (product_group_id IS NULL OR product_group_id = '')
+		   AND (household_id IS NULL OR household_id = '')`,
 		fromUnit, toUnit,
 	).Scan(&factorStr)
 	if err == nil {

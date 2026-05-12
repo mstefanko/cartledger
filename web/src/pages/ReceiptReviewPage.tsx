@@ -393,6 +393,15 @@ function ReceiptReviewPage() {
         </div>
       )}
 
+      {!!receipt?.duplicate_candidates?.length && (
+        <div
+          role="alert"
+          className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"
+        >
+          This receipt image matches {receipt.duplicate_candidates.length} existing receipt{receipt.duplicate_candidates.length === 1 ? '' : 's'}.
+        </div>
+      )}
+
       {/* Mobile: toggle to show/hide receipt image */}
       <div className="lg:hidden mb-3">
         <button

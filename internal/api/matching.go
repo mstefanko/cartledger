@@ -11,6 +11,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/storecodes"
@@ -97,14 +98,15 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 	var rawName string
 	var storeItemCode *string
 	var receiptDescription *string
+	var lineUPC *string
 	var storeID *string
 	err := h.DB.QueryRow(
-		`SELECT li.raw_name, li.store_item_code, li.receipt_description, r.store_id
+		`SELECT li.raw_name, li.store_item_code, li.receipt_description, li.upc, r.store_id
 		 FROM line_items li
 		 JOIN receipts r ON li.receipt_id = r.id
 		 WHERE li.id = ? AND r.household_id = ?`,
 		lineItemID, householdID,
-	).Scan(&rawName, &storeItemCode, &receiptDescription, &storeID)
+	).Scan(&rawName, &storeItemCode, &receiptDescription, &lineUPC, &storeID)
 	if err == sql.ErrNoRows {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "line item not found"})
 	}
@@ -129,23 +131,33 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update line item"})
 	}
 
-	// Create product_alias from raw_name -> product.
-	normalized := matcher.Normalize(rawName)
-	var aliasExists int
-	if err := tx.QueryRow(
-		"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-		req.ProductID, normalized,
-	).Scan(&aliasExists); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	conf := 1.0
+	if err := matcher.UpsertAlias(c.Request().Context(), tx, matcher.AliasUpsert{
+		HouseholdID: householdID,
+		ProductID:   req.ProductID,
+		Alias:       rawName,
+		StoreID:     storeID,
+		Source:      matcher.AliasSourceManualMatch,
+		Confidence:  &conf,
+		AcceptedAt:  &now,
+		CreatedAt:   now,
+	}); err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create alias"})
 	}
-	if aliasExists == 0 {
-		_, err = tx.Exec(
-			"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
-			uuid.New().String(), req.ProductID, normalized, storeID, now,
-		)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create alias"})
-		}
+
+	if obs, _, err := gtinObservation(ptrStringValue(lineUPC), "manual", nil); err == nil && obs != nil {
+		_ = identifiers.InsertLineItemObservation(c.Request().Context(), tx, lineItemID, *obs)
+		_ = identifiers.UpsertProductIdentifier(c.Request().Context(), tx, identifiers.ProductIdentifier{
+			HouseholdID:       householdID,
+			ProductID:         req.ProductID,
+			Kind:              obs.Kind,
+			Authority:         obs.Authority,
+			Value:             obs.RawValue,
+			NormalizedValue:   obs.NormalizedValue,
+			Source:            "user_accept",
+			Confidence:        &conf,
+			SetPrimaryProduct: true,
+		})
 	}
 
 	if storeID != nil && storeItemCode != nil && strings.TrimSpace(*storeItemCode) != "" {
@@ -163,7 +175,7 @@ func (h *MatchingHandler) ManualMatch(c echo.Context) error {
 		_, err = tx.Exec(
 			`INSERT INTO matching_rules (id, household_id, priority, condition_op, condition_val, store_id, product_id, created_at)
 			 VALUES (?, ?, 0, 'exact', ?, ?, ?, ?)`,
-			uuid.New().String(), householdID, normalized, storeID, req.ProductID, now,
+			uuid.New().String(), householdID, matcher.Normalize(rawName), storeID, req.ProductID, now,
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create rule"})

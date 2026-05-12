@@ -413,23 +413,16 @@ func commitGroup(
 				slog.Warn("spreadsheet commit: backfill failed", "product_id", *productID, "err", err)
 			}
 
-			normalized := matcher.Normalize(rawName)
-
-			var aliasExists int
-			if err := tx.QueryRowContext(ctx,
-				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-				*productID, normalized,
-			).Scan(&aliasExists); err != nil {
-				return "", nil, 0, 0, fmt.Errorf("check alias: %w", err)
-			}
-			if aliasExists == 0 {
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO product_aliases (id, product_id, alias, store_id, created_at)
-					 VALUES (?, ?, ?, ?, ?)`,
-					uuid.New().String(), *productID, normalized, storeID, now,
-				); err != nil {
-					return "", nil, 0, 0, fmt.Errorf("insert alias: %w", err)
-				}
+			if err := matcher.UpsertAlias(ctx, tx, matcher.AliasUpsert{
+				HouseholdID: in.HouseholdID,
+				ProductID:   *productID,
+				Alias:       rawName,
+				StoreID:     &storeID,
+				Source:      matcher.AliasSourceImport,
+				Confidence:  confidence,
+				CreatedAt:   now,
+			}); err != nil {
+				slog.Warn("spreadsheet commit: alias upsert skipped", "product_id", *productID, "err", err)
 			}
 
 			if err := prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID); err != nil {

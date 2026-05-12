@@ -513,10 +513,32 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
   )
 }
 
+function aliasSourceLabel(source?: string | null): string {
+  switch (source) {
+    case 'receipt_match':
+      return 'Receipt'
+    case 'manual_match':
+      return 'Accepted'
+    case 'user_alias':
+      return 'Manual'
+    case 'import':
+      return 'Import'
+    case 'enrichment':
+      return 'Enriched'
+    case 'legacy':
+      return 'Legacy'
+    default:
+      return 'Alias'
+  }
+}
+
 function AliasChip({ alias, storeName, onDelete }: { alias: ProductAlias; storeName: string | null; onDelete: () => void }) {
   return (
     <span className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-50 rounded-xl text-caption text-neutral-600">
       &quot;{alias.alias}&quot;
+      <Badge variant={alias.source === 'user_alias' || alias.source === 'manual_match' ? 'success' : 'neutral'}>
+        {aliasSourceLabel(alias.source)}
+      </Badge>
       {storeName && (
         <Badge variant="neutral">{storeName}</Badge>
       )}

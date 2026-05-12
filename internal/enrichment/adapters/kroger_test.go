@@ -14,7 +14,7 @@ func TestKrogerParseExtractsIdentityPackAndNutrition(t *testing.T) {
 		t.Fatalf("read fixture: %v", err)
 	}
 
-	suggestions := Parse("https://www.kroger.com/p/example/0001111008400", enrichment.VisibleText(raw))
+	suggestions := Parse("https://www.kroger.com/p/example/0001111008404", enrichment.VisibleText(raw))
 	fields := map[string]string{}
 	for _, s := range suggestions {
 		fields[s.Field] = s.Value
@@ -28,7 +28,7 @@ func TestKrogerParseExtractsIdentityPackAndNutrition(t *testing.T) {
 	}
 	assertField("name", "Mission Carb Balance Soft Taco Flour Tortillas")
 	assertField("brand", "Mission")
-	assertField("upc", "0001111008400")
+	assertField("upc", "0001111008404")
 	assertField("pack_quantity", "12")
 	assertField("pack_unit", "oz")
 	assertField("calories", "70")

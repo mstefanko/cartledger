@@ -23,11 +23,13 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/receiptline"
+	receiptfingerprint "github.com/mstefanko/cartledger/internal/receipts"
 	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/storecodes"
 	"github.com/mstefanko/cartledger/internal/upc"
@@ -93,6 +95,13 @@ type createLineItemsRequest struct {
 type createLineItemsResponse struct {
 	CreatedCount int    `json:"created_count"`
 	Status       string `json:"status"`
+}
+
+type identifierWarningResponse struct {
+	LineItemID        string  `json:"line_item_id,omitempty"`
+	Code              string  `json:"code"`
+	Message           string  `json:"message"`
+	ExistingProductID *string `json:"existing_product_id,omitempty"`
 }
 
 type repairPreviewRequest struct {
@@ -166,31 +175,51 @@ type receiptImageResponse struct {
 	URL  string `json:"url"`
 }
 
+type receiptDuplicateCandidateResponse struct {
+	ID              string   `json:"id"`
+	ReceiptID       string   `json:"receipt_id"`
+	CandidateID     string   `json:"candidate_id"`
+	CandidateStatus *string  `json:"candidate_status,omitempty"`
+	Kind            string   `json:"kind"`
+	Confidence      *float64 `json:"confidence,omitempty"`
+	Status          string   `json:"status"`
+	EvidenceJSON    *string  `json:"evidence_json,omitempty"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
+}
+
 type receiptDetailResponse struct {
-	ID                 string                   `json:"id"`
-	HouseholdID        string                   `json:"household_id"`
-	StoreID            *string                  `json:"store_id,omitempty"`
-	StoreName          *string                  `json:"store_name,omitempty"`
-	ScannedBy          *string                  `json:"scanned_by,omitempty"`
-	ReceiptDate        string                   `json:"receipt_date"`
-	Subtotal           *string                  `json:"subtotal,omitempty"`
-	Tax                *string                  `json:"tax,omitempty"`
-	Total              *string                  `json:"total,omitempty"`
-	Status             string                   `json:"status"`
-	LLMProvider        *string                  `json:"llm_provider,omitempty"`
-	CardType           *string                  `json:"card_type,omitempty"`
-	CardLast4          *string                  `json:"card_last4,omitempty"`
-	ReceiptTime        *string                  `json:"receipt_time,omitempty"`
-	ItemsSoldCount     *int                     `json:"items_sold_count,omitempty"`
-	AccountedItemCount string                   `json:"accounted_item_count"`
-	ImagePaths         *string                  `json:"image_paths,omitempty"`
-	RawLLMJSON         *string                  `json:"raw_llm_json,omitempty"`
-	CreatedAt          string                   `json:"created_at"`
-	ErrorMessage       *string                  `json:"error_message,omitempty"`
-	Warnings           []receiptWarningResponse `json:"warnings"`
-	Images             []receiptImageResponse   `json:"images"`
-	CanReprocess       bool                     `json:"can_reprocess"`
-	LineItems          []lineItemResponse       `json:"line_items"`
+	ID                  string                              `json:"id"`
+	HouseholdID         string                              `json:"household_id"`
+	StoreID             *string                             `json:"store_id,omitempty"`
+	StoreName           *string                             `json:"store_name,omitempty"`
+	ScannedBy           *string                             `json:"scanned_by,omitempty"`
+	ReceiptDate         string                              `json:"receipt_date"`
+	Subtotal            *string                             `json:"subtotal,omitempty"`
+	Tax                 *string                             `json:"tax,omitempty"`
+	Total               *string                             `json:"total,omitempty"`
+	Status              string                              `json:"status"`
+	LLMProvider         *string                             `json:"llm_provider,omitempty"`
+	CardType            *string                             `json:"card_type,omitempty"`
+	CardLast4           *string                             `json:"card_last4,omitempty"`
+	ReceiptTime         *string                             `json:"receipt_time,omitempty"`
+	ItemsSoldCount      *int                                `json:"items_sold_count,omitempty"`
+	AccountedItemCount  string                              `json:"accounted_item_count"`
+	ImagePaths          *string                             `json:"image_paths,omitempty"`
+	RawLLMJSON          *string                             `json:"raw_llm_json,omitempty"`
+	CreatedAt           string                              `json:"created_at"`
+	ErrorMessage        *string                             `json:"error_message,omitempty"`
+	Warnings            []receiptWarningResponse            `json:"warnings"`
+	Images              []receiptImageResponse              `json:"images"`
+	DuplicateCandidates []receiptDuplicateCandidateResponse `json:"duplicate_candidates"`
+	CanReprocess        bool                                `json:"can_reprocess"`
+	LineItems           []lineItemResponse                  `json:"line_items"`
+}
+
+type scanReceiptResponse struct {
+	ID                  string `json:"id"`
+	Status              string `json:"status"`
+	DuplicateCandidates int    `json:"duplicate_candidates,omitempty"`
 }
 
 const (
@@ -351,6 +380,11 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	}
 
 	imagePathsStr := strings.Join(imagePaths, ",")
+	pageHashes := make([]string, 0, len(savedImages))
+	for _, img := range savedImages {
+		pageHashes = append(pageHashes, img.sha256)
+	}
+	sourceFingerprint := receiptfingerprint.SourceFingerprint(pageHashes)
 
 	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
 	if err != nil {
@@ -360,9 +394,9 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 	defer tx.Rollback()
 
 	_, err = tx.ExecContext(c.Request().Context(),
-		`INSERT INTO receipts (id, household_id, scanned_by, receipt_date, image_paths, status, created_at)
-		 VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
-		receiptID, householdID, userID, now, imagePathsStr, now,
+		`INSERT INTO receipts (id, household_id, scanned_by, receipt_date, image_paths, source_fingerprint, status, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+		receiptID, householdID, userID, now, imagePathsStr, nullableTrimmedString(sourceFingerprint), now,
 	)
 	if err != nil {
 		_ = localStore.DeleteReceipt(receiptID)
@@ -383,6 +417,15 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to record image metadata"})
 		}
 	}
+	duplicateCandidates := 0
+	if sourceFingerprint != "" {
+		count, err := insertDuplicateCandidates(c.Request().Context(), tx, householdID, receiptID, sourceFingerprint)
+		if err != nil {
+			slog.Warn("receipt scan duplicate candidate insert failed", "receipt_id", receiptID, "err", err)
+		} else {
+			duplicateCandidates = count
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		_ = localStore.DeleteReceipt(receiptID)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create receipt"})
@@ -396,9 +439,10 @@ func (h *ReceiptHandler) Scan(c echo.Context) error {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "server busy, please try again later"})
 	}
 
-	return c.JSON(http.StatusAccepted, map[string]string{
-		"id":     receiptID,
-		"status": "pending",
+	return c.JSON(http.StatusAccepted, scanReceiptResponse{
+		ID:                  receiptID,
+		Status:              "pending",
+		DuplicateCandidates: duplicateCandidates,
 	})
 }
 
@@ -445,6 +489,58 @@ func allReceiptPageSourcesPhoto(sources []string) bool {
 		}
 	}
 	return true
+}
+
+func insertDuplicateCandidates(ctx context.Context, tx *sql.Tx, householdID, receiptID, fingerprint string) (int, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, status
+		   FROM receipts
+		  WHERE household_id = ?
+		    AND id != ?
+		    AND source_fingerprint = ?`,
+		householdID, receiptID, fingerprint,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		id     string
+		status string
+	}
+	candidates := make([]candidate, 0)
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.status); err != nil {
+			return 0, err
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	inserted := 0
+	for _, c := range candidates {
+		evidence, _ := json.Marshal(map[string]string{
+			"source_fingerprint": fingerprint,
+			"candidate_status":   c.status,
+		})
+		res, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO receipt_duplicate_candidates
+			    (household_id, receipt_id, candidate_id, kind, confidence, status, evidence_json, created_at, updated_at)
+			 VALUES (?, ?, ?, 'exact_image', 1.0, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			householdID, receiptID, c.id, string(evidence),
+		)
+		if err != nil {
+			return inserted, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			inserted++
+		}
+	}
+	return inserted, nil
 }
 
 // CreateManual handles manually-entered receipts (no image, no LLM).
@@ -585,6 +681,14 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 		if parsed.ReceiptDescription != "" {
 			receiptDescription = &parsed.ReceiptDescription
 		}
+		obs, itemUPC, err := gtinObservation(ptrStringValue(it.UPC), "manual", nil)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("items[%d].%s", i, err.Error())})
+		}
+		identifierObservations := []identifiers.Observation{}
+		if obs != nil {
+			identifierObservations = append(identifierObservations, *obs)
+		}
 
 		var productID *string
 		matched := "unmatched"
@@ -595,9 +699,15 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			productID = it.ProductID
 			matched = "manual"
 		} else {
-			result := engine.MatchWithCodeAndSuggestion(it.RawName, storeItemCode, "", storeIDArg, householdID)
+			result := engine.MatchInput(c.Request().Context(), matcher.Input{
+				RawName:       it.RawName,
+				StoreItemCode: storeItemCode,
+				StoreID:       storeIDArg,
+				HouseholdID:   householdID,
+				Identifiers:   identifierObservations,
+			})
 			switch result.Method {
-			case "code", "rule", "alias", "fuzzy":
+			case "identifier", "code", "rule", "alias", "fuzzy":
 				if result.ProductID != "" {
 					pid := result.ProductID
 					productID = &pid
@@ -618,14 +728,6 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 			quantity = *it.Quantity
 		}
 		countContribution := receiptline.CountContribution(decimal.RequireFromString(quantity), it.Unit)
-		normalizedUPC, err := upc.Normalize(ptrStringValue(it.UPC))
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("items[%d].%s", i, err.Error())})
-		}
-		var itemUPC *string
-		if normalizedUPC != "" {
-			itemUPC = &normalizedUPC
-		}
 
 		_, err = tx.ExecContext(c.Request().Context(), `
 			INSERT INTO line_items
@@ -643,20 +745,19 @@ func (h *ReceiptHandler) CreateManual(c echo.Context) error {
 				"error": fmt.Sprintf("failed to insert item %d: %v", i, err),
 			})
 		}
+		if err := insertLineIdentifierObservation(c.Request().Context(), tx, itemID, obs); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to record identifier observation"})
+		}
 
 		if productID != nil && req.StoreID != nil && strings.TrimSpace(*req.StoreID) != "" {
-			normalized := matcher.Normalize(it.RawName)
-			var aliasExists int
-			_ = tx.QueryRowContext(c.Request().Context(),
-				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-				*productID, normalized,
-			).Scan(&aliasExists)
-			if aliasExists == 0 {
-				_, _ = tx.ExecContext(c.Request().Context(),
-					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
-					uuid.New().String(), *productID, normalized, *req.StoreID, now,
-				)
+			aliasSource := matcher.AliasSourceReceiptMatch
+			var acceptedAt *time.Time
+			if matched == "manual" {
+				aliasSource = matcher.AliasSourceManualMatch
+				acceptedAt = &now
 			}
+			upsertAliasBestEffort(c.Request().Context(), tx, householdID, *productID, it.RawName, req.StoreID, aliasSource, confidence, acceptedAt, now)
+			attachLineIdentifierBestEffort(c.Request().Context(), tx, householdID, *productID, obs, "line_item", 0.9)
 			if storeItemCode != "" {
 				if matched == "manual" {
 					if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *req.StoreID, *productID, storeItemCode, receiptDescription, now); err != nil {
@@ -1011,8 +1112,49 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 			resp.ImagePaths = nil
 		}
 	}
+	duplicates, err := h.duplicateCandidatesForReceipt(c.Request().Context(), householdID, receiptID)
+	if err != nil {
+		slog.Warn("receipts: load duplicate candidates failed", "receipt_id", receiptID, "err", err)
+	} else {
+		resp.DuplicateCandidates = duplicates
+	}
 
 	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *ReceiptHandler) duplicateCandidatesForReceipt(ctx context.Context, householdID, receiptID string) ([]receiptDuplicateCandidateResponse, error) {
+	rows, err := h.DB.QueryContext(ctx,
+		`SELECT rdc.id, rdc.receipt_id, rdc.candidate_id, cr.status,
+		        rdc.kind, rdc.confidence, rdc.status, rdc.evidence_json,
+		        rdc.created_at, rdc.updated_at
+		   FROM receipt_duplicate_candidates rdc
+		   LEFT JOIN receipts cr ON cr.id = rdc.candidate_id
+		  WHERE rdc.household_id = ?
+		    AND rdc.receipt_id = ?
+		    AND rdc.status = 'pending'
+		  ORDER BY rdc.created_at`,
+		householdID, receiptID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]receiptDuplicateCandidateResponse, 0)
+	for rows.Next() {
+		var r receiptDuplicateCandidateResponse
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(
+			&r.ID, &r.ReceiptID, &r.CandidateID, &r.CandidateStatus,
+			&r.Kind, &r.Confidence, &r.Status, &r.EvidenceJSON,
+			&createdAt, &updatedAt,
+		); err != nil {
+			return nil, err
+		}
+		r.CreatedAt = createdAt.Format(time.RFC3339)
+		r.UpdatedAt = updatedAt.Format(time.RFC3339)
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func (h *ReceiptHandler) receiptImagesForResponse(ctx context.Context, receiptID string) ([]receiptImageResponse, bool, string, error) {
@@ -1191,13 +1333,13 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
-	itemUPC, err := upc.Normalize(strings.TrimSpace(ptrStringValue(req.UPC)))
+	obs, itemUPCPtr, err := gtinObservation(strings.TrimSpace(ptrStringValue(req.UPC)), "manual", nil)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
-	var itemUPCPtr *string
-	if itemUPC != "" {
-		itemUPCPtr = &itemUPC
+	identifierObservations := []identifiers.Observation{}
+	if obs != nil {
+		identifierObservations = append(identifierObservations, *obs)
 	}
 
 	var storeID *string
@@ -1248,9 +1390,15 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 		productID = req.ProductID
 		matched = "manual"
 	} else {
-		result := matcher.NewEngine(h.DB).MatchWithCodeAndSuggestion(req.RawName, storeItemCode, "", storeIDArg, householdID)
+		result := matcher.NewEngine(h.DB).MatchInput(c.Request().Context(), matcher.Input{
+			RawName:       req.RawName,
+			StoreItemCode: storeItemCode,
+			StoreID:       storeIDArg,
+			HouseholdID:   householdID,
+			Identifiers:   identifierObservations,
+		})
 		switch result.Method {
-		case "code", "rule", "alias", "fuzzy":
+		case "identifier", "code", "rule", "alias", "fuzzy":
 			if result.ProductID != "" {
 				pid := result.ProductID
 				productID = &pid
@@ -1293,20 +1441,19 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
 	}
+	if err := insertLineIdentifierObservation(c.Request().Context(), tx, itemID, obs); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to record identifier observation"})
+	}
 
 	if productID != nil && storeID != nil {
-		normalized := matcher.Normalize(req.RawName)
-		var aliasExists int
-		_ = tx.QueryRow(
-			"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-			*productID, normalized,
-		).Scan(&aliasExists)
-		if aliasExists == 0 {
-			_, _ = tx.Exec(
-				"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
-				uuid.New().String(), *productID, normalized, *storeID, now,
-			)
+		aliasSource := matcher.AliasSourceReceiptMatch
+		var acceptedAt *time.Time
+		if matched == "manual" {
+			aliasSource = matcher.AliasSourceManualMatch
+			acceptedAt = &now
 		}
+		upsertAliasBestEffort(c.Request().Context(), tx, householdID, *productID, req.RawName, storeID, aliasSource, confidence, acceptedAt, now)
+		attachLineIdentifierBestEffort(c.Request().Context(), tx, householdID, *productID, obs, "line_item", 0.9)
 		if storeItemCode != "" {
 			if matched == "manual" {
 				if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, *productID, storeItemCode, receiptDescription, now); err != nil {
@@ -1334,19 +1481,20 @@ func (h *ReceiptHandler) CreateLineItem(c echo.Context) error {
 }
 
 type parsedManualLineItem struct {
-	rawName              string
-	storeItemCode        *string
-	receiptDescription   *string
-	upc                  *string
-	productID            *string
-	quantity             decimal.Decimal
-	unit                 *string
-	unitPrice            *string
-	totalPrice           decimal.Decimal
-	countContribution    decimal.Decimal
-	packQuantityOverride *string
-	packUnitOverride     *string
-	packOverrideSource   *string
+	rawName               string
+	storeItemCode         *string
+	receiptDescription    *string
+	upc                   *string
+	identifierObservation *identifiers.Observation
+	productID             *string
+	quantity              decimal.Decimal
+	unit                  *string
+	unitPrice             *string
+	totalPrice            decimal.Decimal
+	countContribution     decimal.Decimal
+	packQuantityOverride  *string
+	packUnitOverride      *string
+	packOverrideSource    *string
 }
 
 // CreateLineItems adds multiple manually-entered line items to an existing receipt.
@@ -1429,9 +1577,19 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 		if productID != nil {
 			matched = "manual"
 		} else {
-			result := engine.MatchWithCodeAndSuggestion(item.rawName, ptrStringValue(item.storeItemCode), "", storeIDArg, householdID)
+			identifierObservations := []identifiers.Observation{}
+			if item.identifierObservation != nil {
+				identifierObservations = append(identifierObservations, *item.identifierObservation)
+			}
+			result := engine.MatchInput(c.Request().Context(), matcher.Input{
+				RawName:       item.rawName,
+				StoreItemCode: ptrStringValue(item.storeItemCode),
+				StoreID:       storeIDArg,
+				HouseholdID:   householdID,
+				Identifiers:   identifierObservations,
+			})
 			switch result.Method {
-			case "code", "rule", "alias", "fuzzy":
+			case "identifier", "code", "rule", "alias", "fuzzy":
 				if result.ProductID != "" {
 					pid := result.ProductID
 					productID = &pid
@@ -1456,22 +1614,19 @@ func (h *ReceiptHandler) CreateLineItems(c echo.Context) error {
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to insert line item"})
 		}
+		if err := insertLineIdentifierObservation(c.Request().Context(), tx, itemID, item.identifierObservation); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to record identifier observation"})
+		}
 
 		if productID != nil && storeID != nil {
-			normalized := matcher.Normalize(item.rawName)
-			var aliasExists int
-			_ = tx.QueryRowContext(
-				c.Request().Context(),
-				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-				*productID, normalized,
-			).Scan(&aliasExists)
-			if aliasExists == 0 {
-				_, _ = tx.ExecContext(
-					c.Request().Context(),
-					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
-					uuid.New().String(), *productID, normalized, *storeID, now,
-				)
+			aliasSource := matcher.AliasSourceReceiptMatch
+			var acceptedAt *time.Time
+			if matched == "manual" {
+				aliasSource = matcher.AliasSourceManualMatch
+				acceptedAt = &now
 			}
+			upsertAliasBestEffort(c.Request().Context(), tx, householdID, *productID, item.rawName, storeID, aliasSource, confidence, acceptedAt, now)
+			attachLineIdentifierBestEffort(c.Request().Context(), tx, householdID, *productID, item.identifierObservation, "line_item", 0.9)
 			if code := ptrStringValue(item.storeItemCode); code != "" {
 				if matched == "manual" {
 					if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, *productID, code, item.receiptDescription, now); err != nil {
@@ -1564,13 +1719,9 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 	if err != nil {
 		return parsedManualLineItem{}, err
 	}
-	normalizedUPC, err := upc.Normalize(ptrStringValue(item.UPC))
+	obs, itemUPC, err := gtinObservation(ptrStringValue(item.UPC), "manual", nil)
 	if err != nil {
 		return parsedManualLineItem{}, err
-	}
-	var itemUPC *string
-	if normalizedUPC != "" {
-		itemUPC = &normalizedUPC
 	}
 	parsedLine := matcher.ParseLine(rawName, chain)
 	storeItemCode := storecodes.Normalize(parsedLine.StoreItemCode)
@@ -1583,19 +1734,20 @@ func (h *ReceiptHandler) parseManualLineItem(item manualLineItemRequest, househo
 		receiptDescription = &parsedLine.ReceiptDescription
 	}
 	return parsedManualLineItem{
-		rawName:              rawName,
-		storeItemCode:        storeItemCodePtr,
-		receiptDescription:   receiptDescription,
-		upc:                  itemUPC,
-		productID:            productID,
-		quantity:             quantity,
-		unit:                 unit,
-		unitPrice:            unitPrice,
-		totalPrice:           totalPrice,
-		countContribution:    receiptline.CountContribution(quantity, unit),
-		packQuantityOverride: packQuantityOverride,
-		packUnitOverride:     packUnitOverride,
-		packOverrideSource:   packOverrideSource,
+		rawName:               rawName,
+		storeItemCode:         storeItemCodePtr,
+		receiptDescription:    receiptDescription,
+		upc:                   itemUPC,
+		identifierObservation: obs,
+		productID:             productID,
+		quantity:              quantity,
+		unit:                  unit,
+		unitPrice:             unitPrice,
+		totalPrice:            totalPrice,
+		countContribution:     receiptline.CountContribution(quantity, unit),
+		packQuantityOverride:  packQuantityOverride,
+		packUnitOverride:      packUnitOverride,
+		packOverrideSource:    packOverrideSource,
 	}, nil
 }
 
@@ -1631,6 +1783,62 @@ func ptrStringValue(value *string) string {
 		return ""
 	}
 	return strings.TrimSpace(*value)
+}
+
+func gtinObservation(raw string, source string, confidence *float64) (*identifiers.Observation, *string, error) {
+	obs, err := identifiers.Normalize(raw, identifiers.KindGTIN, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	if obs.NormalizedValue == "" {
+		return nil, nil, nil
+	}
+	obs.Source = source
+	obs.Confidence = confidence
+	normalized := obs.NormalizedValue
+	return &obs, &normalized, nil
+}
+
+func insertLineIdentifierObservation(ctx context.Context, tx identifiers.DBTX, lineItemID string, obs *identifiers.Observation) error {
+	if obs == nil {
+		return nil
+	}
+	return identifiers.InsertLineItemObservation(ctx, tx, lineItemID, *obs)
+}
+
+func attachLineIdentifierBestEffort(ctx context.Context, tx identifiers.DBTX, householdID, productID string, obs *identifiers.Observation, source string, confidence float64) {
+	if obs == nil || productID == "" {
+		return
+	}
+	conf := confidence
+	if err := identifiers.UpsertProductIdentifier(ctx, tx, identifiers.ProductIdentifier{
+		HouseholdID:       householdID,
+		ProductID:         productID,
+		Kind:              obs.Kind,
+		Authority:         obs.Authority,
+		Value:             obs.RawValue,
+		NormalizedValue:   obs.NormalizedValue,
+		Source:            source,
+		Confidence:        &conf,
+		SetPrimaryProduct: true,
+	}); err != nil {
+		slog.Warn("receipts: attach identifier skipped", "product_id", productID, "identifier", obs.NormalizedValue, "err", err)
+	}
+}
+
+func upsertAliasBestEffort(ctx context.Context, tx matcher.AliasDBTX, householdID, productID, rawName string, storeID *string, source matcher.AliasSource, confidence *float64, acceptedAt *time.Time, createdAt time.Time) {
+	if err := matcher.UpsertAlias(ctx, tx, matcher.AliasUpsert{
+		HouseholdID: householdID,
+		ProductID:   productID,
+		Alias:       rawName,
+		StoreID:     storeID,
+		Source:      source,
+		Confidence:  confidence,
+		AcceptedAt:  acceptedAt,
+		CreatedAt:   createdAt,
+	}); err != nil {
+		slog.Warn("receipts: alias upsert skipped", "product_id", productID, "alias", rawName, "err", err)
+	}
 }
 
 func storeChainFromName(name *string) matcher.Chain {
@@ -1976,6 +2184,13 @@ func insertRepairedLineItem(ctx context.Context, tx *sql.Tx, receiptID, househol
 		suggestedBrand = &item.SuggestedBrand
 	}
 	itemUPC := upc.NormalizePointer(item.UPC)
+	var obs *identifiers.Observation
+	if item.UPC != nil {
+		if parsedObs, normalizedUPC, err := gtinObservation(*item.UPC, "repair", nil); err == nil {
+			obs = parsedObs
+			itemUPC = normalizedUPC
+		}
+	}
 
 	lineItemID := uuid.New().String()
 	_, err := tx.Exec(
@@ -1993,8 +2208,12 @@ func insertRepairedLineItem(ctx context.Context, tx *sql.Tx, receiptID, househol
 	if err != nil {
 		return err
 	}
+	if err := insertLineIdentifierObservation(ctx, tx, lineItemID, obs); err != nil {
+		return err
+	}
 
 	if productID != nil && storeID != nil {
+		attachLineIdentifierBestEffort(ctx, tx, householdID, *productID, obs, "line_item", 0.9)
 		if code := ptrStringValue(item.StoreItemCode); code != "" {
 			if err := storecodes.UpsertReceipt(ctx, tx, householdID, *storeID, *productID, code, item.ReceiptDescription, now); err != nil {
 				return err
@@ -2465,10 +2684,11 @@ type suggestionEditInput struct {
 }
 
 type acceptSuggestionsResponse struct {
-	CreatedCount    int            `json:"created_count"`
-	MatchedCount    int            `json:"matched_count"`
-	ProductsCreated []productBrief `json:"products_created"`
-	ProductsMatched []productBrief `json:"products_matched"`
+	CreatedCount    int                         `json:"created_count"`
+	MatchedCount    int                         `json:"matched_count"`
+	ProductsCreated []productBrief              `json:"products_created"`
+	ProductsMatched []productBrief              `json:"products_matched"`
+	Warnings        []identifierWarningResponse `json:"warnings,omitempty"`
 }
 
 type productBrief struct {
@@ -2523,17 +2743,19 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 		var rawName string
 		var storeItemCode *string
 		var receiptDescription *string
+		var lineUPC *string
 		var suggestedName, suggestedCategory, suggestedProductID, suggestedBrand *string
 		var unit *string
 		err := tx.QueryRow(
 			`SELECT li.raw_name, li.store_item_code, li.receipt_description,
+			        li.upc,
 			        li.suggested_name, li.suggested_category, li.suggested_product_id,
 			        li.unit, li.suggested_brand
 			 FROM line_items li
 			 WHERE li.id = ? AND li.receipt_id = ?`,
 			itemID, receiptID,
 		).Scan(&rawName, &storeItemCode, &receiptDescription,
-			&suggestedName, &suggestedCategory, &suggestedProductID,
+			&lineUPC, &suggestedName, &suggestedCategory, &suggestedProductID,
 			&unit, &suggestedBrand)
 		if err == sql.ErrNoRows {
 			continue // skip invalid IDs
@@ -2597,9 +2819,9 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 						brandPtr = &normalized
 					}
 					_, err = tx.Exec(
-						`INSERT INTO products (id, household_id, name, category, brand, purchase_count, created_at, updated_at)
-						 VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
-						productID, householdID, name, catPtr, brandPtr, now, now,
+						`INSERT INTO products (id, household_id, name, name_normalized, category, brand, purchase_count, created_at, updated_at)
+						 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+						productID, householdID, name, matcher.NormalizeProductName(name), catPtr, brandPtr, now, now,
 					)
 					if err != nil {
 						return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create product"})
@@ -2629,18 +2851,9 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 
 		// Create alias from raw_name -> product.
 		if storeID != nil {
-			normalized := matcher.Normalize(rawName)
-			var aliasExists int
-			_ = tx.QueryRow(
-				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-				productID, normalized,
-			).Scan(&aliasExists)
-			if aliasExists == 0 {
-				_, _ = tx.Exec(
-					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
-					uuid.New().String(), productID, normalized, *storeID, now,
-				)
-			}
+			acceptedAt := now
+			conf := 1.0
+			upsertAliasBestEffort(c.Request().Context(), tx, householdID, productID, rawName, storeID, matcher.AliasSourceManualMatch, &conf, &acceptedAt, now)
 
 			if storeItemCode != nil && strings.TrimSpace(*storeItemCode) != "" {
 				if err := storecodes.UpsertManual(c.Request().Context(), tx, householdID, *storeID, productID, *storeItemCode, receiptDescription, now); err != nil {
@@ -2650,6 +2863,32 @@ func (h *ReceiptHandler) AcceptSuggestions(c echo.Context) error {
 
 			if err := prices.RecordProductPriceFromLineItem(c.Request().Context(), tx, itemID); err != nil {
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create price record"})
+			}
+		}
+		if obs, _, err := gtinObservation(ptrStringValue(lineUPC), "manual", nil); err == nil && obs != nil {
+			conf := 0.95
+			err := identifiers.UpsertProductIdentifier(c.Request().Context(), tx, identifiers.ProductIdentifier{
+				HouseholdID:       householdID,
+				ProductID:         productID,
+				Kind:              obs.Kind,
+				Authority:         obs.Authority,
+				Value:             obs.RawValue,
+				NormalizedValue:   obs.NormalizedValue,
+				Source:            "user_accept",
+				Confidence:        &conf,
+				SetPrimaryProduct: true,
+			})
+			if err != nil {
+				var conflict *identifiers.IdentifierConflictError
+				warning := identifierWarningResponse{
+					LineItemID: itemID,
+					Code:       "identifier_conflict",
+					Message:    "UPC already belongs to another product; the line was matched without moving the UPC.",
+				}
+				if errors.As(err, &conflict) && conflict.ExistingProductID != "" {
+					warning.ExistingProductID = &conflict.ExistingProductID
+				}
+				resp.Warnings = append(resp.Warnings, warning)
 			}
 		}
 

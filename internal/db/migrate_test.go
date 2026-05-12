@@ -30,6 +30,8 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"product_images", "product_links", "receipt_images",
 		"store_product_codes",
 		"product_nutrition", "product_enrichment_suggestions",
+		"product_identifiers", "line_item_identifier_observations",
+		"receipt_duplicate_candidates",
 		"products_fts", "product_aliases_fts",
 		"product_groups",
 	}
@@ -60,15 +62,23 @@ func TestMigrationsUpAndDown(t *testing.T) {
 
 	// Verify indexes exist.
 	indexes := []string{
-		"idx_alias_global", "idx_alias_store",
+		"idx_alias_global_household_norm", "idx_alias_store_household_norm",
+		"idx_products_household_name_normalized", "idx_product_aliases_household_alias_normalized",
 		"idx_line_items_receipt", "idx_line_items_product",
 		"idx_line_items_store_item_code", "idx_line_items_upc",
 		"idx_products_household_upc",
+		"idx_product_identifiers_household_kind_authority_value",
+		"idx_product_identifiers_product", "idx_product_identifiers_lookup",
+		"idx_line_item_identifier_observations_line", "idx_line_item_identifier_observations_lookup",
 		"idx_product_prices_product", "idx_product_prices_store",
 		"idx_product_prices_line_item",
+		"idx_unit_conversions_product", "idx_unit_conversions_group", "idx_unit_conversions_household",
+		"idx_unit_conversions_product_unique", "idx_unit_conversions_group_unique", "idx_unit_conversions_household_unique",
 		"idx_store_product_codes_product", "idx_store_product_codes_household_store",
 		"idx_product_aliases_alias",
 		"idx_receipts_store", "idx_receipts_date",
+		"idx_receipts_household_source_fingerprint",
+		"idx_receipt_duplicate_candidates_household_status", "idx_receipt_duplicate_candidates_receipt",
 		"idx_matching_rules_priority",
 		"idx_product_images_product",
 		"idx_receipt_images_receipt", "idx_receipt_images_active",

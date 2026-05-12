@@ -68,7 +68,12 @@ export interface ProductAlias {
   id: string
   product_id: string
   alias: string
+  alias_normalized?: string | null
   store_id: string | null
+  source: 'legacy' | 'receipt_match' | 'manual_match' | 'user_alias' | 'import' | 'enrichment'
+  confidence?: number | null
+  accepted_at?: string | null
+  updated_at?: string | null
   created_at: string
 }
 
@@ -118,6 +123,7 @@ export interface Receipt {
   accounted_item_count?: string
   warnings?: ReceiptWarning[]
   images?: ReceiptImage[]
+  duplicate_candidates?: ReceiptDuplicateCandidate[]
   can_reprocess?: boolean
   created_at: string
   // Populated when status='error' — the worker's most recent failure reason.
@@ -129,6 +135,19 @@ export interface ReceiptImage {
   kind: 'original' | 'processed'
   page: number
   url: string
+}
+
+export interface ReceiptDuplicateCandidate {
+  id: string
+  receipt_id: string
+  candidate_id: string
+  candidate_status?: string | null
+  kind: 'exact_image'
+  confidence?: number | null
+  status: 'pending' | 'dismissed' | 'confirmed'
+  evidence_json?: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface LineItem {
@@ -147,7 +166,7 @@ export interface LineItem {
   unit: string | null
   unit_price: string | null
   total_price: string
-  matched: 'unmatched' | 'auto' | 'manual' | 'rule' | 'alias' | 'fuzzy' | 'code'
+  matched: 'unmatched' | 'auto' | 'manual' | 'rule' | 'alias' | 'fuzzy' | 'code' | 'identifier'
   review_status: 'pending' | 'accepted'
   confidence: number | null
   regular_price: string | null
@@ -183,6 +202,7 @@ export interface AcceptSuggestionsResponse {
   matched_count: number
   products_created: { id: string; name: string }[]
   products_matched: { id: string; name: string }[]
+  warnings?: { line_item_id?: string; code: string; message: string; existing_product_id?: string | null }[]
 }
 
 export interface ProductPrice {
@@ -230,6 +250,8 @@ export interface ShoppingListItem {
 export interface UnitConversion {
   id: string
   product_id: string | null
+  household_id?: string | null
+  product_group_id?: string | null
   from_unit: string
   to_unit: string
   factor: string
@@ -314,6 +336,9 @@ export interface GroupMember {
   pack_unit?: string
   latest_price?: string
   price_per_unit?: string
+  normalized_price?: string
+  normalized_unit?: string
+  price_basis?: 'normalized' | 'raw' | 'missing_package'
   receipt_date?: string
 }
 
@@ -589,6 +614,9 @@ export interface ListItemWithPrice {
   product_group_id: string | null
   product_group_name: string | null
   cheapest_product_id: string | null
+  cheapest_normalized_price?: string | null
+  cheapest_normalized_unit?: string | null
+  price_basis?: 'normalized' | 'raw' | 'missing_package' | null
   assigned_store_id: string | null
   assigned_store_name: string | null
   assigned_store_price: string | null

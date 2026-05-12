@@ -9,13 +9,19 @@ import type {
 } from '@/types'
 import type { ReceiptUploadPage } from '@/lib/receiptUpload'
 
-export async function scanReceipt(pages: ReceiptUploadPage[]): Promise<Receipt> {
+export interface ScanReceiptResponse {
+  id: string
+  status: Receipt['status']
+  duplicate_candidates?: number
+}
+
+export async function scanReceipt(pages: ReceiptUploadPage[]): Promise<ScanReceiptResponse> {
   const formData = new FormData()
   for (const page of pages) {
     formData.append('images', page.file)
   }
   formData.append('page_sources', JSON.stringify(pages.map((page) => page.source)))
-  return postMultipart<Receipt>('/receipts/scan', formData)
+  return postMultipart<ScanReceiptResponse>('/receipts/scan', formData)
 }
 
 export async function listReceipts(): Promise<Receipt[]> {

@@ -43,8 +43,8 @@ type createListRequest struct {
 }
 
 type updateListRequest struct {
-	Name            *string `json:"name,omitempty"`
-	Status          *string `json:"status,omitempty"`
+	Name             *string `json:"name,omitempty"`
+	Status           *string `json:"status,omitempty"`
 	PreferredStoreID *string `json:"preferred_store_id"`
 }
 
@@ -108,27 +108,30 @@ type listDetailResponse struct {
 }
 
 type listItemResponse struct {
-	ID             string  `json:"id"`
-	ListID         string  `json:"list_id"`
-	ProductID      *string `json:"product_id,omitempty"`
-	ProductName    *string `json:"product_name,omitempty"`
-	Name           string  `json:"name"`
-	Quantity       string  `json:"quantity"`
-	Unit           *string `json:"unit,omitempty"`
-	Checked        bool    `json:"checked"`
-	CheckedBy      *string `json:"checked_by,omitempty"`
-	SortOrder      int     `json:"sort_order"`
-	Notes          *string `json:"notes,omitempty"`
-	EstimatedPrice    *string `json:"estimated_price,omitempty"`
-	CheapestStore     *string `json:"cheapest_store,omitempty"`
-	CheapestPrice     *string `json:"cheapest_price,omitempty"`
-	ProductGroupID    *string `json:"product_group_id,omitempty"`
-	ProductGroupName  *string `json:"product_group_name,omitempty"`
-	CheapestProductID *string `json:"cheapest_product_id,omitempty"`
-	StorePrice        *string `json:"store_price,omitempty"`
-	StorePriceStore   *string `json:"store_price_store,omitempty"`
-	AssignedStoreID   *string `json:"assigned_store_id,omitempty"`
-	AssignedStoreName *string `json:"assigned_store_name,omitempty"`
+	ID                      string  `json:"id"`
+	ListID                  string  `json:"list_id"`
+	ProductID               *string `json:"product_id,omitempty"`
+	ProductName             *string `json:"product_name,omitempty"`
+	Name                    string  `json:"name"`
+	Quantity                string  `json:"quantity"`
+	Unit                    *string `json:"unit,omitempty"`
+	Checked                 bool    `json:"checked"`
+	CheckedBy               *string `json:"checked_by,omitempty"`
+	SortOrder               int     `json:"sort_order"`
+	Notes                   *string `json:"notes,omitempty"`
+	EstimatedPrice          *string `json:"estimated_price,omitempty"`
+	CheapestStore           *string `json:"cheapest_store,omitempty"`
+	CheapestPrice           *string `json:"cheapest_price,omitempty"`
+	ProductGroupID          *string `json:"product_group_id,omitempty"`
+	ProductGroupName        *string `json:"product_group_name,omitempty"`
+	CheapestProductID       *string `json:"cheapest_product_id,omitempty"`
+	CheapestNormalizedPrice *string `json:"cheapest_normalized_price,omitempty"`
+	CheapestNormalizedUnit  *string `json:"cheapest_normalized_unit,omitempty"`
+	PriceBasis              *string `json:"price_basis,omitempty"`
+	StorePrice              *string `json:"store_price,omitempty"`
+	StorePriceStore         *string `json:"store_price_store,omitempty"`
+	AssignedStoreID         *string `json:"assigned_store_id,omitempty"`
+	AssignedStoreName       *string `json:"assigned_store_name,omitempty"`
 	// AssignedStorePrice is the latest unit_price at the per-row assigned_store_id
 	// (not the list-level preferred_store_id). Nil when the assigned store has no
 	// price history for this product/group — used by the UI to show a neutral
@@ -136,7 +139,7 @@ type listItemResponse struct {
 	AssignedStorePrice *string `json:"assigned_store_price,omitempty"`
 	// StoreHistoryCount is the number of distinct stores with any price history
 	// for this product/group. Zero when no history anywhere.
-	StoreHistoryCount int    `json:"store_history_count"`
+	StoreHistoryCount int `json:"store_history_count"`
 	// StorageZone classifies the item for shopping-list grouping: produce, cold,
 	// frozen, or other. Derived from the product's category (or the most-recent
 	// line_items.suggested_category fallback) via models.CategoryToZone.
@@ -231,15 +234,15 @@ func (h *ListHandler) Create(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusCreated, listSummaryResponse{
-		ID:          id,
-		HouseholdID: householdID,
-		Name:        req.Name,
-		CreatedBy:   &userID,
-		Status:      "active",
-		ItemCount:   0,
+		ID:           id,
+		HouseholdID:  householdID,
+		Name:         req.Name,
+		CreatedBy:    &userID,
+		Status:       "active",
+		ItemCount:    0,
 		CheckedCount: 0,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	})
 }
 
@@ -358,10 +361,16 @@ func (h *ListHandler) Get(c echo.Context) error {
 
 		cheapestRows, err := h.DB.Query(
 			fmt.Sprintf(
-				`SELECT sub.product_id, s.name, sub.unit_price
+				`SELECT sub.product_id, s.name, sub.unit_price, sub.normalized_price, sub.normalized_unit,
+				        CASE WHEN sub.normalized_price IS NOT NULL THEN 'normalized' ELSE 'raw' END AS price_basis
 				 FROM (
-				     SELECT pp.product_id, pp.store_id, pp.unit_price,
-				            ROW_NUMBER() OVER (PARTITION BY pp.product_id ORDER BY pp.unit_price ASC) AS rn
+				     SELECT pp.product_id, pp.store_id, pp.unit_price, pp.normalized_price, pp.normalized_unit,
+				            ROW_NUMBER() OVER (
+				              PARTITION BY pp.product_id
+				              ORDER BY
+				                CASE WHEN pp.normalized_price IS NOT NULL THEN 0 ELSE 1 END,
+				                CAST(COALESCE(pp.normalized_price, pp.unit_price) AS REAL) ASC
+				            ) AS rn
 				     FROM product_prices pp
 				     WHERE pp.product_id IN (%s)
 				       AND pp.receipt_date = (
@@ -377,15 +386,20 @@ func (h *ListHandler) Get(c echo.Context) error {
 		if err == nil {
 			defer cheapestRows.Close()
 			type cheapestInfo struct {
-				StoreName string
-				Price     float64
+				StoreName       string
+				Price           float64
+				NormalizedPrice *float64
+				NormalizedUnit  *string
+				PriceBasis      string
 			}
 			cheapestMap := make(map[string]cheapestInfo)
 			for cheapestRows.Next() {
-				var productID, storeName string
+				var productID, storeName, priceBasis string
 				var price float64
-				if cheapestRows.Scan(&productID, &storeName, &price) == nil {
-					cheapestMap[productID] = cheapestInfo{StoreName: storeName, Price: price}
+				var normalizedPrice *float64
+				var normalizedUnit *string
+				if cheapestRows.Scan(&productID, &storeName, &price, &normalizedPrice, &normalizedUnit, &priceBasis) == nil {
+					cheapestMap[productID] = cheapestInfo{StoreName: storeName, Price: price, NormalizedPrice: normalizedPrice, NormalizedUnit: normalizedUnit, PriceBasis: priceBasis}
 				}
 			}
 
@@ -397,6 +411,12 @@ func (h *ListHandler) Get(c echo.Context) error {
 					resp.Items[i].CheapestStore = &info.StoreName
 					p := fmt.Sprintf("%.2f", info.Price)
 					resp.Items[i].CheapestPrice = &p
+					if info.NormalizedPrice != nil {
+						np := fmt.Sprintf("%.4f", *info.NormalizedPrice)
+						resp.Items[i].CheapestNormalizedPrice = &np
+					}
+					resp.Items[i].CheapestNormalizedUnit = info.NormalizedUnit
+					resp.Items[i].PriceBasis = &info.PriceBasis
 				}
 			}
 		}
@@ -522,24 +542,56 @@ func (h *ListHandler) Get(c echo.Context) error {
 
 	// Batch query: find cheapest product+store for all items with a product_group_id.
 	type groupPriceInfo struct {
-		CheapestStore     string
-		CheapestPrice     string
-		CheapestProductID string
+		CheapestStore           string
+		CheapestPrice           string
+		CheapestProductID       string
+		CheapestNormalizedPrice *string
+		CheapestNormalizedUnit  *string
+		PriceBasis              string
 	}
 	groupPriceMap := map[string]groupPriceInfo{}
 	if len(groupIDs) > 0 {
 		placeholders := strings.Repeat("?,", len(groupIDs))
 		placeholders = placeholders[:len(placeholders)-1]
 		q2 := fmt.Sprintf(`
-			SELECT sub.product_group_id, sub.product_id, s.name, PRINTF('%%.2f', sub.unit_price)
+			SELECT sub.product_group_id, sub.product_id, s.name, PRINTF('%%.2f', sub.unit_price),
+			       CASE WHEN sub.normalized_price IS NOT NULL THEN PRINTF('%%.4f', sub.normalized_price) END,
+			       sub.normalized_unit,
+			       sub.price_basis
 			FROM (
 				SELECT p.product_group_id, pp.product_id, pp.store_id, pp.unit_price,
+				       pp.normalized_price, pp.normalized_unit,
+				       CASE
+				         WHEN pg.comparison_unit IS NOT NULL
+				          AND pp.normalized_unit = pg.comparison_unit
+				          AND pp.normalized_price IS NOT NULL THEN 'normalized'
+				         WHEN pg.comparison_unit IS NULL
+				          AND pp.normalized_price IS NOT NULL THEN 'normalized'
+				         WHEN pg.comparison_unit IS NOT NULL THEN 'missing_package'
+				         ELSE 'raw'
+				       END AS price_basis,
 				       ROW_NUMBER() OVER (
 				           PARTITION BY p.product_group_id
-				           ORDER BY pp.unit_price ASC
+				           ORDER BY
+				             CASE
+				               WHEN pg.comparison_unit IS NOT NULL
+				                AND pp.normalized_unit = pg.comparison_unit
+				                AND pp.normalized_price IS NOT NULL THEN 0
+				               WHEN pg.comparison_unit IS NULL
+				                AND pp.normalized_price IS NOT NULL THEN 0
+				               WHEN pp.normalized_price IS NOT NULL THEN 1
+				               ELSE 2
+				             END,
+				             CAST(CASE
+				               WHEN ((pg.comparison_unit IS NOT NULL AND pp.normalized_unit = pg.comparison_unit)
+				                     OR pg.comparison_unit IS NULL)
+				                AND pp.normalized_price IS NOT NULL THEN pp.normalized_price
+				               ELSE pp.unit_price
+				             END AS REAL) ASC
 				       ) AS rn
 				FROM product_prices pp
 				JOIN products p ON p.id = pp.product_id
+				JOIN product_groups pg ON pg.id = p.product_group_id
 				WHERE p.product_group_id IN (%s)
 				  AND pp.receipt_date = (
 				      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
@@ -558,14 +610,18 @@ func (h *ListHandler) Get(c echo.Context) error {
 		}
 		defer rows2.Close()
 		for rows2.Next() {
-			var groupID, productID, storeName, price string
-			if err := rows2.Scan(&groupID, &productID, &storeName, &price); err != nil {
+			var groupID, productID, storeName, price, priceBasis string
+			var normalizedPrice, normalizedUnit *string
+			if err := rows2.Scan(&groupID, &productID, &storeName, &price, &normalizedPrice, &normalizedUnit, &priceBasis); err != nil {
 				return echo.NewHTTPError(http.StatusInternalServerError, "failed to scan group prices")
 			}
 			groupPriceMap[groupID] = groupPriceInfo{
-				CheapestStore:     storeName,
-				CheapestPrice:     price,
-				CheapestProductID: productID,
+				CheapestStore:           storeName,
+				CheapestPrice:           price,
+				CheapestProductID:       productID,
+				CheapestNormalizedPrice: normalizedPrice,
+				CheapestNormalizedUnit:  normalizedUnit,
+				PriceBasis:              priceBasis,
 			}
 		}
 	}
@@ -576,16 +632,39 @@ func (h *ListHandler) Get(c echo.Context) error {
 		placeholders := strings.Repeat("?,", len(groupIDs))
 		placeholders = placeholders[:len(placeholders)-1]
 		q2b := fmt.Sprintf(`
-			SELECT p.product_group_id, PRINTF('%%.2f', MIN(pp.unit_price))
-			FROM product_prices pp
-			JOIN products p ON p.id = pp.product_id
-			WHERE p.product_group_id IN (%s)
-			  AND pp.store_id = ?
-			  AND pp.receipt_date = (
-			      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
-			      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
-			  )
-			GROUP BY p.product_group_id`, placeholders)
+			SELECT sub.product_group_id, PRINTF('%%.2f', sub.unit_price)
+			FROM (
+				SELECT p.product_group_id, pp.unit_price, pp.normalized_price, pp.normalized_unit,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY p.product_group_id
+				           ORDER BY
+				             CASE
+				               WHEN pg.comparison_unit IS NOT NULL
+				                AND pp.normalized_unit = pg.comparison_unit
+				                AND pp.normalized_price IS NOT NULL THEN 0
+				               WHEN pg.comparison_unit IS NULL
+				                AND pp.normalized_price IS NOT NULL THEN 0
+				               WHEN pp.normalized_price IS NOT NULL THEN 1
+				               ELSE 2
+				             END,
+				             CAST(CASE
+				               WHEN ((pg.comparison_unit IS NOT NULL AND pp.normalized_unit = pg.comparison_unit)
+				                     OR pg.comparison_unit IS NULL)
+				                AND pp.normalized_price IS NOT NULL THEN pp.normalized_price
+				               ELSE pp.unit_price
+				             END AS REAL) ASC
+				       ) AS rn
+				FROM product_prices pp
+				JOIN products p ON p.id = pp.product_id
+				JOIN product_groups pg ON pg.id = p.product_group_id
+				WHERE p.product_group_id IN (%s)
+				  AND pp.store_id = ?
+				  AND pp.receipt_date = (
+				      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+				      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+				  )
+			) sub
+			WHERE sub.rn = 1`, placeholders)
 		args2b := make([]interface{}, len(groupIDs)+1)
 		for i, id := range groupIDs {
 			args2b[i] = id
@@ -666,15 +745,38 @@ func (h *ListHandler) Get(c echo.Context) error {
 			args2d = append(args2d, pair.GroupID, pair.StoreID)
 		}
 		q2d := fmt.Sprintf(`
-			SELECT p.product_group_id, pp.store_id, PRINTF('%%.2f', MIN(pp.unit_price))
-			FROM product_prices pp
-			JOIN products p ON p.id = pp.product_id
-			WHERE (p.product_group_id, pp.store_id) IN (VALUES %s)
-			  AND pp.receipt_date = (
-			      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
-			      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
-			  )
-			GROUP BY p.product_group_id, pp.store_id`, strings.Join(tuplePlaceholders, ","))
+			SELECT sub.product_group_id, sub.store_id, PRINTF('%%.2f', sub.unit_price)
+			FROM (
+				SELECT p.product_group_id, pp.store_id, pp.unit_price, pp.normalized_price, pp.normalized_unit,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY p.product_group_id, pp.store_id
+				           ORDER BY
+				             CASE
+				               WHEN pg.comparison_unit IS NOT NULL
+				                AND pp.normalized_unit = pg.comparison_unit
+				                AND pp.normalized_price IS NOT NULL THEN 0
+				               WHEN pg.comparison_unit IS NULL
+				                AND pp.normalized_price IS NOT NULL THEN 0
+				               WHEN pp.normalized_price IS NOT NULL THEN 1
+				               ELSE 2
+				             END,
+				             CAST(CASE
+				               WHEN ((pg.comparison_unit IS NOT NULL AND pp.normalized_unit = pg.comparison_unit)
+				                     OR pg.comparison_unit IS NULL)
+				                AND pp.normalized_price IS NOT NULL THEN pp.normalized_price
+				               ELSE pp.unit_price
+				             END AS REAL) ASC
+				       ) AS rn
+				FROM product_prices pp
+				JOIN products p ON p.id = pp.product_id
+				JOIN product_groups pg ON pg.id = p.product_group_id
+				WHERE (p.product_group_id, pp.store_id) IN (VALUES %s)
+				  AND pp.receipt_date = (
+				      SELECT MAX(pp2.receipt_date) FROM product_prices pp2
+				      WHERE pp2.product_id = pp.product_id AND pp2.store_id = pp.store_id
+				  )
+			) sub
+			WHERE sub.rn = 1`, strings.Join(tuplePlaceholders, ","))
 		rows2d, err := h.DB.QueryContext(c.Request().Context(), q2d, args2d...)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch assigned group store prices")
@@ -696,6 +798,9 @@ func (h *ListHandler) Get(c echo.Context) error {
 				resp.Items[i].CheapestStore = &info.CheapestStore
 				resp.Items[i].CheapestPrice = &info.CheapestPrice
 				resp.Items[i].CheapestProductID = &info.CheapestProductID
+				resp.Items[i].CheapestNormalizedPrice = info.CheapestNormalizedPrice
+				resp.Items[i].CheapestNormalizedUnit = info.CheapestNormalizedUnit
+				resp.Items[i].PriceBasis = &info.PriceBasis
 				resp.Items[i].EstimatedPrice = &info.CheapestPrice
 			}
 			if price, ok := groupStorePriceMap[*item.ProductGroupID]; ok {

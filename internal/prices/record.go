@@ -9,7 +9,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+
+	"github.com/mstefanko/cartledger/internal/units"
 )
+
+type ProductPriceContext struct {
+	HouseholdID      string
+	ProductID        string
+	ProductGroupID   *string
+	ProductPackQty   *decimal.Decimal
+	ProductPackUnit  *string
+	GroupCompareUnit *string
+}
 
 func RecordProductPriceFromLineItem(ctx context.Context, tx *sql.Tx, lineItemID string) error {
 	existingProductID, err := existingPriceProductID(ctx, tx, lineItemID)
@@ -64,7 +75,7 @@ func RecordProductPriceFromLineItem(ctx context.Context, tx *sql.Tx, lineItemID 
 		return fmt.Errorf("parse total price: %w", err)
 	}
 
-	productPackQuantity, productPackUnit, err := loadProductPack(ctx, tx, productID.String)
+	priceContext, err := loadProductPriceContext(ctx, tx, productID.String)
 	if err != nil {
 		return err
 	}
@@ -75,14 +86,26 @@ func RecordProductPriceFromLineItem(ctx context.Context, tx *sql.Tx, lineItemID 
 	lineOverrideUnit := stringPtrFromNullString(overrideUnit)
 	lineUnit := stringPtrFromNullString(unit)
 
-	normalized, err := NormalizeLineItemPrice(
+	scope := units.ConversionScope{
+		HouseholdID: priceContext.HouseholdID,
+		ProductID:   priceContext.ProductID,
+	}
+	if priceContext.ProductGroupID != nil {
+		scope.ProductGroupID = *priceContext.ProductGroupID
+	}
+
+	normalized, err := NormalizeLineItemPriceWithScope(
+		ctx,
+		tx,
 		totalPrice,
 		lineQuantity,
 		lineUnit,
-		productPackQuantity,
-		productPackUnit,
+		priceContext.ProductPackQty,
+		priceContext.ProductPackUnit,
 		lineOverrideQuantity,
 		lineOverrideUnit,
+		priceContext.GroupCompareUnit,
+		scope,
 	)
 	if err != nil {
 		return fmt.Errorf("normalize line price: %w", err)
@@ -185,22 +208,28 @@ func deletePriceAndRefresh(ctx context.Context, tx *sql.Tx, lineItemID string, p
 	return RefreshProductPurchaseStats(ctx, tx, productID)
 }
 
-func loadProductPack(ctx context.Context, tx *sql.Tx, productID string) (*decimal.Decimal, *string, error) {
+func loadProductPriceContext(ctx context.Context, tx *sql.Tx, productID string) (ProductPriceContext, error) {
+	out := ProductPriceContext{ProductID: productID}
 	var packQuantity sql.NullFloat64
-	var packUnit sql.NullString
+	var packUnit, productGroupID, comparisonUnit sql.NullString
 	err := tx.QueryRowContext(ctx,
-		`SELECT pack_quantity, pack_unit FROM products WHERE id = ?`,
+		`SELECT p.household_id, p.product_group_id, p.pack_quantity, p.pack_unit, pg.comparison_unit
+		   FROM products p
+		   LEFT JOIN product_groups pg ON pg.id = p.product_group_id
+		  WHERE p.id = ?`,
 		productID,
-	).Scan(&packQuantity, &packUnit)
+	).Scan(&out.HouseholdID, &productGroupID, &packQuantity, &packUnit, &comparisonUnit)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load product pack: %w", err)
+		return out, fmt.Errorf("load product price context: %w", err)
 	}
-	var qty *decimal.Decimal
 	if packQuantity.Valid {
 		d := decimal.NewFromFloat(packQuantity.Float64)
-		qty = &d
+		out.ProductPackQty = &d
 	}
-	return qty, stringPtrFromNullString(packUnit), nil
+	out.ProductPackUnit = stringPtrFromNullString(packUnit)
+	out.ProductGroupID = stringPtrFromNullString(productGroupID)
+	out.GroupCompareUnit = stringPtrFromNullString(comparisonUnit)
+	return out, nil
 }
 
 func decimalPtrFromNullString(value sql.NullString) (*decimal.Decimal, error) {

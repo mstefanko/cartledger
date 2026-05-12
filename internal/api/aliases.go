@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/matcher"
 )
 
 // AliasHandler holds dependencies for product alias endpoints.
@@ -28,11 +30,16 @@ type createAliasRequest struct {
 // --- Response types ---
 
 type aliasResponse struct {
-	ID        string    `json:"id"`
-	ProductID string    `json:"product_id"`
-	Alias     string    `json:"alias"`
-	StoreID   *string   `json:"store_id,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              string     `json:"id"`
+	ProductID       string     `json:"product_id"`
+	Alias           string     `json:"alias"`
+	AliasNormalized *string    `json:"alias_normalized,omitempty"`
+	StoreID         *string    `json:"store_id,omitempty"`
+	Source          string     `json:"source"`
+	Confidence      *float64   `json:"confidence,omitempty"`
+	AcceptedAt      *time.Time `json:"accepted_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
 }
 
 // RegisterRoutes mounts alias endpoints onto the protected group.
@@ -63,7 +70,10 @@ func (h *AliasHandler) List(c echo.Context) error {
 	}
 
 	rows, err := h.DB.Query(
-		"SELECT id, product_id, alias, store_id, created_at FROM product_aliases WHERE product_id = ? ORDER BY alias",
+		`SELECT id, product_id, alias, alias_normalized, store_id, source, confidence, accepted_at, created_at, updated_at
+		   FROM product_aliases
+		  WHERE product_id = ?
+		  ORDER BY alias`,
 		productID,
 	)
 	if err != nil {
@@ -74,7 +84,7 @@ func (h *AliasHandler) List(c echo.Context) error {
 	aliases := make([]aliasResponse, 0)
 	for rows.Next() {
 		var a aliasResponse
-		if err := rows.Scan(&a.ID, &a.ProductID, &a.Alias, &a.StoreID, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.ProductID, &a.Alias, &a.AliasNormalized, &a.StoreID, &a.Source, &a.Confidence, &a.AcceptedAt, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 		aliases = append(aliases, a)
@@ -115,27 +125,37 @@ func (h *AliasHandler) Create(c echo.Context) error {
 	}
 
 	now := time.Now().UTC()
-	var id string
-	err = h.DB.QueryRow(
-		`INSERT INTO product_aliases (id, product_id, alias, store_id, created_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?)
-		 RETURNING id`,
-		productID, req.Alias, req.StoreID, now,
-	).Scan(&id)
-	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint") {
+	if err := matcher.UpsertAlias(c.Request().Context(), h.DB, matcher.AliasUpsert{
+		HouseholdID: householdID,
+		ProductID:   productID,
+		Alias:       req.Alias,
+		StoreID:     req.StoreID,
+		Source:      matcher.AliasSourceUserAlias,
+		Confidence:  floatPtr(1),
+		AcceptedAt:  &now,
+		CreatedAt:   now,
+	}); err != nil {
+		if errors.Is(err, matcher.ErrAliasConflict) || strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "alias already exists"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	return c.JSON(http.StatusCreated, aliasResponse{
-		ID:        id,
-		ProductID: productID,
-		Alias:     req.Alias,
-		StoreID:   req.StoreID,
-		CreatedAt: now,
-	})
+	var resp aliasResponse
+	err = h.DB.QueryRow(
+		`SELECT id, product_id, alias, alias_normalized, store_id, source, confidence, accepted_at, created_at, updated_at
+		   FROM product_aliases
+		  WHERE product_id = ?
+		    AND alias_normalized = ?
+		    AND ((? IS NULL AND store_id IS NULL) OR store_id = ?)
+		  ORDER BY updated_at DESC
+		  LIMIT 1`,
+		productID, matcher.NormalizeProductName(req.Alias), req.StoreID, req.StoreID,
+	).Scan(&resp.ID, &resp.ProductID, &resp.Alias, &resp.AliasNormalized, &resp.StoreID, &resp.Source, &resp.Confidence, &resp.AcceptedAt, &resp.CreatedAt, &resp.UpdatedAt)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	return c.JSON(http.StatusCreated, resp)
 }
 
 // Delete removes a product alias.

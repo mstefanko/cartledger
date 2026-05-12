@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
@@ -162,6 +164,10 @@ func scanProductRow(rows *sql.Rows, p *productResponse) error {
 		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
 }
 
+func floatPtr(v float64) *float64 {
+	return &v
+}
+
 // List returns products for the household.
 //
 // Query params:
@@ -306,16 +312,33 @@ func (h *ProductHandler) Create(c echo.Context) error {
 
 	now := time.Now().UTC()
 	var id string
-	err = h.DB.QueryRow(
-		`INSERT INTO products (id, household_id, name, category, default_unit, notes, brand, upc, pack_quantity, pack_unit, created_at, updated_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	err = tx.QueryRowContext(c.Request().Context(),
+		`INSERT INTO products (id, household_id, name, name_normalized, category, default_unit, notes, brand, upc, pack_quantity, pack_unit, created_at, updated_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
 		 RETURNING id`,
-		householdID, req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, upc, req.PackQuantity, req.PackUnit, now, now,
+		householdID, req.Name, matcher.NormalizeProductName(req.Name), req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, now, now,
 	).Scan(&id)
 	if err != nil {
 		if isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "product name already exists"})
 		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if upc != nil {
+		if _, err := identifiers.SetProductPrimaryGTIN(c.Request().Context(), tx, householdID, id, *upc, "manual", floatPtr(1)); err != nil {
+			if errors.Is(err, identifiers.ErrIdentifierConflict) || isUniqueConstraintError(err) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": "upc already belongs to another product"})
+			}
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
@@ -395,10 +418,16 @@ func (h *ProductHandler) Update(c echo.Context) error {
 	}
 
 	now := time.Now().UTC()
-	result, err := h.DB.Exec(
-		`UPDATE products SET name = ?, category = ?, default_unit = ?, notes = ?, brand = ?, upc = ?, pack_quantity = ?, pack_unit = ?, product_group_id = ?, updated_at = ?
+	tx, err := h.DB.BeginTx(c.Request().Context(), nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(c.Request().Context(),
+		`UPDATE products SET name = ?, name_normalized = ?, category = ?, default_unit = ?, notes = ?, brand = ?, pack_quantity = ?, pack_unit = ?, product_group_id = ?, updated_at = ?
 		 WHERE id = ? AND household_id = ?`,
-		req.Name, req.Category, req.DefaultUnit, req.Notes, req.Brand, upc, req.PackQuantity, req.PackUnit, req.ProductGroupID, now, productID, householdID,
+		req.Name, matcher.NormalizeProductName(req.Name), req.Category, req.DefaultUnit, req.Notes, req.Brand, req.PackQuantity, req.PackUnit, req.ProductGroupID, now, productID, householdID,
 	)
 	if err != nil {
 		if isUniqueConstraintError(err) {
@@ -409,6 +438,24 @@ func (h *ProductHandler) Update(c echo.Context) error {
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+	}
+	if upc == nil {
+		if _, err := identifiers.SetProductPrimaryGTIN(c.Request().Context(), tx, householdID, productID, "", "manual", nil); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	} else {
+		if _, err := identifiers.SetProductPrimaryGTIN(c.Request().Context(), tx, householdID, productID, *upc, "manual", floatPtr(1)); err != nil {
+			if errors.Is(err, identifiers.ErrIdentifierConflict) || isUniqueConstraintError(err) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": "upc already belongs to another product"})
+			}
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		if isUniqueConstraintError(err) {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "upc already belongs to another product"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
 	p, err := h.fetchProduct(productID)
@@ -1146,9 +1193,15 @@ type purchaseStats struct {
 }
 
 type productAliasResponse struct {
-	ID      string  `json:"id"`
-	Alias   string  `json:"alias"`
-	StoreID *string `json:"store_id,omitempty"`
+	ID              string     `json:"id"`
+	ProductID       string     `json:"product_id,omitempty"`
+	Alias           string     `json:"alias"`
+	AliasNormalized *string    `json:"alias_normalized,omitempty"`
+	StoreID         *string    `json:"store_id,omitempty"`
+	Source          string     `json:"source"`
+	Confidence      *float64   `json:"confidence,omitempty"`
+	AcceptedAt      *time.Time `json:"accepted_at,omitempty"`
+	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
 }
 
 type productStoreCodeResponse struct {
@@ -1275,14 +1328,17 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 
 	// Fetch aliases.
 	aliasRows, err := h.DB.Query(
-		"SELECT id, alias, store_id FROM product_aliases WHERE product_id = ? ORDER BY alias",
+		`SELECT id, product_id, alias, alias_normalized, store_id, source, confidence, accepted_at, updated_at
+		   FROM product_aliases
+		  WHERE product_id = ?
+		  ORDER BY alias`,
 		productID,
 	)
 	if err == nil {
 		defer aliasRows.Close()
 		for aliasRows.Next() {
 			var a productAliasResponse
-			if aliasRows.Scan(&a.ID, &a.Alias, &a.StoreID) == nil {
+			if aliasRows.Scan(&a.ID, &a.ProductID, &a.Alias, &a.AliasNormalized, &a.StoreID, &a.Source, &a.Confidence, &a.AcceptedAt, &a.UpdatedAt) == nil {
 				resp.Aliases = append(resp.Aliases, a)
 			}
 		}

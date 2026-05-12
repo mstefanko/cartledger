@@ -84,13 +84,32 @@ type BadgeState =
   | { kind: 'best'; storeName: string; price: string }
   | { kind: 'worse'; otherStoreName: string; otherPrice: string }
   | { kind: 'unknown'; otherStoreName: string; otherPrice: string }
+  | { kind: 'not_comparable'; label: string }
   | { kind: 'no_data' }
+
+function priceBasisLabel(item: ListItemWithPrice): string | null {
+  if (item.price_basis === 'normalized') return null
+  if (item.price_basis === 'missing_package') return 'Needs package details'
+  if (item.price_basis === 'raw') return 'Package price only'
+  return null
+}
+
+function comparisonPriceText(item: ListItemWithPrice): string | null {
+  if (!item.cheapest_normalized_price || !item.cheapest_normalized_unit) {
+    return null
+  }
+  return `$${parseFloat(item.cheapest_normalized_price).toFixed(2)}/${item.cheapest_normalized_unit}`
+}
 
 function deriveBadgeState(
   item: ListItemWithPrice,
   effectiveStoreId: string | null,
   stores: Store[],
 ): BadgeState {
+  const basisLabel = priceBasisLabel(item)
+  if (basisLabel) {
+    return { kind: 'not_comparable', label: basisLabel }
+  }
   if (!item.cheapest_store || !item.cheapest_price) {
     return { kind: 'no_data' }
   }
@@ -1765,6 +1784,7 @@ function ListItemRow({
 
   // Quantity-only pill — unit is rendered inside the price hint sub-row below.
   const qtyLabel = item.quantity !== '1' ? item.quantity : null
+  const comparablePrice = comparisonPriceText(item)
 
   return (
     <div
@@ -1978,6 +1998,17 @@ function ListItemRow({
                 </p>
               )
             }
+            if (state.kind === 'not_comparable') {
+              return (
+                <p className="text-small mt-0.5 flex items-center gap-1 text-neutral-500">
+                  <Info
+                    className="w-3.5 h-3.5 text-neutral-400 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <span className="truncate">{state.label}</span>
+                </p>
+              )
+            }
             // no_data
             return (
               <p className="text-small mt-0.5 flex items-center gap-1 text-neutral-500">
@@ -2009,6 +2040,11 @@ function ListItemRow({
               {!item.checked && item.unit && item.cheapest_price && parseFloat(item.quantity) > 0 && (
                 <span className="text-small text-neutral-400">
                   {item.quantity} {item.unit} x ${item.cheapest_price}/{item.unit}
+                </span>
+              )}
+              {!item.checked && comparablePrice && (
+                <span className="text-small text-neutral-400">
+                  {comparablePrice}
                 </span>
               )}
             </div>

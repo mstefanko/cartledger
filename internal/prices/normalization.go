@@ -1,6 +1,7 @@
 package prices
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -32,6 +33,34 @@ func NormalizeLineItemPrice(
 	linePackOverrideQuantity *decimal.Decimal,
 	linePackOverrideUnit *string,
 ) (NormalizedLinePrice, error) {
+	return NormalizeLineItemPriceWithScope(
+		context.Background(),
+		nil,
+		totalPrice,
+		lineQuantity,
+		lineUnit,
+		productPackQuantity,
+		productPackUnit,
+		linePackOverrideQuantity,
+		linePackOverrideUnit,
+		nil,
+		units.ConversionScope{},
+	)
+}
+
+func NormalizeLineItemPriceWithScope(
+	ctx context.Context,
+	db units.Querier,
+	totalPrice decimal.Decimal,
+	lineQuantity decimal.Decimal,
+	lineUnit *string,
+	productPackQuantity *decimal.Decimal,
+	productPackUnit *string,
+	linePackOverrideQuantity *decimal.Decimal,
+	linePackOverrideUnit *string,
+	comparisonUnit *string,
+	scope units.ConversionScope,
+) (NormalizedLinePrice, error) {
 	if lineQuantity.IsNegative() {
 		return NormalizedLinePrice{}, fmt.Errorf("line quantity cannot be negative")
 	}
@@ -47,21 +76,21 @@ func NormalizeLineItemPrice(
 	if unit := normalizedUnitValue(lineUnit); unit != "" {
 		switch units.Classify(unit) {
 		case units.CategoryWeight, units.CategoryVolume:
-			if normalized, ok := normalizeContent(result, totalPrice, lineQuantity, unit, SourceLineUnit); ok {
+			if normalized, ok := normalizeContent(ctx, db, result, totalPrice, lineQuantity, unit, comparisonUnit, scope, SourceLineUnit); ok {
 				return normalized, nil
 			}
 		}
 	}
 
 	if linePackOverrideQuantity != nil && linePackOverrideUnit != nil {
-		if normalized, ok := normalizePackQuantity(totalPrice, lineQuantity, *linePackOverrideQuantity, *linePackOverrideUnit, SourceLineOverride); ok {
+		if normalized, ok := normalizePackQuantity(ctx, db, totalPrice, lineQuantity, *linePackOverrideQuantity, *linePackOverrideUnit, comparisonUnit, scope, SourceLineOverride); ok {
 			normalized.UnitPrice = result.UnitPrice
 			return normalized, nil
 		}
 	}
 
 	if productPackQuantity != nil && productPackUnit != nil {
-		if normalized, ok := normalizePackQuantity(totalPrice, lineQuantity, *productPackQuantity, *productPackUnit, SourceProductPack); ok {
+		if normalized, ok := normalizePackQuantity(ctx, db, totalPrice, lineQuantity, *productPackQuantity, *productPackUnit, comparisonUnit, scope, SourceProductPack); ok {
 			normalized.UnitPrice = result.UnitPrice
 			return normalized, nil
 		}
@@ -70,7 +99,7 @@ func NormalizeLineItemPrice(
 	return result, nil
 }
 
-func normalizePackQuantity(totalPrice, lineQuantity, packQuantity decimal.Decimal, packUnit string, source string) (NormalizedLinePrice, bool) {
+func normalizePackQuantity(ctx context.Context, db units.Querier, totalPrice, lineQuantity, packQuantity decimal.Decimal, packUnit string, comparisonUnit *string, scope units.ConversionScope, source string) (NormalizedLinePrice, bool) {
 	if !packQuantity.GreaterThan(decimal.Zero) {
 		return NormalizedLinePrice{}, false
 	}
@@ -78,21 +107,24 @@ func normalizePackQuantity(totalPrice, lineQuantity, packQuantity decimal.Decima
 	if strings.TrimSpace(unit) == "" || units.Classify(unit) == units.CategoryUnknown {
 		return NormalizedLinePrice{}, false
 	}
-	return normalizeContent(NormalizedLinePrice{}, totalPrice, lineQuantity.Mul(packQuantity), unit, source)
+	return normalizeContent(ctx, db, NormalizedLinePrice{}, totalPrice, lineQuantity.Mul(packQuantity), unit, comparisonUnit, scope, source)
 }
 
-func normalizeContent(result NormalizedLinePrice, totalPrice, quantity decimal.Decimal, unit string, source string) (NormalizedLinePrice, bool) {
+func normalizeContent(ctx context.Context, db units.Querier, result NormalizedLinePrice, totalPrice, quantity decimal.Decimal, unit string, comparisonUnit *string, scope units.ConversionScope, source string) (NormalizedLinePrice, bool) {
 	if !quantity.GreaterThan(decimal.Zero) {
 		return result, false
 	}
-	stdUnit := units.StandardUnit(unit)
-	stdQty, err := units.Convert(quantity, unit, stdUnit, "", nil)
+	targetUnit := units.StandardUnit(unit)
+	if comparison := normalizedUnitValue(comparisonUnit); comparison != "" {
+		targetUnit = comparison
+	}
+	stdQty, err := units.ConvertScoped(ctx, db, quantity, unit, targetUnit, scope)
 	if err != nil || stdQty.IsZero() {
 		return result, false
 	}
 	normalizedPrice := totalPrice.Div(stdQty)
 	result.NormalizedPrice = &normalizedPrice
-	result.NormalizedUnit = &stdUnit
+	result.NormalizedUnit = &targetUnit
 	result.Source = source
 	return result, true
 }

@@ -14,8 +14,14 @@ func matchByAlias(db *sql.DB, normalized string, storeID string, householdID str
 	err := db.QueryRow(
 		`SELECT pa.product_id FROM product_aliases pa
 		 JOIN products p ON pa.product_id = p.id
-		 WHERE LOWER(pa.alias) = ? AND pa.store_id = ? AND p.household_id = ? LIMIT 1`,
-		normalized, storeID, householdID,
+		 WHERE pa.store_id = ?
+		   AND p.household_id = ?
+		   AND (
+		       (pa.household_id = ? AND pa.alias_normalized = ?)
+		       OR (pa.alias_normalized IS NULL AND LOWER(pa.alias) = ?)
+		   )
+		 LIMIT 1`,
+		storeID, householdID, householdID, normalized, normalized,
 	).Scan(&productID)
 	if err == nil {
 		return &MatchResult{
@@ -29,8 +35,14 @@ func matchByAlias(db *sql.DB, normalized string, storeID string, householdID str
 	err = db.QueryRow(
 		`SELECT pa.product_id FROM product_aliases pa
 		 JOIN products p ON pa.product_id = p.id
-		 WHERE LOWER(pa.alias) = ? AND pa.store_id IS NULL AND p.household_id = ? LIMIT 1`,
-		normalized, householdID,
+		 WHERE pa.store_id IS NULL
+		   AND p.household_id = ?
+		   AND (
+		       (pa.household_id = ? AND pa.alias_normalized = ?)
+		       OR (pa.alias_normalized IS NULL AND LOWER(pa.alias) = ?)
+		   )
+		 LIMIT 1`,
+		householdID, householdID, normalized, normalized,
 	).Scan(&productID)
 	if err == nil {
 		return &MatchResult{
@@ -55,7 +67,7 @@ func matchByFuzzy(db *sql.DB, normalized string, storeID string, householdID str
 
 	// Gather aliases (store-specific first, then global), scoped to household via products.
 	aliasRows, err := db.Query(
-		`SELECT pa.product_id, LOWER(pa.alias) FROM product_aliases pa
+		`SELECT pa.product_id, COALESCE(pa.alias_normalized, LOWER(pa.alias)) FROM product_aliases pa
 		 JOIN products p ON pa.product_id = p.id
 		 WHERE (pa.store_id = ? OR pa.store_id IS NULL) AND p.household_id = ?`,
 		storeID, householdID,
@@ -71,7 +83,7 @@ func matchByFuzzy(db *sql.DB, normalized string, storeID string, householdID str
 	}
 
 	// Gather product names, scoped to household.
-	prodRows, err := db.Query(`SELECT id, LOWER(name) FROM products WHERE household_id = ?`, householdID)
+	prodRows, err := db.Query(`SELECT id, COALESCE(name_normalized, LOWER(name)) FROM products WHERE household_id = ?`, householdID)
 	if err == nil {
 		defer prodRows.Close()
 		for prodRows.Next() {

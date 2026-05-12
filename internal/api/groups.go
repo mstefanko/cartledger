@@ -47,15 +47,18 @@ type groupListItem struct {
 }
 
 type groupMember struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Brand        *string  `json:"brand,omitempty"`
-	PackQuantity *float64 `json:"pack_quantity,omitempty"`
-	PackUnit     *string  `json:"pack_unit,omitempty"`
-	StoreName    *string  `json:"store_name,omitempty"`
-	LatestPrice  *string  `json:"latest_price,omitempty"`
-	ReceiptDate  *string  `json:"receipt_date,omitempty"`
-	PricePerUnit *string  `json:"price_per_unit,omitempty"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Brand           *string  `json:"brand,omitempty"`
+	PackQuantity    *float64 `json:"pack_quantity,omitempty"`
+	PackUnit        *string  `json:"pack_unit,omitempty"`
+	StoreName       *string  `json:"store_name,omitempty"`
+	LatestPrice     *string  `json:"latest_price,omitempty"`
+	ReceiptDate     *string  `json:"receipt_date,omitempty"`
+	PricePerUnit    *string  `json:"price_per_unit,omitempty"`
+	NormalizedPrice *string  `json:"normalized_price,omitempty"`
+	NormalizedUnit  *string  `json:"normalized_unit,omitempty"`
+	PriceBasis      string   `json:"price_basis"`
 }
 
 type groupDetailResponse struct {
@@ -133,14 +136,37 @@ func (h *GroupHandler) Create(c echo.Context) error {
 // want a divergence between the q-set and q-empty SQL.
 const groupListSelect = `SELECT g.id, g.household_id, g.name, g.comparison_unit,
 	        (SELECT COUNT(*) FROM products p WHERE p.product_group_id = g.id) as member_count,
-	        (SELECT PRINTF('%.2f', MIN(CAST(pp.unit_price AS REAL)))
-	         FROM products p2
-	         JOIN (
-	             SELECT product_id, unit_price,
-	                    ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY receipt_date DESC) rn
-	             FROM product_prices
-	         ) pp ON pp.product_id = p2.id AND pp.rn = 1
-	         WHERE p2.product_group_id = g.id
+	        (SELECT PRINTF('%.2f', ranked.unit_price)
+	           FROM (
+	             SELECT pp.unit_price, pp.normalized_price, pp.normalized_unit
+	               FROM products p2
+	               JOIN (
+	                 SELECT product_id, unit_price, normalized_price, normalized_unit,
+	                        ROW_NUMBER() OVER (
+	                          PARTITION BY product_id
+	                          ORDER BY receipt_date DESC, created_at DESC, id DESC
+	                        ) rn
+	                   FROM product_prices
+	               ) pp ON pp.product_id = p2.id AND pp.rn = 1
+	              WHERE p2.product_group_id = g.id
+	              ORDER BY
+	                CASE
+	                  WHEN g.comparison_unit IS NOT NULL
+	                   AND pp.normalized_unit = g.comparison_unit
+	                   AND pp.normalized_price IS NOT NULL THEN 0
+	                  WHEN g.comparison_unit IS NULL
+	                   AND pp.normalized_price IS NOT NULL THEN 0
+	                  WHEN pp.normalized_price IS NOT NULL THEN 1
+	                  ELSE 2
+	                END,
+	                CAST(CASE
+	                  WHEN ((g.comparison_unit IS NOT NULL AND pp.normalized_unit = g.comparison_unit)
+	                        OR g.comparison_unit IS NULL)
+	                   AND pp.normalized_price IS NOT NULL THEN pp.normalized_price
+	                  ELSE pp.unit_price
+	                END AS REAL) ASC
+	              LIMIT 1
+	           ) ranked
 	        ) as best_price,
 	        g.created_at, g.updated_at
 	 FROM product_groups g`
@@ -256,18 +282,38 @@ func (h *GroupHandler) Get(c echo.Context) error {
 
 	// Fetch members with latest price.
 	rows, err := h.DB.Query(
-		`SELECT p.id, p.name, p.brand, p.pack_quantity, p.pack_unit, s.name,
-		        pp.unit_price, pp.receipt_date
+		`WITH latest AS (
+		     SELECT pp.*,
+		            ROW_NUMBER() OVER (
+		                PARTITION BY pp.product_id
+		                ORDER BY pp.receipt_date DESC, pp.created_at DESC, pp.id DESC
+		            ) AS rn
+		       FROM product_prices pp
+		 )
+		 SELECT p.id, p.name, p.brand, p.pack_quantity, p.pack_unit, s.name,
+		        latest.unit_price, latest.normalized_price, latest.normalized_unit, latest.receipt_date
 		 FROM products p
-		 LEFT JOIN (
-		     SELECT product_id, store_id, unit_price, receipt_date,
-		            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY receipt_date DESC) rn
-		     FROM product_prices
-		 ) pp ON pp.product_id = p.id AND pp.rn = 1
-		 LEFT JOIN stores s ON pp.store_id = s.id
+		 LEFT JOIN latest ON latest.product_id = p.id AND latest.rn = 1
+		 LEFT JOIN stores s ON s.id = latest.store_id
 		 WHERE p.product_group_id = ? AND p.household_id = ?
-		 ORDER BY CAST(pp.unit_price AS REAL) ASC`,
+		 ORDER BY
+		   CASE
+		     WHEN ? IS NOT NULL
+		      AND latest.normalized_unit = ?
+		      AND latest.normalized_price IS NOT NULL THEN 0
+		     WHEN ? IS NULL
+		      AND latest.normalized_price IS NOT NULL THEN 0
+		     WHEN latest.normalized_price IS NOT NULL THEN 1
+		     ELSE 2
+		   END,
+		   CAST(CASE
+		     WHEN ((? IS NOT NULL AND latest.normalized_unit = ?) OR ? IS NULL)
+		      AND latest.normalized_price IS NOT NULL THEN latest.normalized_price
+		     ELSE latest.unit_price
+		   END AS REAL) ASC`,
 		groupID, householdID,
+		resp.ComparisonUnit, resp.ComparisonUnit, resp.ComparisonUnit,
+		resp.ComparisonUnit, resp.ComparisonUnit, resp.ComparisonUnit,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -280,10 +326,12 @@ func (h *GroupHandler) Get(c echo.Context) error {
 	for rows.Next() {
 		var m groupMember
 		var unitPrice *float64
+		var normalizedPrice *float64
+		var normalizedUnit *string
 		var receiptDate *time.Time
 
 		if err := rows.Scan(&m.ID, &m.Name, &m.Brand, &m.PackQuantity, &m.PackUnit,
-			&m.StoreName, &unitPrice, &receiptDate); err != nil {
+			&m.StoreName, &unitPrice, &normalizedPrice, &normalizedUnit, &receiptDate); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
 
@@ -295,9 +343,15 @@ func (h *GroupHandler) Get(c echo.Context) error {
 			s := receiptDate.Format("2006-01-02")
 			m.ReceiptDate = &s
 		}
+		if normalizedPrice != nil {
+			s := fmt.Sprintf("%.4f", *normalizedPrice)
+			m.NormalizedPrice = &s
+			m.PricePerUnit = &s
+		}
+		m.NormalizedUnit = normalizedUnit
+		m.PriceBasis = groupPriceBasis(resp.ComparisonUnit, normalizedPrice, normalizedUnit)
 
-		// Compute price_per_unit = latest_price / pack_quantity.
-		if unitPrice != nil && m.PackQuantity != nil && *m.PackQuantity > 0 {
+		if m.PricePerUnit == nil && unitPrice != nil && m.PackQuantity != nil && *m.PackQuantity > 0 {
 			ppu := *unitPrice / *m.PackQuantity
 			s := fmt.Sprintf("%.2f", ppu)
 			m.PricePerUnit = &s
@@ -316,6 +370,19 @@ func (h *GroupHandler) Get(c echo.Context) error {
 	resp.UnitsMixed = len(unitSet) > 1
 
 	return c.JSON(http.StatusOK, resp)
+}
+
+func groupPriceBasis(comparisonUnit *string, normalizedPrice *float64, normalizedUnit *string) string {
+	if normalizedPrice != nil && normalizedUnit != nil {
+		if comparisonUnit == nil || strings.TrimSpace(*comparisonUnit) == "" || strings.EqualFold(strings.TrimSpace(*comparisonUnit), strings.TrimSpace(*normalizedUnit)) {
+			return "normalized"
+		}
+		return "raw"
+	}
+	if comparisonUnit != nil && strings.TrimSpace(*comparisonUnit) != "" {
+		return "missing_package"
+	}
+	return "raw"
 }
 
 // Update modifies a product group.

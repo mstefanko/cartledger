@@ -5,9 +5,9 @@ import (
 	"unicode"
 )
 
-// Normalize lowercases, strips punctuation, collapses whitespace, and trims a string.
+// Normalize lowercases, strips punctuation/symbols, collapses whitespace, and trims a string.
 func Normalize(s string) string {
-	s = strings.ToLower(s)
+	s = strings.ToLower(strings.TrimSpace(s))
 
 	// Replace punctuation with spaces.
 	var b strings.Builder

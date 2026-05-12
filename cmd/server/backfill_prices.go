@@ -15,6 +15,7 @@ import (
 func newBackfillNormalizedPricesCmd() *cobra.Command {
 	var apply bool
 	var productID string
+	var productGroupID string
 	var sampleLimit int
 
 	cmd := &cobra.Command{
@@ -26,16 +27,17 @@ package sizes. The command defaults to dry-run and never uses LLM guesses.
 Use --apply to write deterministic normalized prices and unique line-item links.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackfillNormalizedPrices(apply, productID, sampleLimit)
+			return runBackfillNormalizedPrices(apply, productID, productGroupID, sampleLimit)
 		},
 	}
 	cmd.Flags().BoolVar(&apply, "apply", false, "apply deterministic updates instead of dry-run")
 	cmd.Flags().StringVar(&productID, "product-id", "", "limit backfill to one product id")
+	cmd.Flags().StringVar(&productGroupID, "product-group-id", "", "limit backfill to one product group id")
 	cmd.Flags().IntVar(&sampleLimit, "sample-limit", 10, "number of skipped row samples to print")
 	return cmd
 }
 
-func runBackfillNormalizedPrices(apply bool, productID string, sampleLimit int) error {
+func runBackfillNormalizedPrices(apply bool, productID string, productGroupID string, sampleLimit int) error {
 	initLogger()
 
 	cfg, err := config.LoadBase()
@@ -57,9 +59,10 @@ func runBackfillNormalizedPrices(apply bool, productID string, sampleLimit int) 
 	defer cancel()
 
 	summary, err := prices.BackfillNormalizedPrices(ctx, database, prices.BackfillOptions{
-		Apply:       apply,
-		ProductID:   productID,
-		SampleLimit: sampleLimit,
+		Apply:          apply,
+		ProductID:      productID,
+		ProductGroupID: productGroupID,
+		SampleLimit:    sampleLimit,
 	})
 	if err != nil {
 		return fmt.Errorf("backfill normalized prices: %w", err)
@@ -73,11 +76,15 @@ func runBackfillNormalizedPrices(apply bool, productID string, sampleLimit int) 
 	if productID != "" {
 		fmt.Printf("  product_id:                     %s\n", productID)
 	}
+	if productGroupID != "" {
+		fmt.Printf("  product_group_id:               %s\n", productGroupID)
+	}
 	fmt.Printf("  total_product_prices:           %d\n", summary.TotalRows)
 	fmt.Printf("  already_normalized:             %d\n", summary.AlreadyNormalized)
 	fmt.Printf("  normalized_from_receipt_unit:   %d\n", summary.ReceiptUnitNormalized)
 	fmt.Printf("  normalized_from_line_override:  %d\n", summary.LineOverrideNormalized)
 	fmt.Printf("  normalized_from_product_pack:   %d\n", summary.ProductPackNormalized)
+	fmt.Printf("  normalized_to_group_unit:       %d\n", summary.GroupComparisonUnitNormalized)
 	fmt.Printf("  skipped_missing_pack:           %d\n", summary.MissingPackSkipped)
 	fmt.Printf("  skipped_ambiguous_unit:         %d\n", summary.AmbiguousUnitSkipped)
 	fmt.Printf("  skipped_invalid:                %d\n", summary.InvalidSkipped)

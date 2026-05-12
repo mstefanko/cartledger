@@ -19,6 +19,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
@@ -845,6 +846,22 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			discountAmount = &da
 		}
 
+		itemUPC := upc.NormalizePointer(item.UPC)
+		var itemIdentifier *identifiers.Observation
+		var identifierObservations []identifiers.Observation
+		if item.UPC != nil {
+			if obs, err := identifiers.Normalize(*item.UPC, identifiers.KindGTIN, ""); err == nil && obs.NormalizedValue != "" {
+				obs.Source = "receipt"
+				if item.Confidence > 0 {
+					conf := item.Confidence
+					obs.Confidence = &conf
+				}
+				itemIdentifier = &obs
+				identifierObservations = append(identifierObservations, obs)
+				itemUPC = &obs.NormalizedValue
+			}
+		}
+
 		// Run matcher with suggested-name fallback. Prefer the per-receipt
 		// session when it opened cleanly; fall back to the one-shot path
 		// otherwise. Both paths return byte-identical MatchResult per
@@ -852,9 +869,21 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		var matchResult matcher.MatchResult
 		storeItemCode := ptrStringValue(item.StoreItemCode)
 		if sess != nil {
-			matchResult = sess.MatchWithCodeAndSuggestion(item.RawName, storeItemCode, item.SuggestedName)
+			matchResult = sess.MatchInput(context.Background(), matcher.Input{
+				RawName:       item.RawName,
+				StoreItemCode: storeItemCode,
+				SuggestedName: item.SuggestedName,
+				Identifiers:   identifierObservations,
+			})
 		} else {
-			matchResult = w.matchEngine.MatchWithCodeAndSuggestion(item.RawName, storeItemCode, item.SuggestedName, storeID, job.HouseholdID)
+			matchResult = w.matchEngine.MatchInput(context.Background(), matcher.Input{
+				RawName:       item.RawName,
+				StoreItemCode: storeItemCode,
+				SuggestedName: item.SuggestedName,
+				StoreID:       storeID,
+				HouseholdID:   job.HouseholdID,
+				Identifiers:   identifierObservations,
+			})
 		}
 
 		matched := matchResult.Method
@@ -893,8 +922,6 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		if item.SuggestedBrand != "" {
 			suggestedBrand = &item.SuggestedBrand
 		}
-		itemUPC := upc.NormalizePointer(item.UPC)
-
 		_, err = tx.Exec(
 			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, store_item_code, receipt_description, upc, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -907,6 +934,11 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		)
 		if err != nil {
 			return fmt.Errorf("insert line item: %w", err)
+		}
+		if itemIdentifier != nil {
+			if err := identifiers.InsertLineItemObservation(context.Background(), tx, lineItemID, *itemIdentifier); err != nil {
+				return fmt.Errorf("insert identifier observation: %w", err)
+			}
 		}
 
 		// If matched: create product_alias (if new) and product_prices entry.
@@ -924,24 +956,35 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 				}
 			}
 
-			normalized := matcher.Normalize(item.RawName)
-
-			// Create alias if it doesn't already exist.
-			var aliasExists int
-			err = tx.QueryRow(
-				"SELECT COUNT(*) FROM product_aliases WHERE product_id = ? AND alias = ?",
-				*productID, normalized,
-			).Scan(&aliasExists)
-			if err != nil {
-				return fmt.Errorf("check alias: %w", err)
+			if err := matcher.UpsertAlias(context.Background(), tx, matcher.AliasUpsert{
+				HouseholdID: job.HouseholdID,
+				ProductID:   *productID,
+				Alias:       item.RawName,
+				StoreID:     &storeID,
+				Source:      matcher.AliasSourceReceiptMatch,
+				Confidence:  confidence,
+				CreatedAt:   now,
+			}); err != nil {
+				slog.Warn("worker: alias upsert skipped", "receipt_id", job.ReceiptID, "product_id", *productID, "err", err)
 			}
-			if aliasExists == 0 {
-				_, err = tx.Exec(
-					"INSERT OR IGNORE INTO product_aliases (id, product_id, alias, store_id, created_at) VALUES (?, ?, ?, ?, ?)",
-					uuid.New().String(), *productID, normalized, storeID, now,
-				)
-				if err != nil {
-					return fmt.Errorf("insert alias: %w", err)
+
+			if itemIdentifier != nil {
+				conf := 0.9
+				if confidence != nil {
+					conf = *confidence
+				}
+				if err := identifiers.UpsertProductIdentifier(context.Background(), tx, identifiers.ProductIdentifier{
+					HouseholdID:       job.HouseholdID,
+					ProductID:         *productID,
+					Kind:              itemIdentifier.Kind,
+					Authority:         itemIdentifier.Authority,
+					Value:             itemIdentifier.RawValue,
+					NormalizedValue:   itemIdentifier.NormalizedValue,
+					Source:            "line_item",
+					Confidence:        &conf,
+					SetPrimaryProduct: true,
+				}); err != nil {
+					slog.Warn("worker: identifier upsert skipped", "receipt_id", job.ReceiptID, "product_id", *productID, "identifier", itemIdentifier.NormalizedValue, "err", err)
 				}
 			}
 

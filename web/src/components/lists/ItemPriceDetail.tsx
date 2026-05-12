@@ -10,6 +10,10 @@ interface ItemPriceDetailProps {
 }
 
 export function ItemPriceDetail({ item }: ItemPriceDetailProps) {
+  const canCompare = !item.price_basis || item.price_basis === 'normalized'
+  const comparisonPrice = item.cheapest_normalized_price && item.cheapest_normalized_unit
+    ? `$${parseFloat(item.cheapest_normalized_price).toFixed(2)} / ${item.cheapest_normalized_unit}`
+    : null
   const targetId = item.product_group_id
     ? null
     : (item.cheapest_product_id ?? item.product_id)
@@ -17,14 +21,14 @@ export function ItemPriceDetail({ item }: ItemPriceDetailProps) {
   const productQuery = useQuery({
     queryKey: ['product-trend', targetId],
     queryFn: () => fetchProductTrend(targetId!),
-    enabled: !!targetId && !item.product_group_id,
+    enabled: canCompare && !!targetId && !item.product_group_id,
     staleTime: 5 * 60 * 1000,
   })
 
   const groupQuery = useQuery({
     queryKey: ['group-trend', item.product_group_id],
     queryFn: () => fetchGroupTrend(item.product_group_id!),
-    enabled: !!item.product_group_id,
+    enabled: canCompare && !!item.product_group_id,
     staleTime: 5 * 60 * 1000,
   })
 
@@ -61,6 +65,14 @@ export function ItemPriceDetail({ item }: ItemPriceDetailProps) {
 
   const minPrice = storeData.length > 0 ? storeData[0]!.price : null
 
+  if (!canCompare) {
+    return (
+      <div className="py-2 text-xs text-neutral-400">
+        {item.price_basis === 'missing_package' ? 'Add package details for comparable pricing.' : 'Package price only.'}
+      </div>
+    )
+  }
+
   if (isLoading) {
     return <div className="py-2 text-xs text-neutral-400">Loading prices...</div>
   }
@@ -71,6 +83,11 @@ export function ItemPriceDetail({ item }: ItemPriceDetailProps) {
 
   return (
     <div className="mt-2 space-y-2">
+      {comparisonPrice && (
+        <div className="text-xs text-neutral-500">
+          Comparable {comparisonPrice}
+        </div>
+      )}
       <div className="flex items-center gap-3">
         {sparklineData.length >= 2 ? (
           <>

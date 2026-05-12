@@ -1,7 +1,10 @@
 package matcher
 
 import (
+	"context"
 	"database/sql"
+
+	"github.com/mstefanko/cartledger/internal/identifiers"
 )
 
 // MatchResult describes how a raw receipt item name was matched to a product.
@@ -16,6 +19,15 @@ type Engine struct {
 	db *sql.DB
 }
 
+type Input struct {
+	RawName       string
+	StoreItemCode string
+	SuggestedName string
+	StoreID       string
+	HouseholdID   string
+	Identifiers   []identifiers.Observation
+}
+
 // NewEngine creates a new matching engine backed by the given database.
 func NewEngine(db *sql.DB) *Engine {
 	return &Engine{db: db}
@@ -28,24 +40,11 @@ func NewEngine(db *sql.DB) *Engine {
 // Stage 3: Fuzzy — trigram similarity via fuzzy search (confidence 0.5-0.9).
 // Default: unmatched (confidence 0).
 func (e *Engine) Match(rawName string, storeID string, householdID string) MatchResult {
-	normalized := Normalize(rawName)
-
-	// Stage 1: Rules.
-	if result := matchByRules(e.db, normalized, storeID, householdID); result != nil {
-		return *result
-	}
-
-	// Stage 2: Alias exact match.
-	if result := matchByAlias(e.db, normalized, storeID, householdID); result != nil {
-		return *result
-	}
-
-	// Stage 3: Fuzzy matching.
-	if result := matchByFuzzy(e.db, normalized, storeID, householdID); result != nil {
-		return *result
-	}
-
-	return MatchResult{Method: "unmatched", Confidence: 0}
+	return e.MatchInput(context.Background(), Input{
+		RawName:     rawName,
+		StoreID:     storeID,
+		HouseholdID: householdID,
+	})
 }
 
 // MatchWithSuggestion extends the standard pipeline with suggested-name matching.
@@ -58,31 +57,66 @@ func (e *Engine) Match(rawName string, storeID string, householdID string) Match
 // Matches from stages 4-5 are returned with Method="suggested" — they are
 // proposals awaiting user confirmation, not finalized matches.
 func (e *Engine) MatchWithSuggestion(rawName, suggestedName, storeID, householdID string) MatchResult {
-	// Stages 1-3: standard pipeline on raw_name.
-	result := e.Match(rawName, storeID, householdID)
-	if result.Method != "unmatched" {
+	return e.MatchInput(context.Background(), Input{
+		RawName:       rawName,
+		SuggestedName: suggestedName,
+		StoreID:       storeID,
+		HouseholdID:   householdID,
+	})
+}
+
+func (e *Engine) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedName, storeID, householdID string) MatchResult {
+	return e.MatchInput(context.Background(), Input{
+		RawName:       rawName,
+		StoreItemCode: storeItemCode,
+		SuggestedName: suggestedName,
+		StoreID:       storeID,
+		HouseholdID:   householdID,
+	})
+}
+
+func (e *Engine) MatchInput(ctx context.Context, input Input) MatchResult {
+	normalized := Normalize(input.RawName)
+
+	if result := matchByIdentifier(ctx, e.db, input.HouseholdID, input.Identifiers); result != nil {
+		return *result
+	}
+
+	if result := matchByCode(e.db, input.StoreItemCode, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	if result := matchByRules(e.db, normalized, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	if result := matchByAlias(e.db, normalized, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	if result := matchByFuzzy(e.db, normalized, input.StoreID, input.HouseholdID); result != nil {
+		return *result
+	}
+
+	return e.matchSuggestion(input, MatchResult{Method: "unmatched", Confidence: 0})
+}
+
+func (e *Engine) matchSuggestion(input Input, result MatchResult) MatchResult {
+	if input.SuggestedName == "" {
 		return result
 	}
 
-	if suggestedName == "" {
-		return result
-	}
-
-	// Stage 4: Exact match suggested_name against product names.
-	if r := matchNameExact(e.db, suggestedName, householdID); r != nil {
-		// Check store history: reduce confidence for cross-store matches.
-		if hist := productHasStoreHistory(e.db, r.ProductID, storeID); hist == storeHistoryOtherStore {
+	if r := matchNameExact(e.db, input.SuggestedName, input.HouseholdID); r != nil {
+		if hist := productHasStoreHistory(e.db, r.ProductID, input.StoreID); hist == storeHistoryOtherStore {
 			r.Confidence = 0.7
 			r.Method = "cross_store_match"
 		}
 		return *r
 	}
 
-	// Stage 5: Fuzzy match suggested_name against product names + aliases.
-	normalizedSuggestion := Normalize(suggestedName)
-	if r := matchByFuzzy(e.db, normalizedSuggestion, storeID, householdID); r != nil {
-		// Check store history: reduce confidence for cross-store matches.
-		if hist := productHasStoreHistory(e.db, r.ProductID, storeID); hist == storeHistoryOtherStore {
+	normalizedSuggestion := Normalize(input.SuggestedName)
+	if r := matchByFuzzy(e.db, normalizedSuggestion, input.StoreID, input.HouseholdID); r != nil {
+		if hist := productHasStoreHistory(e.db, r.ProductID, input.StoreID); hist == storeHistoryOtherStore {
 			r.Confidence = 0.6
 			r.Method = "cross_store_match"
 		} else {
@@ -91,22 +125,20 @@ func (e *Engine) MatchWithSuggestion(rawName, suggestedName, storeID, householdI
 		return *r
 	}
 
-	return MatchResult{Method: "unmatched", Confidence: 0}
-}
-
-func (e *Engine) MatchWithCodeAndSuggestion(rawName, storeItemCode, suggestedName, storeID, householdID string) MatchResult {
-	if result := matchByCode(e.db, storeItemCode, storeID, householdID); result != nil {
-		return *result
-	}
-	return e.MatchWithSuggestion(rawName, suggestedName, storeID, householdID)
+	return result
 }
 
 // matchNameExact does a case-insensitive exact match of suggestedName against product names.
 func matchNameExact(db *sql.DB, suggestedName string, householdID string) *MatchResult {
 	var productID string
+	normalizedName := NormalizeProductName(suggestedName)
 	err := db.QueryRow(
-		`SELECT id FROM products WHERE household_id = ? AND LOWER(name) = LOWER(?) LIMIT 1`,
-		householdID, suggestedName,
+		`SELECT id
+		   FROM products
+		  WHERE household_id = ?
+		    AND (name_normalized = ? OR (name_normalized IS NULL AND LOWER(name) = LOWER(?)))
+		  LIMIT 1`,
+		householdID, normalizedName, suggestedName,
 	).Scan(&productID)
 	if err == nil {
 		return &MatchResult{

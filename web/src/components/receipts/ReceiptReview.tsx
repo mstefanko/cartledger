@@ -18,11 +18,13 @@ import {
 import { getReceipt, updateLineItem, createLineItem, createLineItems, repairReceiptPreview, applyRepairPreview, acceptSuggestions, confirmReceipt, type CreateLineItemRequest, type ManualLineItemInput, type ReceiptDetail, type RepairPreviewResponse } from '@/api/receipts'
 import { addProductLink, listProducts } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
-import type { LineItem, Product } from '@/types'
+import type { AcceptSuggestionsResponse, LineItem, Product } from '@/types'
 
 interface ReceiptReviewProps {
   receiptId: string
 }
+
+type IdentifierWarning = NonNullable<AcceptSuggestionsResponse['warnings']>[number]
 
 const SCAN_PROGRESS_STAGES = [
   { label: 'Reading receipt image...', duration: 12_000 },
@@ -321,6 +323,17 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   const [productUrlItem, setProductUrlItem] = useState<LineItemRow | null>(null)
   const [productUrl, setProductUrl] = useState('')
   const [productUrlError, setProductUrlError] = useState<string | null>(null)
+  const [identifierWarnings, setIdentifierWarnings] = useState<IdentifierWarning[]>([])
+
+  useEffect(() => {
+    setIdentifierWarnings([])
+  }, [receiptId])
+
+  const recordIdentifierWarnings = useCallback((response: AcceptSuggestionsResponse) => {
+    const warnings = response.warnings ?? []
+    if (warnings.length === 0) return
+    setIdentifierWarnings((current) => [...warnings, ...current].slice(0, 6))
+  }, [])
 
   // --- Mutations ---
   const matchMutation = useMutation({
@@ -556,7 +569,8 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
 
         if (!item.product_id) {
           if (!item.suggestion_type) return
-          await acceptSuggestions(receiptId, { line_item_ids: [item.id] })
+          const response = await acceptSuggestions(receiptId, { line_item_ids: [item.id] })
+          recordIdentifierWarnings(response)
         }
 
         await updateLineItem(receiptId, item.id, { review_status: 'accepted' })
@@ -570,7 +584,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         queryClient.invalidateQueries({ queryKey: ['receipts'] })
       }
     },
-    [queryClient, receipt, receiptId],
+    [queryClient, receipt, receiptId, recordIdentifierWarnings],
   )
 
   // --- Cell update handler ---
@@ -765,6 +779,9 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                   </Link>
                   {item.matched === 'code' && (
                     <Badge variant="neutral">code match</Badge>
+                  )}
+                  {item.matched === 'identifier' && (
+                    <Badge variant="success">ID match</Badge>
                   )}
                   <button
                     type="button"
@@ -1067,6 +1084,18 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                 </Button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {identifierWarnings.length > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+          <div className="flex flex-col gap-1">
+            {identifierWarnings.map((warning, index) => (
+              <p key={`${warning.code}-${warning.line_item_id ?? 'receipt'}-${index}`} className="text-body text-amber-900">
+                {warning.message}
+              </p>
+            ))}
           </div>
         </div>
       )}
@@ -1431,7 +1460,8 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                 setConfirmLoading(true)
                 try {
                   if (suggestedRows.length > 0) {
-                    await acceptSuggestions(receiptId, { line_item_ids: suggestedRows.map(r => r.id) })
+                    const response = await acceptSuggestions(receiptId, { line_item_ids: suggestedRows.map(r => r.id) })
+                    recordIdentifierWarnings(response)
                   }
                   if (pendingRuleMatches.length > 0 && receipt.status !== 'reviewed') {
                     setBatchRuleModalOpen(true)

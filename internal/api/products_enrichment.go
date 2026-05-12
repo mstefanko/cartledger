@@ -21,6 +21,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/enrichment"
 	"github.com/mstefanko/cartledger/internal/enrichment/adapters"
 	"github.com/mstefanko/cartledger/internal/httpsafe"
+	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/upc"
 )
@@ -293,11 +294,11 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	if err := applySuggestion(ctx, tx, productID, s); err != nil {
+	if err := applySuggestion(ctx, tx, householdID, productID, s); err != nil {
 		if errors.Is(err, errInvalidSuggestionValue) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		if isUniqueConstraintError(err) {
+		if errors.Is(err, identifiers.ErrIdentifierConflict) || isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "accepted value conflicts with an existing product"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -558,7 +559,7 @@ func (h *ProductHandler) fetchProductNutrition(productID string) []productNutrit
 
 var errInvalidSuggestionValue = errors.New("invalid suggestion value")
 
-func applySuggestion(ctx context.Context, tx *sql.Tx, productID string, s productEnrichmentSuggestionResponse) error {
+func applySuggestion(ctx context.Context, tx *sql.Tx, householdID, productID string, s productEnrichmentSuggestionResponse) error {
 	now := time.Now().UTC()
 	switch s.Field {
 	case "name":
@@ -571,9 +572,9 @@ func applySuggestion(ctx context.Context, tx *sql.Tx, productID string, s produc
 	case "upc":
 		upc, err := normalizeUPCValue(s.Value)
 		if err != nil || upc == "" {
-			return fmt.Errorf("%w: upc must contain 8 to 14 digits", errInvalidSuggestionValue)
+			return fmt.Errorf("%w: upc must be a valid GTIN", errInvalidSuggestionValue)
 		}
-		_, err = tx.ExecContext(ctx, "UPDATE products SET upc = ?, updated_at = ? WHERE id = ?", upc, now, productID)
+		_, err = identifiers.SetProductPrimaryGTIN(ctx, tx, householdID, productID, upc, "enrichment", s.Confidence)
 		return err
 	case "pack_quantity":
 		qty, err := strconv.ParseFloat(strings.TrimSpace(s.Value), 64)

@@ -49,7 +49,7 @@ func TestAddProductLinkReturnsKrogerSuggestionsAndAcceptsPackOnly(t *testing.T) 
 <title>Mission Carb Balance Soft Taco Flour Tortillas - Kroger</title>
 <h1>Mission Carb Balance Soft Taco Flour Tortillas</h1>
 <p>Brand: Mission</p>
-<p>UPC: 0001111008400</p>
+<p>UPC: 0001111008404</p>
 <p>Net Wt: 12 oz</p>
 <p>Calories 70</p>
 <p>Protein 5 g</p>
@@ -70,7 +70,7 @@ func TestAddProductLinkReturnsKrogerSuggestionsAndAcceptsPackOnly(t *testing.T) 
 	})
 	defer restore()
 
-	krogerURL := "http://www.kroger.com:" + serverURL.Port() + "/p/tortillas/0001111008400"
+	krogerURL := "http://www.kroger.com:" + serverURL.Port() + "/p/tortillas/0001111008404"
 	e := echo.New()
 	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/links", `{"url":"`+krogerURL+`"}`, householdID, productID)
 	if err := h.AddLink(c); err != nil {
@@ -141,7 +141,7 @@ func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
 	h.Cfg.USDAFDCAPIKey = "test-key"
 	householdID, _, _, productID := seedTestData(t, h)
 
-	upc := "0001111008400"
+	upc := "0001111008404"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/off/api/v2/product/"):
@@ -151,7 +151,7 @@ func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
 				"product": {
 					"product_name": "Mission Carb Balance Tortillas",
 					"brands": "Mission",
-					"code": "0001111008400",
+					"code": "0001111008404",
 					"quantity": "12 oz",
 					"ingredients_text": "Water, wheat.",
 					"allergens": "en:wheat",
@@ -172,7 +172,7 @@ func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
 					"fdcId": 123,
 					"description": "MISSION TORTILLAS",
 					"brandOwner": "MISSION",
-					"gtinUpc": "0001111008400",
+					"gtinUpc": "0001111008404",
 					"ingredients": "Water, wheat.",
 					"foodNutrients": [
 						{"nutrientName": "Energy", "unitName": "KCAL", "value": 72},

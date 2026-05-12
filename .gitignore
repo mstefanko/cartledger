@@ -1,5 +1,8 @@
 # Environment (secrets)
 .env
+.env.*
+!.env.example
+.envrc
 
 # Data
 data/
@@ -27,4 +30,5 @@ REVIEW-*.md
 ANALYSIS-*.md
 UX-AUDIT-*.md
 WORK-BREAKDOWN-*.md
+docs/plans/
 tmp/

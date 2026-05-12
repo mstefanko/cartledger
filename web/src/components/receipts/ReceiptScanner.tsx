@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
-import { scanReceipt } from '@/api/receipts'
+import { scanReceipt, type ScanReceiptResponse } from '@/api/receipts'
 import { Button } from '@/components/ui/Button'
 import {
   isPdfFile,
@@ -15,7 +15,6 @@ import {
   validatePageBudget,
   validateReceiptFile,
 } from '@/lib/receiptUpload'
-import type { Receipt } from '@/types'
 
 interface PageEntry {
   file: File
@@ -114,7 +113,7 @@ function ReceiptScanner() {
     }
   }, [])
 
-  const uploadMutation = useMutation<Receipt, Error, ReceiptUploadPage[]>({
+  const uploadMutation = useMutation<ScanReceiptResponse, Error, ReceiptUploadPage[]>({
     mutationFn: scanReceipt,
     onSuccess: (receipt) => {
       navigate(`/receipts/${receipt.id}`)
