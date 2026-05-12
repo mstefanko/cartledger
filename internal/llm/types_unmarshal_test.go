@@ -24,6 +24,9 @@ func TestReceiptExtractionUnmarshalAcceptsQuotedNumbers(t *testing.T) {
 			"store_item_code": "1407506",
 			"receipt_description": "LC SOFT TACO",
 			"upc": "0001111008404",
+			"package_label": "12 OZ",
+			"package_quantity": "12",
+			"package_unit": "oz",
 			"suggested_name": "Soft Taco Shells",
 			"suggested_brand": "",
 			"suggested_tags": "taco,shells",
@@ -69,6 +72,15 @@ func TestReceiptExtractionUnmarshalAcceptsQuotedNumbers(t *testing.T) {
 	}
 	if item.UPC == nil || *item.UPC != "0001111008404" {
 		t.Fatalf("UPC = %v, want 0001111008404", item.UPC)
+	}
+	if item.PackageLabel == nil || *item.PackageLabel != "12 OZ" {
+		t.Fatalf("PackageLabel = %v, want 12 OZ", item.PackageLabel)
+	}
+	if item.PackageQuantity == nil || *item.PackageQuantity != "12" {
+		t.Fatalf("PackageQuantity = %v, want 12", item.PackageQuantity)
+	}
+	if item.PackageUnit == nil || *item.PackageUnit != "oz" {
+		t.Fatalf("PackageUnit = %v, want oz", item.PackageUnit)
 	}
 	if item.DiscountAmount == nil || *item.DiscountAmount != -3 {
 		t.Fatalf("DiscountAmount = %v, want -3", item.DiscountAmount)

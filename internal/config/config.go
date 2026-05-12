@@ -91,6 +91,15 @@ type Config struct {
 	// default 404). Default true. Env: IMPORT_SPREADSHEET_ENABLED.
 	// See PLAN-spreadsheet-import.md §Rollout.
 	ImportSpreadsheetEnabled bool
+	// Product enrichment global gates. Manual lookup defaults on to preserve
+	// the existing explicit UPC/URL actions; automatic scan and sweep work
+	// require both these global flags and household opt-in settings.
+	ProductEnrichmentEnabled          bool
+	ProductEnrichmentAutoOnScan       bool
+	ProductEnrichmentScheduledSweep   bool
+	ProductEnrichmentSweepInterval    time.Duration
+	ProductEnrichmentMaxJobsPerSweep  int
+	ProductEnrichmentRefreshAfterDays int
 
 	// SMTP/mail settings. Empty SMTPHost disables outbound mail. AppBaseURL is
 	// used to build invite and password-reset links.
@@ -194,29 +203,35 @@ func load(server bool) (*Config, error) {
 	_ = godotenv.Load() // ignore error if .env doesn't exist
 
 	cfg := &Config{
-		Port:                        getEnv("PORT", "8079"),
-		DataDir:                     getEnv("DATA_DIR", "./data"),
-		AnthropicAPIKey:             getEnv("ANTHROPIC_API_KEY", ""),
-		GeminiAPIKey:                getEnv("GEMINI_API_KEY", ""),
-		LLMProvider:                 getEnv("LLM_PROVIDER", ""),
-		LLMModel:                    getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
-		USDAFDCAPIKey:               getEnv("USDA_FDC_API_KEY", ""),
-		LLMMonthlyTokenBudget:       getEnvInt64("LLM_MONTHLY_TOKEN_BUDGET", 0),
-		JWTSecret:                   os.Getenv("JWT_SECRET"), // no default — policy applied below
-		AllowPrivateIntegrations:    getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
-		LockInactivityTTL:           getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
-		RateLimitEnabled:            getEnvBool("RATE_LIMIT_ENABLED", true),
-		ImageRetentionDays:          int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
-		ImageRetentionSweepInterval: getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
-		BackupRetainCount:           int(getEnvInt64("BACKUP_RETAIN_COUNT", 14)),
-		ImportSpreadsheetEnabled:    getEnvBool("IMPORT_SPREADSHEET_ENABLED", true),
-		SMTPHost:                    strings.TrimSpace(getEnv("SMTP_HOST", "")),
-		SMTPPort:                    int(getEnvInt64("SMTP_PORT", 587)),
-		SMTPUser:                    getEnv("SMTP_USER", ""),
-		SMTPPass:                    getEnv("SMTP_PASS", ""),
-		SMTPFrom:                    strings.TrimSpace(getEnv("SMTP_FROM", "")),
-		SMTPTLSMode:                 strings.ToLower(strings.TrimSpace(getEnv("SMTP_TLS_MODE", "starttls"))),
-		AppBaseURL:                  strings.TrimRight(strings.TrimSpace(getEnv("APP_BASE_URL", "")), "/"),
+		Port:                              getEnv("PORT", "8079"),
+		DataDir:                           getEnv("DATA_DIR", "./data"),
+		AnthropicAPIKey:                   getEnv("ANTHROPIC_API_KEY", ""),
+		GeminiAPIKey:                      getEnv("GEMINI_API_KEY", ""),
+		LLMProvider:                       getEnv("LLM_PROVIDER", ""),
+		LLMModel:                          getEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
+		USDAFDCAPIKey:                     getEnv("USDA_FDC_API_KEY", ""),
+		LLMMonthlyTokenBudget:             getEnvInt64("LLM_MONTHLY_TOKEN_BUDGET", 0),
+		JWTSecret:                         os.Getenv("JWT_SECRET"), // no default — policy applied below
+		AllowPrivateIntegrations:          getEnvBool("ALLOW_PRIVATE_INTEGRATIONS", false),
+		LockInactivityTTL:                 getEnvDuration("LOCK_INACTIVITY_TTL", 60*time.Second),
+		RateLimitEnabled:                  getEnvBool("RATE_LIMIT_ENABLED", true),
+		ImageRetentionDays:                int(getEnvInt64("IMAGE_RETENTION_DAYS", 0)),
+		ImageRetentionSweepInterval:       getEnvDuration("IMAGE_RETENTION_SWEEP_INTERVAL", 24*time.Hour),
+		BackupRetainCount:                 int(getEnvInt64("BACKUP_RETAIN_COUNT", 14)),
+		ImportSpreadsheetEnabled:          getEnvBool("IMPORT_SPREADSHEET_ENABLED", true),
+		ProductEnrichmentEnabled:          getEnvBool("PRODUCT_ENRICHMENT_ENABLED", true),
+		ProductEnrichmentAutoOnScan:       getEnvBool("PRODUCT_ENRICHMENT_AUTO_ON_SCAN", false),
+		ProductEnrichmentScheduledSweep:   getEnvBool("PRODUCT_ENRICHMENT_SCHEDULED_SWEEP", false),
+		ProductEnrichmentSweepInterval:    getEnvDuration("PRODUCT_ENRICHMENT_SWEEP_INTERVAL", 24*time.Hour),
+		ProductEnrichmentMaxJobsPerSweep:  int(getEnvInt64("PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP", 50)),
+		ProductEnrichmentRefreshAfterDays: int(getEnvInt64("PRODUCT_ENRICHMENT_REFRESH_AFTER_DAYS", 90)),
+		SMTPHost:                          strings.TrimSpace(getEnv("SMTP_HOST", "")),
+		SMTPPort:                          int(getEnvInt64("SMTP_PORT", 587)),
+		SMTPUser:                          getEnv("SMTP_USER", ""),
+		SMTPPass:                          getEnv("SMTP_PASS", ""),
+		SMTPFrom:                          strings.TrimSpace(getEnv("SMTP_FROM", "")),
+		SMTPTLSMode:                       strings.ToLower(strings.TrimSpace(getEnv("SMTP_TLS_MODE", "starttls"))),
+		AppBaseURL:                        strings.TrimRight(strings.TrimSpace(getEnv("APP_BASE_URL", "")), "/"),
 	}
 	if cfg.SMTPHost == "" && cfg.AppBaseURL == "" {
 		cfg.AppBaseURL = "http://localhost:8079"

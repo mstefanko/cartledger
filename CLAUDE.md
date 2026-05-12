@@ -91,6 +91,7 @@ go test ./...     # Run Go tests (no frontend tests)
 - Backups: `cartledger backup` produces an archive in `$DATA_DIR/backups/`; `cartledger restore <archive>` restores into a fresh `$DATA_DIR`. Daily backups are scheduled via launchd; see `scripts/install-backup-launchd.sh`.
 - Planning docs (`PLAN-*.md`, `ANALYSIS-*.md`, etc.) are gitignored
 - **WebSocket lifecycle** — `connectWebSocket(queryClient)` in `web/src/api/ws.ts` is mounted exactly once in `AppLayout` (always post-auth via `ProtectedRoute`). Do NOT call it from individual components. Cleanup via `disconnectWebSocket()` runs on unmount/logout. The socket drives React Query cache invalidation for `receipt.complete`, `list.*`, `product.updated`, and `store.updated` messages.
+- **Product enrichment phase status** — current code only wires the Phase 1 manual/review slice: explicit URL/UPC lookup, receipt package suggestions, suggestion accept/reject, and the global `PRODUCT_ENRICHMENT_ENABLED` gate. Migrations 040-042 plus job/sweep/settings/store-ref config are provisional scaffolding for Phases 2-4; automated provider jobs, scheduled sweeps, household settings UI, and Kroger OAuth/store mapping are not live yet.
 
 # context-mode — MANDATORY routing rules
 

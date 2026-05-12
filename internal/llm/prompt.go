@@ -9,6 +9,9 @@ Rules:
 - store_item_code: store-printed item number/SKU if visible; Costco commonly prints this before the description
 - receipt_description: printed product text with the store item number/SKU removed only when confident
 - upc: product barcode/UPC/GTIN if explicitly printed for this line item; digits only; null when absent
+- package_label: explicit package content printed on the line, such as 12 OZ, 1GAL, 16 CT, or 2 x 8 ct; null when absent
+- package_quantity: numeric package quantity from explicit package text only; preserve decimal text when present; null when absent
+- package_unit: package unit from explicit package text only, such as oz, fl_oz, lb, g, ml, l, gal, each, or ct; null when absent
 - Store item numbers/SKUs are not purchase quantities
 - suggested_name: clean, human-readable canonical product name
   - Include brand when identifiable (e.g., "Kirkland Organic Broccoli Florets")
@@ -63,6 +66,7 @@ Rules:
 - Fix only issues supported by the image or the user note.
 - Store item numbers/SKUs are not purchase quantities.
 - If a product barcode/UPC/GTIN is printed for a line item, include upc as digits only; otherwise null.
+- If explicit package content is printed for a line item, include package_label, package_quantity, and package_unit; otherwise set all package fields to null.
 - For Costco receipts, the leading numeric field before the description is usually the store_item_code.
 - If only total_price is visible, set packaged-goods purchase quantity to 1.
 - Package text like 1GAL, 16 CT, 2 x 8 ct, or 2/31.7 is package content, not purchase quantity.

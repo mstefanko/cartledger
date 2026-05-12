@@ -342,13 +342,15 @@ func TestProcessJobStoresCostcoStoreCodeAndNormalizesQuantity(t *testing.T) {
 	}
 
 	var storeItemCode, receiptDescription, quantity, countContribution, gotProductID, matched string
+	var packQuantityOverride, packUnitOverride, packOverrideSource sql.NullString
 	var confidence sql.NullFloat64
 	if err := database.QueryRow(
 		`SELECT store_item_code, receipt_description, quantity, count_contribution,
-		        product_id, matched, confidence
+		        product_id, matched, confidence,
+		        pack_quantity_override, pack_unit_override, pack_override_source
 		   FROM line_items WHERE receipt_id = ?`,
 		receiptID,
-	).Scan(&storeItemCode, &receiptDescription, &quantity, &countContribution, &gotProductID, &matched, &confidence); err != nil {
+	).Scan(&storeItemCode, &receiptDescription, &quantity, &countContribution, &gotProductID, &matched, &confidence, &packQuantityOverride, &packUnitOverride, &packOverrideSource); err != nil {
 		t.Fatalf("query line item: %v", err)
 	}
 	if storeItemCode != "8" || receiptDescription != "2% MILK 1GAL" || quantity != "1" || countContribution != "1" {
@@ -358,5 +360,42 @@ func TestProcessJobStoresCostcoStoreCodeAndNormalizesQuantity(t *testing.T) {
 	if gotProductID != productID || matched != "code" || !confidence.Valid || confidence.Float64 != 0.99 {
 		t.Fatalf("match = product %q method %q confidence %v, want %q/code/0.99",
 			gotProductID, matched, confidence, productID)
+	}
+	if !packQuantityOverride.Valid || packQuantityOverride.String != "1" || !packUnitOverride.Valid || packUnitOverride.String != "gal" || !packOverrideSource.Valid || packOverrideSource.String != "receipt_explicit" {
+		t.Fatalf("package override = %q/%q/%q, want 1/gal/receipt_explicit",
+			packQuantityOverride.String, packUnitOverride.String, packOverrideSource.String)
+	}
+
+	var normalizedPrice, normalizedUnit sql.NullString
+	if err := database.QueryRow(
+		`SELECT normalized_price, normalized_unit
+		   FROM product_prices
+		  WHERE product_id = ?`,
+		productID,
+	).Scan(&normalizedPrice, &normalizedUnit); err != nil {
+		t.Fatalf("query product price: %v", err)
+	}
+	if !normalizedPrice.Valid || normalizedPrice.String != "0.0228125" || !normalizedUnit.Valid || normalizedUnit.String != "fl_oz" {
+		t.Fatalf("normalized price = %q/%q, want 0.0228125/fl_oz", normalizedPrice.String, normalizedUnit.String)
+	}
+
+	suggestions := map[string]string{}
+	rows, err := database.Query(`SELECT field, value FROM product_enrichment_suggestions WHERE product_id = ? AND source = 'receipt_explicit'`, productID)
+	if err != nil {
+		t.Fatalf("query suggestions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var field, value string
+		if err := rows.Scan(&field, &value); err != nil {
+			t.Fatalf("scan suggestion: %v", err)
+		}
+		suggestions[field] = value
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("suggestion rows: %v", err)
+	}
+	if suggestions["pack_quantity"] != "1" || suggestions["pack_unit"] != "gal" {
+		t.Fatalf("package suggestions = %+v, want pack_quantity=1 pack_unit=gal", suggestions)
 	}
 }

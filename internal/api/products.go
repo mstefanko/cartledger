@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,12 +24,14 @@ import (
 	"github.com/mstefanko/cartledger/internal/prices"
 	"github.com/mstefanko/cartledger/internal/search"
 	"github.com/mstefanko/cartledger/internal/storage"
+	"github.com/mstefanko/cartledger/internal/ws"
 )
 
 // ProductHandler holds dependencies for product-related endpoints.
 type ProductHandler struct {
 	DB  *sql.DB
 	Cfg *config.Config
+	Hub *ws.Hub
 }
 
 // --- Request types ---
@@ -138,6 +142,8 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products.GET("/:id/links", h.ListLinks)
 	products.POST("/:id/links", h.AddLink)
 	products.POST("/:id/enrich/upc", h.EnrichByUPC)
+	products.POST("/:id/enrichment-suggestions/bulk-accept", h.BulkAcceptEnrichmentSuggestions)
+	products.POST("/:id/enrichment-suggestions/bulk-reject", h.BulkRejectEnrichmentSuggestions)
 	products.POST("/:id/enrichment-suggestions/:suggestionId/accept", h.AcceptEnrichmentSuggestion)
 	products.POST("/:id/enrichment-suggestions/:suggestionId/reject", h.RejectEnrichmentSuggestion)
 	products.GET("/:id/detail", h.Detail)
@@ -166,6 +172,65 @@ func scanProductRow(rows *sql.Rows, p *productResponse) error {
 
 func floatPtr(v float64) *float64 {
 	return &v
+}
+
+func productEditFieldsFromRequest(c echo.Context) (map[string]struct{}, error) {
+	body, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return nil, err
+	}
+	c.Request().Body = io.NopCloser(bytes.NewReader(body))
+	fields := make(map[string]struct{})
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return fields, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	for jsonField, productField := range map[string]string{
+		"name":          "name",
+		"brand":         "brand",
+		"upc":           "upc",
+		"pack_quantity": "pack_quantity",
+		"pack_unit":     "pack_unit",
+	} {
+		if _, ok := raw[jsonField]; ok {
+			fields[productField] = struct{}{}
+		}
+	}
+	return fields, nil
+}
+
+func fieldsFromSet(fields map[string]struct{}) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	order := []string{"name", "brand", "upc", "pack_quantity", "pack_unit", "price_history"}
+	out := make([]string, 0, len(fields))
+	for _, field := range order {
+		if _, ok := fields[field]; ok {
+			out = append(out, field)
+		}
+	}
+	for field := range fields {
+		found := false
+		for _, known := range order {
+			if field == known {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
+func hasField(fields map[string]struct{}, field string) bool {
+	_, ok := fields[field]
+	return ok
 }
 
 // List returns products for the household.
@@ -357,6 +422,10 @@ func (h *ProductHandler) Update(c echo.Context) error {
 	productID := c.Param("id")
 
 	var req updateProductRequest
+	touchedFields, err := productEditFieldsFromRequest(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
@@ -451,6 +520,9 @@ func (h *ProductHandler) Update(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 	}
+	if err := recordProductFieldEdits(c.Request().Context(), tx, productID, auth.UserIDFrom(c), touchedFields, "manual"); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
 	if err := tx.Commit(); err != nil {
 		if isUniqueConstraintError(err) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "upc already belongs to another product"})
@@ -463,6 +535,7 @@ func (h *ProductHandler) Update(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
+	h.broadcastProductUpdated(householdID, productID, fieldsFromSet(touchedFields))
 	return c.JSON(http.StatusOK, p)
 }
 
@@ -509,27 +582,43 @@ func (h *ProductHandler) RecomputePrices(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	lineItemIDs, err := h.linkedLineItemsForProduct(ctx, productID, householdID)
+	updated, err := h.recomputeProductPrices(ctx, productID, householdID)
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to recompute price history"})
 	}
+	h.broadcastProductUpdated(householdID, productID, []string{"price_history"})
+	return c.JSON(http.StatusOK, recomputePricesResponse{UpdatedCount: updated})
+}
 
+func (h *ProductHandler) recomputeProductPrices(ctx context.Context, productID, householdID string) (int, error) {
 	tx, err := h.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		return 0, err
 	}
 	defer tx.Rollback()
 
-	for _, lineItemID := range lineItemIDs {
-		if err := prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID); err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to recompute price history"})
-		}
+	updated, err := h.recomputeProductPricesTx(ctx, tx, productID, householdID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return updated, nil
+}
+
+func (h *ProductHandler) recomputeProductPricesTx(ctx context.Context, tx *sql.Tx, productID, householdID string) (int, error) {
+	lineItemIDs, err := h.linkedLineItemsForProduct(ctx, productID, householdID)
+	if err != nil {
+		return 0, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to commit"})
+	for _, lineItemID := range lineItemIDs {
+		if err := prices.RecordProductPriceFromLineItem(ctx, tx, lineItemID); err != nil {
+			return 0, err
+		}
 	}
-	return c.JSON(http.StatusOK, recomputePricesResponse{UpdatedCount: len(lineItemIDs)})
+	return len(lineItemIDs), nil
 }
 
 func (h *ProductHandler) verifyProduct(ctx context.Context, productID, householdID string) error {
@@ -538,6 +627,45 @@ func (h *ProductHandler) verifyProduct(ctx context.Context, productID, household
 		"SELECT 1 FROM products WHERE id = ? AND household_id = ?",
 		productID, householdID,
 	).Scan(&exists)
+}
+
+func recordProductFieldEdits(ctx context.Context, tx *sql.Tx, productID, userID string, fields map[string]struct{}, source string) error {
+	for field := range fields {
+		if strings.TrimSpace(field) == "" {
+			continue
+		}
+		var editedBy interface{}
+		if strings.TrimSpace(userID) != "" {
+			editedBy = userID
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO product_field_edits
+			    (product_id, field, edited_by_user_id, edit_source, edited_at)
+			 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+			 ON CONFLICT(product_id, field) DO UPDATE SET
+			    edited_by_user_id = excluded.edited_by_user_id,
+			    edit_source = excluded.edit_source,
+			    edited_at = CURRENT_TIMESTAMP`,
+			productID, field, editedBy, source,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *ProductHandler) broadcastProductUpdated(householdID, productID string, changedFields []string) {
+	if h.Hub == nil {
+		return
+	}
+	h.Hub.Broadcast(ws.Message{
+		Type:      ws.EventProductUpdated,
+		Household: householdID,
+		Payload: map[string]interface{}{
+			"product_id":     productID,
+			"changed_fields": changedFields,
+		},
+	})
 }
 
 func (h *ProductHandler) linkedLineItemsForProduct(ctx context.Context, productID, householdID string) ([]string, error) {
@@ -1155,6 +1283,7 @@ func (h *ProductHandler) Merge(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
+	h.broadcastProductUpdated(householdID, req.KeepID, []string{"merge"})
 	return c.JSON(http.StatusOK, p)
 }
 

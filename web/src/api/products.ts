@@ -7,6 +7,7 @@ import type {
   ProductLink,
   ProductDetail,
   ProductEnrichmentSuggestion,
+  BulkProductEnrichmentSuggestionsResponse,
   CreateProductRequest,
   UpdateProductRequest,
   CreateAliasRequest,
@@ -117,6 +118,26 @@ export async function rejectProductEnrichmentSuggestion(
   return post<void>(
     `/products/${encodeURIComponent(productId)}/enrichment-suggestions/${encodeURIComponent(suggestionId)}/reject`,
     {},
+  )
+}
+
+export async function bulkAcceptProductEnrichmentSuggestions(
+  productId: string,
+  data: { suggestion_ids: string[]; recompute_prices?: boolean },
+): Promise<BulkProductEnrichmentSuggestionsResponse> {
+  return post<BulkProductEnrichmentSuggestionsResponse>(
+    `/products/${encodeURIComponent(productId)}/enrichment-suggestions/bulk-accept`,
+    data,
+  )
+}
+
+export async function bulkRejectProductEnrichmentSuggestions(
+  productId: string,
+  data: { suggestion_ids: string[] },
+): Promise<{ rejected: number }> {
+  return post<{ rejected: number }>(
+    `/products/${encodeURIComponent(productId)}/enrichment-suggestions/bulk-reject`,
+    data,
   )
 }
 

@@ -27,6 +27,9 @@ type ExtractedItem struct {
 	StoreItemCode      *string  `json:"store_item_code,omitempty"`
 	ReceiptDescription *string  `json:"receipt_description,omitempty"`
 	UPC                *string  `json:"upc,omitempty"`
+	PackageLabel       *string  `json:"package_label,omitempty"`
+	PackageQuantity    *string  `json:"package_quantity,omitempty"`
+	PackageUnit        *string  `json:"package_unit,omitempty"`
 	SuggestedName      string   `json:"suggested_name"`
 	SuggestedCategory  string   `json:"suggested_category"`
 	SuggestedBrand     string   `json:"suggested_brand"`

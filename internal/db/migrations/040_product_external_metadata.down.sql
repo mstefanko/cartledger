@@ -1,0 +1,5 @@
+DROP INDEX IF EXISTS idx_product_enrichment_suggestions_snapshot_unique;
+ALTER TABLE product_enrichment_suggestions DROP COLUMN external_metadata_id;
+DROP INDEX IF EXISTS idx_product_external_metadata_source_record;
+DROP INDEX IF EXISTS idx_product_external_metadata_product;
+DROP TABLE IF EXISTS product_external_metadata;

@@ -29,6 +29,89 @@ The short-term value is package size and identifiers. Nutrition is useful, but
 secondary. Photos are evidence and nice-to-have; they should not drive the
 first implementation.
 
+## Review Addendum: Required Corrections Before Implementation
+
+This plan is no longer a greenfield enrichment plan. Implement it as a delta on
+the code that already exists in this repository.
+
+Validated existing code:
+
+- `internal/db/migrations/036_product_identifiers.up.sql` already added
+  `product_identifiers`, `line_item_identifier_observations`, GTIN/PLU/external
+  identifier kinds, and line item `matched='identifier'`.
+- `internal/identifiers` already normalizes GTIN, PLU, and external identifiers
+  and returns `IdentifierConflictError` / `ErrIdentifierConflict` on household
+  identifier collisions.
+- `internal/enrichment/types.go`, `internal/enrichment/html.go`, and
+  `internal/enrichment/adapters/kroger.go` already exist. The Kroger adapter has
+  a substantial HTML/visible-text parser and fixture tests; Phase 4 must extend
+  that code, not replace it.
+- `internal/api/products_enrichment.go` already supports manual URL fetch,
+  Open Food Facts UPC lookup, USDA FoodData Central lookup when
+  `USDA_FDC_API_KEY` is configured, source links, field suggestions, suggestion
+  acceptance/rejection, and accepted nutrition persistence; supporting tests
+  live in `internal/api/products_enrichment_test.go`.
+- `internal/llm/guarded.go` and `internal/llm/breaker.go` already provide
+  household token budgets, rate-limit detection, retry-after helpers,
+  `ErrCircuitOpen`, and `ErrBudgetExceeded`. New LLM enrichment paths must go
+  through `GuardedExtractor`; do not create a second budget/breaker path.
+- `internal/worker/receipt.go` already has the worker pool, shutdown,
+  pending-job recovery, WebSocket completion events, identifier observations,
+  and price recording patterns that an enrichment worker should mirror.
+- `internal/sqliteutil/errors.go` already exposes `IsUniqueConstraint`; reuse it
+  for idempotent inserts and conflict handling.
+- `cmd/server/serve.go` is the actual server boot and worker wiring location.
+  `cmd/server/main.go` only calls `Execute()`.
+- `web/src/pages/ProductDetailPage.tsx` and
+  `web/src/components/settings/IntegrationsTab.tsx` already contain the product
+  detail and integration-card patterns this work should evolve.
+
+Hard decisions resolved:
+
+- Automatic external lookups are off by default. Manual lookup remains an
+  explicit user action. Receipt-triggered lookup and scheduled sweeps require a
+  household setting opt-in and the global config gate.
+- UPC conflicts stop the accept flow. A single accept returns `409` with the
+  existing product details. Bulk accept applies non-conflicting suggestions,
+  reports UPC conflicts in the response, and never silently reassigns an
+  identifier.
+- Manual user edits win over future provider suggestions. Add field-level edit
+  tracking so a later fetch does not keep resurfacing values the user already
+  corrected.
+- Successful products have a provider refresh cooldown. Default to 90 days for
+  scheduled refresh, 7 days for repeated failures, and allow an explicit manual
+  refresh to bypass the success cooldown while still respecting provider rate
+  limits.
+- Do not run a first-use backfill across the whole product table. At opt-in,
+  offer a bounded first-run batch focused on recently purchased/high-value
+  products, then let nightly sweeps and user-selected bulk lookup continue from
+  there.
+- Use WebSockets for cross-tab/client invalidation and terminal job events.
+  Use short React Query polling only while a visible page is showing an active
+  job.
+- Package overrides are written only from explicit, deterministic package text.
+  LLM-only package fields create suggestions, not line item overrides, unless
+  the deterministic parser agrees.
+
+Schema blockers to fix before provider orchestration:
+
+- `product_enrichment_suggestions` is currently coupled to
+  `product_link_id`. The nullable link means snapshot-driven suggestions cannot
+  be safely upserted by the existing unique constraint. Add an
+  `external_metadata_id` path and unique index, or create a source-link row for
+  every snapshot before inserting suggestions. This plan recommends the
+  `external_metadata_id` schema change.
+- Adding `PackageLabel`, `PackageQuantity`, or `PackageUnit` to
+  `llm.ExtractedItem` is not enough. The Claude tool schema in
+  `internal/llm/claude.go`, the tolerant unmarshal helper in
+  `internal/llm/types_unmarshal.go`, prompts, fixtures, and tests must all be
+  updated in the same phase.
+- Product mutation paths that accept suggestions must emit
+  `ws.EventProductUpdated` with `product_id`, and the frontend WebSocket handler
+  must invalidate both `['products']` and `['product-detail', product_id]`.
+- Every new migration must include a down migration. Concrete down SQL for the
+  proposed 040/041/042 migrations appears in the Data Model section.
+
 ## Current CartLedger Stack
 
 Existing pieces to keep and extend:
@@ -36,6 +119,10 @@ Existing pieces to keep and extend:
 - `products.upc` and `line_items.upc` already exist, with a household-level
   unique index on product UPC in
   `internal/db/migrations/032_upc_fields.up.sql`.
+- `product_identifiers` and `line_item_identifier_observations` already exist
+  from migration 036. Treat `products.upc` as the primary GTIN shortcut for
+  compatibility, while using `internal/identifiers` as the authoritative
+  conflict-aware identifier path.
 - `products.pack_quantity` and `products.pack_unit` already drive normalized
   price calculations.
 - `line_items.pack_quantity_override` and `line_items.pack_unit_override`
@@ -50,6 +137,12 @@ Existing pieces to keep and extend:
   suggestions.
 - `product_nutrition` already stores accepted nutrition/ingredient/allergen
   fields.
+- `internal/api/products_enrichment.go` already makes live Open Food Facts and
+  USDA calls and parses suggestions. The provider-chain work should extract and
+  harden this behavior, not create a second implementation.
+- `internal/enrichment/adapters/kroger.go` already parses Kroger visible text.
+  Use it as the URL/manual evidence parser and extend it for API-backed Kroger
+  metadata.
 - `ProductDetailPage` already exposes brand, UPC lookup, package size editing,
   source links, suggestions, and accepted nutrition.
 - `Settings -> Integrations` already has a credential-storage pattern for
@@ -200,10 +293,10 @@ Sources:
 
 #### IFPS PLU Database
 
-Defer a full PLU database until product identifiers are expanded beyond the
-current `products.upc` field. Short term, add lightweight PLU detection only:
-normalize 4-5 digit produce codes from receipt text and keep them as line
-observations or low-confidence suggestions. Do not scrape the IFPS website.
+Defer a full PLU database. The shipped identifier model can already store PLU
+observations; v1 should only add lightweight PLU detection from receipt text and
+keep matches as observations or low-confidence suggestions. Do not scrape the
+IFPS website.
 
 Source:
 
@@ -300,6 +393,94 @@ Initial metadata contract:
 }
 ```
 
+Concrete Go contract:
+
+```go
+type MetadataPayload struct {
+    Version        int                  `json:"version"`
+    Source         string               `json:"source"`
+    SourceRecordID *string              `json:"source_record_id,omitempty"`
+    SourceURL      *string              `json:"source_url,omitempty"`
+    Identifiers    []PayloadIdentifier  `json:"identifiers,omitempty"`
+    Name           *string              `json:"name,omitempty"`
+    Brand          *string              `json:"brand,omitempty"`
+    Category       *string              `json:"category,omitempty"`
+    Tags           []string             `json:"tags,omitempty"`
+    Package        *PackagePayload      `json:"package,omitempty"`
+    Serving        *ServingPayload      `json:"serving,omitempty"`
+    Nutrients      *NutrientPayload     `json:"nutrients,omitempty"`
+    Ingredients    *string              `json:"ingredients,omitempty"`
+    Allergens      []string             `json:"allergens,omitempty"`
+    ImageURLs      map[string]string    `json:"image_urls,omitempty"`
+    ProviderMeta   map[string]string    `json:"provider_meta,omitempty"`
+    Evidence       []EvidencePayload    `json:"evidence,omitempty"`
+}
+
+type PayloadIdentifier struct {
+    Type      string  `json:"type"`                // gtin, plu, external_id
+    Authority *string `json:"authority,omitempty"` // ifps, kroger, openfoodfacts
+    Value     string  `json:"value"`
+}
+
+type PackagePayload struct {
+    Label    *string  `json:"label,omitempty"`
+    Quantity *float64 `json:"quantity,omitempty"`
+    Unit     *string  `json:"unit,omitempty"`
+}
+
+type ServingPayload struct {
+    Label                *string  `json:"label,omitempty"`
+    Quantity             *float64 `json:"quantity,omitempty"`
+    Unit                 *string  `json:"unit,omitempty"`
+    ServingsPerContainer *float64 `json:"servings_per_container,omitempty"`
+}
+
+type NutrientPayload struct {
+    Calories             *float64 `json:"calories,omitempty"`
+    TotalFatG            *float64 `json:"total_fat_g,omitempty"`
+    SaturatedFatG        *float64 `json:"saturated_fat_g,omitempty"`
+    TransFatG            *float64 `json:"trans_fat_g,omitempty"`
+    CholesterolMG        *float64 `json:"cholesterol_mg,omitempty"`
+    SodiumMG             *float64 `json:"sodium_mg,omitempty"`
+    TotalCarbohydrateG   *float64 `json:"total_carbohydrate_g,omitempty"`
+    DietaryFiberG        *float64 `json:"dietary_fiber_g,omitempty"`
+    TotalSugarsG         *float64 `json:"total_sugars_g,omitempty"`
+    AddedSugarsG         *float64 `json:"added_sugars_g,omitempty"`
+    ProteinG             *float64 `json:"protein_g,omitempty"`
+}
+
+type EvidencePayload struct {
+    Field string  `json:"field"`
+    Text  string  `json:"text"`
+    URL   *string `json:"url,omitempty"`
+}
+```
+
+Suggestion linkage fix:
+
+```sql
+ALTER TABLE product_enrichment_suggestions
+    ADD COLUMN external_metadata_id TEXT
+        REFERENCES product_external_metadata(id) ON DELETE SET NULL;
+
+CREATE UNIQUE INDEX idx_product_enrichment_suggestions_snapshot_unique
+    ON product_enrichment_suggestions(product_id, external_metadata_id, field, value)
+    WHERE external_metadata_id IS NOT NULL;
+```
+
+Write rules:
+
+- Provider-backed suggestions must have either `product_link_id` or
+  `external_metadata_id`.
+- `source_url` remains required by the current suggestions table. Use the
+  provider product URL when available, otherwise a deterministic provider search
+  URL for the lookup key.
+- Snapshot-backed insert/upsert uses
+  `ON CONFLICT(product_id, external_metadata_id, field, value)`.
+- Existing URL/link-backed insert/upsert can keep using
+  `ON CONFLICT(product_id, product_link_id, field, value)`.
+- Do not insert new provider suggestions with both link and snapshot unset.
+
 ### 2. Enrichment Jobs
 
 Add a small persistent job/status table. This can start as a single-process
@@ -318,7 +499,7 @@ CREATE TABLE product_enrichment_jobs (
         'scheduled_refresh',
         'batch_backfill'
     )),
-    lookup_key          TEXT,
+    lookup_key          TEXT NOT NULL DEFAULT '',
     requested_sources   TEXT,
     status              TEXT NOT NULL DEFAULT 'queued' CHECK (status IN (
         'queued',
@@ -329,6 +510,7 @@ CREATE TABLE product_enrichment_jobs (
         'cancelled'
     )),
     attempt_count       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     DATETIME,
     last_error          TEXT,
     queued_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at          DATETIME,
@@ -341,6 +523,10 @@ CREATE INDEX idx_product_enrichment_jobs_status
 
 CREATE INDEX idx_product_enrichment_jobs_product
     ON product_enrichment_jobs(product_id, queued_at);
+
+CREATE UNIQUE INDEX idx_product_enrichment_jobs_active
+    ON product_enrichment_jobs(product_id, trigger, lookup_key)
+    WHERE status IN ('queued', 'running');
 ```
 
 Job idempotency:
@@ -348,11 +534,85 @@ Job idempotency:
 - before queueing a job, check for queued/running jobs for the same product and
   lookup key;
 - provider adapters upsert snapshots by source and source record;
-- suggestions upsert through the existing unique constraint;
+- suggestions upsert through either the existing link unique constraint or the
+  new snapshot unique index;
 - failed provider calls update snapshot/job metadata without deleting old good
   snapshots.
+- on server boot, reset stale `running` jobs older than 30 minutes to `queued`
+  with `attempt_count + 1`, capped by a max-attempt policy.
+- provider rate-limit responses set `next_attempt_at` from
+  `llm.RateLimitRetryAfter`-style helper logic when available; otherwise use
+  exponential backoff with jitter.
 
-### 3. Store External References
+### 3. Product Enrichment Settings
+
+Add household-scoped settings for privacy and provider opt-in. These are
+separate from credential rows in `integrations` because Open Food Facts has no
+secret and because automatic lookup needs its own explicit consent.
+
+```sql
+CREATE TABLE product_enrichment_settings (
+    household_id                  TEXT PRIMARY KEY REFERENCES households(id) ON DELETE CASCADE,
+    manual_lookup_enabled          INTEGER NOT NULL DEFAULT 1,
+    auto_on_scan_enabled           INTEGER NOT NULL DEFAULT 0,
+    scheduled_sweep_enabled        INTEGER NOT NULL DEFAULT 0,
+    provider_openfoodfacts_enabled INTEGER NOT NULL DEFAULT 1,
+    provider_usda_fdc_enabled      INTEGER NOT NULL DEFAULT 0,
+    provider_kroger_enabled        INTEGER NOT NULL DEFAULT 0,
+    first_run_backfill_limit       INTEGER NOT NULL DEFAULT 200,
+    created_at                     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at                     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Defaults:
+
+- Manual lookup is available by default because it is an explicit click.
+- Automatic scan lookup and scheduled sweep are disabled until the household
+  opts in.
+- USDA and Kroger provider toggles remain disabled until credentials or store
+  mapping exist.
+- The global `PRODUCT_ENRICHMENT_ENABLED=true` feature flag preserves existing
+  explicit manual lookup behavior. Operators can set it to `false` to disable
+  all provider calls regardless of household settings.
+
+### 4. Manual Field Edit Tracking
+
+Manual user edits should suppress repetitive future suggestions for the same
+field. Track the field-level edit instead of trying to infer intent from
+`products.updated_at`.
+
+```sql
+CREATE TABLE product_field_edits (
+    product_id         TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    field              TEXT NOT NULL,
+    edited_by_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
+    edit_source        TEXT NOT NULL DEFAULT 'manual' CHECK (edit_source IN (
+        'manual',
+        'suggestion_accept',
+        'merge',
+        'import'
+    )),
+    edited_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(product_id, field)
+);
+
+CREATE INDEX idx_product_field_edits_product
+    ON product_field_edits(product_id, edited_at);
+```
+
+Rules:
+
+- Product edit endpoints mark `name`, `brand`, `upc`, `pack_quantity`, and
+  `pack_unit` as `manual`.
+- Suggestion acceptance marks the field as `suggestion_accept`.
+- Automatic providers do not create a new pending suggestion for a non-empty
+  field if the latest field edit is newer than the snapshot evidence, unless the
+  user explicitly runs manual refresh.
+- Rejected suggestions stay rejected unless a later snapshot has a different
+  `content_hash` or source record.
+
+### 5. Store External References
 
 Kroger needs location mapping. Add a generic table rather than Kroger-specific
 columns on `stores`.
@@ -371,10 +631,93 @@ CREATE TABLE store_external_refs (
     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(store_id, source)
 );
+
+CREATE INDEX idx_store_external_refs_household_source
+    ON store_external_refs(household_id, source, external_id);
 ```
 
 For Kroger, `external_id` is `locationId`. `metadata_json` may hold address,
 banner, phone, and geocoordinates from the location lookup.
+
+### 6. Migration Order and Down Migrations
+
+Use the next available migration numbers after 039. The exact filenames should
+match the repository convention. The `...` markers below mean "use the full
+table definitions from the subsections above"; the down migrations are written
+out because they were previously missing.
+
+`040_product_external_metadata.up.sql`:
+
+```sql
+CREATE TABLE product_external_metadata (...);
+CREATE INDEX idx_product_external_metadata_product
+    ON product_external_metadata(product_id, source, fetched_at);
+CREATE UNIQUE INDEX idx_product_external_metadata_source_record
+    ON product_external_metadata(product_id, source, source_record_id)
+    WHERE source_record_id IS NOT NULL AND source_record_id != '';
+ALTER TABLE product_enrichment_suggestions
+    ADD COLUMN external_metadata_id TEXT
+        REFERENCES product_external_metadata(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX idx_product_enrichment_suggestions_snapshot_unique
+    ON product_enrichment_suggestions(product_id, external_metadata_id, field, value)
+    WHERE external_metadata_id IS NOT NULL;
+```
+
+`040_product_external_metadata.down.sql`:
+
+```sql
+DROP INDEX IF EXISTS idx_product_enrichment_suggestions_snapshot_unique;
+ALTER TABLE product_enrichment_suggestions DROP COLUMN external_metadata_id;
+DROP INDEX IF EXISTS idx_product_external_metadata_source_record;
+DROP INDEX IF EXISTS idx_product_external_metadata_product;
+DROP TABLE IF EXISTS product_external_metadata;
+```
+
+`041_product_enrichment_jobs_settings_edits.up.sql`:
+
+```sql
+CREATE TABLE product_enrichment_jobs (...);
+CREATE INDEX idx_product_enrichment_jobs_status
+    ON product_enrichment_jobs(status, queued_at);
+CREATE INDEX idx_product_enrichment_jobs_product
+    ON product_enrichment_jobs(product_id, queued_at);
+CREATE UNIQUE INDEX idx_product_enrichment_jobs_active
+    ON product_enrichment_jobs(product_id, trigger, lookup_key)
+    WHERE status IN ('queued', 'running');
+
+CREATE TABLE product_enrichment_settings (...);
+
+CREATE TABLE product_field_edits (...);
+CREATE INDEX idx_product_field_edits_product
+    ON product_field_edits(product_id, edited_at);
+```
+
+`041_product_enrichment_jobs_settings_edits.down.sql`:
+
+```sql
+DROP INDEX IF EXISTS idx_product_field_edits_product;
+DROP TABLE IF EXISTS product_field_edits;
+DROP TABLE IF EXISTS product_enrichment_settings;
+DROP INDEX IF EXISTS idx_product_enrichment_jobs_active;
+DROP INDEX IF EXISTS idx_product_enrichment_jobs_product;
+DROP INDEX IF EXISTS idx_product_enrichment_jobs_status;
+DROP TABLE IF EXISTS product_enrichment_jobs;
+```
+
+`042_store_external_refs.up.sql`:
+
+```sql
+CREATE TABLE store_external_refs (...);
+CREATE INDEX idx_store_external_refs_household_source
+    ON store_external_refs(household_id, source, external_id);
+```
+
+`042_store_external_refs.down.sql`:
+
+```sql
+DROP INDEX IF EXISTS idx_store_external_refs_household_source;
+DROP TABLE IF EXISTS store_external_refs;
+```
 
 ## Backend Design
 
@@ -389,6 +732,7 @@ type LookupInput struct {
     ProductName        string
     Brand              *string
     UPC                *string
+    Identifiers        []identifiers.ProductIdentifier
     StoreID            *string
     StoreName          *string
     StoreNumber        *string
@@ -416,15 +760,25 @@ type Provider interface {
 
 Adapters:
 
-- `openfoodfacts.Provider`: direct UPC lookup.
-- `usda.Provider`: direct UPC lookup when API key exists.
-- `kroger.Provider`: OAuth, product lookup, product search, and location-aware
-  candidate scoring.
-- `url.Provider`: wraps current manual URL fetch and Kroger HTML parser.
+- `openfoodfacts.Provider`: extract current Open Food Facts logic from
+  `internal/api/products_enrichment.go` into a fixture-tested adapter.
+- `usda.Provider`: extract current USDA FoodData Central logic from
+  `internal/api/products_enrichment.go`; use env `USDA_FDC_API_KEY` as fallback
+  after household settings.
+- `kroger.Provider`: add OAuth, product lookup, product search, and
+  location-aware candidate scoring while reusing the existing Kroger
+  visible-text parser in `internal/enrichment/adapters/kroger.go`.
+- `url.Provider`: wraps current manual URL fetch and existing Kroger HTML
+  parser.
 
 Keep current `enrichment.Suggestion` as the last-mile field suggestion type.
 Provider adapters should return snapshots plus suggestions; handlers store the
 snapshot first, then suggestions.
+
+HTTP-backed adapters must use `internal/httpsafe` and provider-specific
+allowlists/timeouts. LLM-backed enrichment, if added later, must use
+`internal/llm.GuardedExtractor`; receipt scanning should remain the only LLM
+caller in v1.
 
 ### Enrichment Runner
 
@@ -433,12 +787,16 @@ Create `internal/enrichment/runner`.
 Responsibilities:
 
 - load product, UPC, store codes, latest receipt descriptions, and store refs;
+- load `product_identifiers` through `internal/identifiers` rather than
+  inventing a second identifier store;
 - choose providers based on trigger and available identifiers;
 - enforce per-provider rate limits and timeouts;
 - store `product_external_metadata`;
 - upsert or refresh `product_links` when a canonical source URL exists;
 - create field-level suggestions;
+- skip suggestions blocked by newer `product_field_edits`;
 - update job status and metrics;
+- emit WebSocket invalidation events when jobs produce visible changes;
 - never overwrite product fields without user acceptance.
 
 Provider order:
@@ -458,8 +816,10 @@ Add product enrichment endpoints:
 - `GET /api/v1/products/:id/enrichment-jobs`
   - returns recent jobs for status display.
 - `POST /api/v1/products/:id/enrichment-suggestions/bulk-accept`
-  - body: `{ "suggestion_ids": ["..."] }`
-  - atomic accept where possible; returns accepted, skipped, conflicts.
+  - body: `{ "suggestion_ids": ["..."], "recompute_prices": false }`
+  - accepts each suggestion independently inside one request; non-conflicting
+    suggestions are applied, conflicted suggestions are reported and left
+    pending.
 - `POST /api/v1/products/:id/enrichment-suggestions/bulk-reject`
   - body: `{ "suggestion_ids": ["..."] }`.
 - Keep existing `POST /api/v1/products/:id/enrich/upc` as a compatibility
@@ -479,6 +839,46 @@ Add settings integration support:
   future paid providers;
 - Kroger config: `client_id`, `client_secret`, token metadata;
 - USDA config: API key. Keep env `USDA_FDC_API_KEY` as fallback.
+
+Bulk accept response:
+
+```json
+{
+  "accepted": [
+    { "suggestion_id": "s1", "field": "pack_quantity", "value": "12" }
+  ],
+  "skipped": [
+    { "suggestion_id": "s2", "field": "brand", "reason": "already_current" }
+  ],
+  "conflicts": [
+    {
+      "suggestion_id": "s3",
+      "field": "upc",
+      "code": "identifier_conflict",
+      "message": "UPC already belongs to another product",
+      "existing_product_id": "p_existing",
+      "existing_product_name": "Existing Product",
+      "suggested_merge": true
+    }
+  ]
+}
+```
+
+Single-suggestion accept may keep returning `409` for conflicts, but should use
+the same conflict shape. Bulk accept should return `200` when some suggestions
+were accepted and some conflicted, and `409` only when nothing could be applied
+because every selected mutation conflicted.
+
+WebSocket contract:
+
+- `ProductHandler` needs a `Hub *ws.Hub` dependency, wired in
+  `internal/api/router.go`.
+- Suggestion acceptance, bulk acceptance, product update, product merge, and
+  package-size recompute should broadcast `ws.EventProductUpdated`.
+- Payload: `{ "product_id": "...", "changed_fields": ["pack_quantity"] }`.
+- `web/src/api/ws.ts` must invalidate `['products']`,
+  `['product-detail', product_id]`, and field-specific queries such as
+  `['product-usage', product_id]` when relevant.
 
 ### Receipt Scan Flow
 
@@ -500,6 +900,36 @@ PackageQuantity *string `json:"package_quantity,omitempty"`
 PackageUnit     *string `json:"package_unit,omitempty"`
 ```
 
+Required companion changes:
+
+- Add the same fields to the tolerant item aux struct in
+  `internal/llm/types_unmarshal.go`.
+- Update `internal/llm/prompt.go` and receipt repair prompt text to ask for
+  package content only when printed on the receipt.
+- Update `internal/llm/claude.go` `receiptTool.InputSchema.Properties` under
+  `items.items.properties`:
+
+```go
+"package_label": map[string]any{
+    "type": []any{"string", "null"},
+    "description": "explicit package content printed on the receipt line, such as 12 OZ, 1GAL, 16 CT, or 2 x 8 ct; null if not printed",
+},
+"package_quantity": map[string]any{
+    "type": []any{"string", "null"},
+    "description": "numeric package quantity from explicit package text only; preserve decimal text when present",
+},
+"package_unit": map[string]any{
+    "type": []any{"string", "null"},
+    "description": "package unit from explicit package text only, such as oz, fl_oz, lb, g, ml, l, gal, each, or ct",
+},
+```
+
+- Add `package_label`, `package_quantity`, and `package_unit` to the item
+  schema `required` list with nullable types, matching the existing nullable
+  `store_item_code`, `receipt_description`, and `upc` pattern.
+- Update `internal/llm/testdata/sample-receipt.json`, mock client fixtures, and
+  unmarshal tests.
+
 Also add a deterministic parser that scans `raw_name` and
 `receipt_description` for explicit package text such as `1GAL`, `16 CT`,
 `12 OZ`, `2 x 8 ct`, and `31.7 oz`. If deterministic parser and LLM agree, use
@@ -507,14 +937,21 @@ higher confidence. If they disagree, leave as a suggestion.
 
 Worker behavior:
 
-- when package content is explicit and parseable, write line-item package
-  overrides so price normalization works immediately for that receipt;
+- when deterministic package content is explicit and parseable, write line-item
+  package overrides so price normalization works immediately for that receipt;
+- when deterministic parser and LLM package fields agree after canonicalization,
+  mark the override `pack_override_source='receipt_explicit'` and use higher
+  confidence for product suggestions;
+- when LLM package fields appear without deterministic evidence, create
+  suggestions only and do not write line overrides;
 - if the matched/accepted product lacks package size, create pending
   `pack_quantity` and `pack_unit` suggestions from the line evidence;
 - if UPC is present on a line and the product lacks UPC, create a pending UPC
-  suggestion or carry it into product creation during suggestion acceptance;
+  suggestion using `internal/identifiers` conflict checks, or carry it into
+  product creation during suggestion acceptance;
 - after receipt processing commits, queue enrichment jobs for products with a
-  new UPC or missing package size, capped per receipt.
+  new UPC or missing package size only when household auto-on-scan is enabled,
+  capped per receipt.
 
 Do not ask the LLM for nutrition, servings, ingredients, allergens, photos, or
 web-search facts during receipt scanning.
@@ -525,13 +962,29 @@ Start with conservative scheduling.
 
 Add config:
 
-- `PRODUCT_ENRICHMENT_ENABLED=false` by default;
-- `PRODUCT_ENRICHMENT_AUTO_ON_SCAN=true` only after settings opt-in;
+- `PRODUCT_ENRICHMENT_ENABLED=true` by default to preserve existing explicit
+  manual URL/UPC lookup behavior;
+- `PRODUCT_ENRICHMENT_AUTO_ON_SCAN=false` by default; the household setting
+  must also be enabled before scan-triggered jobs are queued;
+- `PRODUCT_ENRICHMENT_SCHEDULED_SWEEP=false` by default; the household setting
+  must also be enabled before sweeps run;
 - `PRODUCT_ENRICHMENT_SWEEP_INTERVAL=24h`;
 - `PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP=50`;
 - `PRODUCT_ENRICHMENT_REFRESH_AFTER_DAYS=90`;
 - provider-specific timeout and rate-limit constants in code, not user-tuned
   until there is operational evidence.
+
+First-run backfill:
+
+- do not enqueue every historical product after opt-in;
+- show an estimated candidate count and default to the top
+  `first_run_backfill_limit` products, ordered by recent purchase date,
+  purchase count, missing package size, and available UPC;
+- default first-run limit is 200 products per household;
+- user-selected bulk lookup can exceed the default limit, but still respects
+  provider rate limits and job queue caps;
+- nightly sweep continues at `PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP` for the
+  remaining eligible recent products.
 
 Sweep candidates:
 
@@ -546,7 +999,10 @@ Skip:
 - non-products;
 - products with no useful identifier unless the user manually requested lookup;
 - products with repeated provider failures in the last 7 days;
-- products whose missing fields were explicitly rejected recently.
+- products whose missing fields were explicitly rejected recently;
+- products whose last successful snapshot for all requested providers is newer
+  than `PRODUCT_ENRICHMENT_REFRESH_AFTER_DAYS`, unless the trigger is
+  `manual_refresh`.
 
 ## UI/UX Plan
 
@@ -641,25 +1097,59 @@ Privacy copy:
 - snapshots can be deleted/refetched;
 - accepted user edits remain household data.
 
+Workflow edge cases:
+
+- Provider conflicts: group competing suggestions by field and show source,
+  evidence, and current value. Do not auto-rank into a hidden winner; default
+  selected value should be the current value when user-edited.
+- Rate limits mid-batch: pause the provider, set affected jobs to queued with
+  `next_attempt_at`, and show a "paused until" provider status. Do not mark the
+  whole batch failed.
+- Photo URL 404s: store image URLs as evidence only. Lazy-check failures in the
+  UI should mark the image URL unavailable on the snapshot without deleting the
+  snapshot or failing the product lookup.
+- Granular provider opt-in: users can enable manual Open Food Facts lookup
+  while leaving automatic Open Food Facts, USDA, and Kroger disabled.
+- Undo accept: v1 should offer "Restore previous value" immediately after
+  accepting name/brand/package fields by using the old value returned in the
+  accept response. Full multi-step history can remain deferred.
+- Post-merge metadata: when products merge, move snapshots, links, identifiers,
+  and pending suggestions to the survivor when they do not conflict; leave
+  duplicate suggestions rejected with evidence text instead of adding new status
+  values in v1.
+- Running-state recovery: on boot, stale `running` enrichment jobs become
+  `queued` with an incremented attempt count, matching the receipt worker's
+  recovery style.
+- Integration test buttons: tests validate credentials and permissions without
+  writing snapshots or suggestions. A successful test may update only the
+  integration row's token/status metadata.
+
 ## Implementation Phases
 
 ### Phase 1: Metadata Backbone and Receipt Package Extraction
 
 Backend:
 
-- add `product_external_metadata` migration;
-- add `product_enrichment_jobs` migration;
+- add `product_external_metadata` migration and
+  `product_enrichment_suggestions.external_metadata_id`;
+- add `product_enrichment_jobs`, `product_enrichment_settings`, and
+  `product_field_edits` migrations;
+- include down migrations for each new migration file;
 - add metadata payload Go structs;
 - add package-content parser for receipt line text;
-- add LLM schema fields for explicit package content;
+- add LLM schema fields for explicit package content in `types.go`,
+  `types_unmarshal.go`, `claude.go`, prompts, fixtures, and tests;
 - populate line item package overrides when evidence is explicit;
 - create package-size suggestions from line evidence;
+- update suggestion acceptance to record field edits and broadcast
+  `product.updated`;
 - add tests for parser, worker persistence, and price normalization from line
   overrides.
 
 Frontend:
 
 - add Product Detail grouped suggestions and bulk accept/reject;
+- update WebSocket handling to invalidate product detail on `product.updated`;
 - improve UPC lookup success/error feedback;
 - show source/snapshot status.
 
@@ -673,7 +1163,8 @@ Why first:
 
 Backend:
 
-- move current Open Food Facts/USDA logic into provider adapters;
+- move current Open Food Facts/USDA logic from
+  `internal/api/products_enrichment.go` into provider adapters;
 - store metadata snapshots before creating suggestions;
 - add runner and manual job endpoint;
 - keep existing UPC endpoint as a wrapper;
@@ -699,6 +1190,8 @@ Acceptance:
 Backend:
 
 - start enrichment worker in `cmd/server/serve.go`;
+- mirror the receipt worker's queue depth, shutdown, and stale-running recovery
+  patterns;
 - queue limited jobs after receipt scan commit;
 - add scheduler/sweeper with config gates;
 - add metrics for jobs queued, succeeded, failed, provider latency, and
@@ -712,7 +1205,8 @@ Frontend:
 
 Acceptance:
 
-- scanning a receipt with UPCs queues jobs after the receipt completes;
+- scanning a receipt with UPCs queues jobs after the receipt completes when the
+  household has automatic lookup enabled;
 - jobs are capped and idempotent;
 - app restart leaves queued jobs recoverable;
 - users can disable all automatic external lookups.
@@ -724,7 +1218,8 @@ Backend:
 - add Kroger integration config and OAuth token handling;
 - add `store_external_refs`;
 - add location search/mapping endpoints;
-- add Kroger product lookup/search adapter;
+- extend existing `internal/enrichment/adapters/kroger.go` fixtures/parser for
+  URL evidence and add Kroger product lookup/search adapter logic around it;
 - score candidates using UPC, product name, brand, package size, location, and
   receipt price when available.
 
@@ -773,12 +1268,8 @@ Deferred because value is uncertain or maintenance cost is high:
 - natural-language nutrition search without UPC;
 - AI web search during receipt processing;
 - source-based automatic product overwrites without review;
-- replacing `products.upc` with a full multi-identifier model in this plan.
-
-The multi-identifier model still belongs in the broader product identity
-roadmap. This plan should stay compatible by treating `products.upc` as the
-current primary shortcut and storing extra identifiers inside metadata snapshots
-until that foundation lands.
+- global product identity expansion beyond the shipped household-scoped
+  `product_identifiers` model.
 
 ## Risks
 
@@ -802,33 +1293,72 @@ until that foundation lands.
   critical path. Queue after receipt commit.
 - Schema drift: provider payloads change. Adapter tests must use fixtures and
   the stored payload must remain allowlisted.
+- Manual edit churn: without `product_field_edits`, providers can keep
+  resurfacing values the user already fixed. Implement edit tracking before
+  scheduled lookup.
 
-## Open Questions
+## Resolved Questions and Recommendations
 
-- Should Open Food Facts be enabled by default for manual lookup only, while
-  automatic lookup remains opt-in?
-- Should USDA API key remain environment-only, household integration-only, or
-  both? Current code uses `USDA_FDC_API_KEY`; both is the least disruptive.
-- What exact threshold should auto-create line package overrides from receipt
-  text: deterministic parser only, or parser plus LLM agreement?
-- Should accepting a high-confidence UPC automatically queue provider lookup?
-- Do we want job status surfaced through WebSocket events, polling, or just
-  React Query refetch? Polling is simpler for v1.
-- What is the correct retention policy for stale source snapshots and failed
-  snapshots?
-- How should backups/exports represent external metadata attribution?
+- Open Food Facts default: enable manual lookup by default because it requires a
+  click. Keep automatic Open Food Facts lookup disabled until the household opts
+  in.
+- USDA API key: support both household integration and `USDA_FDC_API_KEY`.
+  Household credentials win. The env key remains a server-wide fallback and
+  should be shown in settings as configured by operator, not revealed.
+- Package override threshold: write line item overrides only when a
+  deterministic parser finds explicit package text. If the LLM agrees, raise
+  confidence. If only the LLM sees package content, create suggestions only.
+- UPC accept follow-up: accepting a UPC should queue provider lookup only when
+  the household has automatic lookup enabled or the user clicked a lookup action
+  in the same flow. Otherwise show a `Lookup missing info` action.
+- Job status transport: use WebSocket events for invalidation and terminal
+  state; use short polling while a Product Detail or settings batch page is
+  visibly showing active jobs.
+- Snapshot retention: keep snapshots tied to accepted suggestions, source
+  links, or current product evidence while the product exists. Prune failed-only
+  snapshots after 30 days and unaccepted stale snapshots after 180 days unless a
+  pending suggestion still references them.
+- Backups/exports: include `product_external_metadata`,
+  `product_enrichment_suggestions.external_metadata_id`, `store_external_refs`,
+  and provider attribution in backups. User-facing exports should include
+  accepted product/nutrition values plus source attribution, not raw provider
+  payloads beyond the allowlisted metadata contract.
+- Provider conflict UI: show conflicts as review choices grouped by field.
+  Never auto-merge UPC conflicts; route to the existing ProductMerge flow.
+- Rate limits mid-batch: pause only the affected provider and reschedule jobs
+  with `next_attempt_at`. Continue other providers when configured.
+- Photo URLs: treat image URLs as evidence. Failed image loads mark that image
+  unavailable but do not fail the product metadata snapshot.
+- Granular opt-in: expose provider toggles separately from automatic lookup
+  toggles.
+- Undo accept: v1 supports immediate restore using previous value returned by
+  accept responses. Full audit/history UI remains deferred.
+- Post-merge metadata: move non-conflicting links, identifiers, snapshots, and
+  pending suggestions to the survivor. Conflicting identifiers stay blocked and
+  are shown in the merge result.
+- Running recovery: reset stale `running` jobs on boot, increment attempts, and
+  cap retries with backoff.
+- Integration test semantics: test credentials and permissions only; do not
+  create product snapshots or suggestions from a test button.
 
 ## Test Plan
 
 Backend tests:
 
+- migrations 040/041/042 apply and down-migrate cleanly;
 - package parser for common receipt patterns;
+- LLM schema, prompt fixtures, and tolerant unmarshal include package fields;
 - worker stores package overrides and records normalized price from overrides;
 - Open Food Facts adapter maps fixtures to metadata and suggestions;
 - USDA adapter filters non-exact UPC matches;
-- Kroger adapter candidate scoring with fixtures;
+- Kroger adapter preserves existing visible-text fixture behavior and adds
+  candidate scoring fixtures;
 - job idempotency and retry behavior;
+- stale running jobs recover on boot;
 - suggestion accept conflicts for UPC uniqueness;
+- bulk accept returns accepted/skipped/conflicts and does not silently merge UPCs;
+- suggestion acceptance records `product_field_edits`;
+- suggestion acceptance broadcasts `product.updated`;
 - metadata payload allowlist rejects raw provider blobs;
 - safe HTTP client remains used for URL/manual fetch paths;
 - scheduled sweep caps jobs and skips recent failures.
@@ -837,8 +1367,11 @@ Frontend tests:
 
 - Product Detail renders grouped suggestions and bulk accept/reject;
 - lookup button shows queued/running/error/success states;
+- WebSocket `product.updated` invalidates product detail and product list
+  caches;
 - accepting package-size suggestion offers recompute;
 - settings cards store/test provider config;
+- settings expose granular provider and automatic lookup toggles;
 - product filters for missing metadata and failed lookups.
 
 Manual smoke:
@@ -847,5 +1380,8 @@ Manual smoke:
 - product with package text only on receipt;
 - Kroger product with mapped store;
 - product with conflicting UPC;
+- provider conflict between Open Food Facts and USDA values;
+- photo URL returns 404;
 - provider timeout/failure;
-- automatic enrichment disabled.
+- automatic enrichment disabled;
+- first-run backfill opt-in with more candidates than the default limit.

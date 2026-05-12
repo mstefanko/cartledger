@@ -313,6 +313,7 @@ export interface ProductEnrichmentSuggestion {
   id: string
   product_id: string
   product_link_id?: string | null
+  external_metadata_id?: string | null
   source: string
   source_url: string
   field: string
@@ -323,6 +324,22 @@ export interface ProductEnrichmentSuggestion {
   status: 'pending' | 'accepted' | 'rejected'
   created_at: string
   updated_at: string
+}
+
+export interface ProductEnrichmentSuggestionConflict {
+  suggestion_id: string
+  field: string
+  code: string
+  message: string
+  existing_product_id?: string
+  existing_product_name?: string
+  suggested_merge: boolean
+}
+
+export interface BulkProductEnrichmentSuggestionsResponse {
+  accepted: Array<{ suggestion_id: string; field: string; value: string }>
+  skipped: Array<{ suggestion_id: string; field?: string; reason: string }>
+  conflicts: ProductEnrichmentSuggestionConflict[]
 }
 
 // --- Product Group Types ---

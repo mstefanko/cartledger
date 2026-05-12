@@ -31,7 +31,7 @@ func newTestHandler(t *testing.T) (*ProductHandler, *ReviewHandler, func()) {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	cfg := &config.Config{DataDir: dir}
+	cfg := &config.Config{DataDir: dir, ProductEnrichmentEnabled: true}
 	ph := &ProductHandler{DB: database, Cfg: cfg}
 	rh := &ReviewHandler{DB: database, Cfg: cfg}
 
@@ -43,7 +43,9 @@ func newTestHandler(t *testing.T) (*ProductHandler, *ReviewHandler, func()) {
 }
 
 // insertHousehold inserts a household row and returns its id.
-func insertHousehold(t *testing.T, database interface{ Exec(string, ...interface{}) (interface{}, error) }, name string) string {
+func insertHousehold(t *testing.T, database interface {
+	Exec(string, ...interface{}) (interface{}, error)
+}, name string) string {
 	t.Helper()
 	// Use raw sql.DB via the handler's DB field.
 	return ""

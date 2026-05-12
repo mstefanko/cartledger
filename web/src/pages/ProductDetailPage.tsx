@@ -10,6 +10,8 @@ import {
   enrichProductByUPC,
   acceptProductEnrichmentSuggestion,
   rejectProductEnrichmentSuggestion,
+  bulkAcceptProductEnrichmentSuggestions,
+  bulkRejectProductEnrichmentSuggestions,
   previewProductPriceRecompute,
   recomputeProductPrices,
   uploadProductImage,
@@ -899,6 +901,10 @@ function sourceLabel(source: string): string {
       return 'Open Food Facts'
     case 'user_upc':
       return 'UPC'
+    case 'receipt_explicit':
+      return 'Receipt'
+    case 'receipt_llm':
+      return 'Receipt'
     default:
       return source
   }
@@ -1038,9 +1044,29 @@ function fieldLabel(field: string): string {
   return labels[field] ?? field
 }
 
+function suggestionGroup(field: string): string {
+  if (['name', 'brand', 'upc'].includes(field)) return 'Identity'
+  if (['pack_quantity', 'pack_unit'].includes(field)) return 'Package'
+  if (['ingredients', 'allergens'].includes(field)) return 'Ingredients'
+  return 'Nutrition'
+}
+
 function SuggestionsSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
   const queryClient = useQueryClient()
   const suggestions = detail.enrichment_suggestions ?? []
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [bulkRecomputePrices, setBulkRecomputePrices] = useState(false)
+  const groupedSuggestions = useMemo(() => {
+    return suggestions.reduce<Record<string, ProductEnrichmentSuggestion[]>>((groups, suggestion) => {
+      const group = suggestionGroup(suggestion.field)
+      groups[group] = [...(groups[group] ?? []), suggestion]
+      return groups
+    }, {})
+  }, [suggestions])
+  const selectedHasPackageSuggestion = suggestions.some((suggestion) =>
+    selectedIds.includes(suggestion.id) && ['pack_quantity', 'pack_unit'].includes(suggestion.field),
+  )
+
   const acceptMutation = useMutation({
     mutationFn: (suggestion: ProductEnrichmentSuggestion) =>
       acceptProductEnrichmentSuggestion(productId, suggestion.id, { fields: [suggestion.field] }),
@@ -1056,52 +1082,133 @@ function SuggestionsSection({ detail, productId }: { detail: ProductDetail; prod
       queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
     },
   })
+  const bulkAcceptMutation = useMutation({
+    mutationFn: () =>
+      bulkAcceptProductEnrichmentSuggestions(productId, {
+        suggestion_ids: selectedIds,
+        recompute_prices: selectedHasPackageSuggestion && bulkRecomputePrices,
+      }),
+    onSuccess: () => {
+      setSelectedIds([])
+      setBulkRecomputePrices(false)
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+  const bulkRejectMutation = useMutation({
+    mutationFn: () =>
+      bulkRejectProductEnrichmentSuggestions(productId, {
+        suggestion_ids: selectedIds,
+      }),
+    onSuccess: () => {
+      setSelectedIds([])
+      setBulkRecomputePrices(false)
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
 
   if (suggestions.length === 0) {
     return null
   }
 
+  const mutationPending =
+    acceptMutation.isPending ||
+    rejectMutation.isPending ||
+    bulkAcceptMutation.isPending ||
+    bulkRejectMutation.isPending
+  const toggleSelected = (id: string) => {
+    setSelectedIds((current) =>
+      current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
+    )
+  }
+
   return (
     <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Suggestions</h2>
-      <div className="space-y-2">
-        {suggestions.map((suggestion) => (
-          <div key={suggestion.id} className="rounded-xl border border-neutral-200 px-3 py-2">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-caption font-semibold text-neutral-900">{fieldLabel(suggestion.field)}</span>
-                  <Badge variant="neutral">{sourceLabel(suggestion.source)}</Badge>
-                  {suggestion.confidence != null && (
-                    <span className="text-small text-neutral-400">{Math.round(suggestion.confidence * 100)}%</span>
-                  )}
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <h2 className="font-display text-feature font-semibold text-neutral-900">Suggestions</h2>
+        <div className="flex flex-wrap gap-2">
+          {selectedHasPackageSuggestion && (
+            <label className="flex items-center gap-2 rounded-lg border border-neutral-200 px-2 py-1 text-small text-neutral-600">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded border-neutral-300 text-brand focus:ring-brand"
+                checked={bulkRecomputePrices}
+                onChange={(event) => setBulkRecomputePrices(event.target.checked)}
+                disabled={mutationPending}
+              />
+              Recompute prices
+            </label>
+          )}
+          <Button
+            size="sm"
+            variant="subtle"
+            onClick={() => bulkRejectMutation.mutate()}
+            disabled={selectedIds.length === 0 || mutationPending}
+          >
+            Dismiss selected
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => bulkAcceptMutation.mutate()}
+            disabled={selectedIds.length === 0 || mutationPending}
+          >
+            Accept selected
+          </Button>
+        </div>
+      </div>
+      <div className="space-y-4">
+        {Object.entries(groupedSuggestions).map(([group, groupSuggestions]) => (
+          <div key={group} className="space-y-2">
+            <h3 className="text-caption font-semibold text-neutral-500">{group}</h3>
+            {groupSuggestions.map((suggestion) => (
+              <div key={suggestion.id} className="rounded-xl border border-neutral-200 px-3 py-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="flex min-w-0 gap-3">
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-4 w-4 rounded border-neutral-300 text-brand focus:ring-brand"
+                      checked={selectedIds.includes(suggestion.id)}
+                      onChange={() => toggleSelected(suggestion.id)}
+                      disabled={mutationPending}
+                      aria-label={`Select ${fieldLabel(suggestion.field)} suggestion`}
+                    />
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-caption font-semibold text-neutral-900">{fieldLabel(suggestion.field)}</span>
+                        <Badge variant="neutral">{sourceLabel(suggestion.source)}</Badge>
+                        {suggestion.confidence != null && (
+                          <span className="text-small text-neutral-400">{Math.round(suggestion.confidence * 100)}%</span>
+                        )}
+                      </div>
+                      <div className="mt-1 grid gap-1 text-caption sm:grid-cols-2">
+                        <span className="min-w-0 text-neutral-400">Current: {suggestion.current_value || '—'}</span>
+                        <span className="min-w-0 text-neutral-900">Suggested: {suggestion.value}</span>
+                      </div>
+                      {suggestion.evidence && (
+                        <p className="mt-1 line-clamp-2 text-small text-neutral-400">{suggestion.evidence}</p>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    <Button
+                      size="sm"
+                      variant="subtle"
+                      onClick={() => rejectMutation.mutate(suggestion)}
+                      disabled={mutationPending}
+                    >
+                      Dismiss
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => acceptMutation.mutate(suggestion)}
+                      disabled={mutationPending}
+                    >
+                      Accept
+                    </Button>
+                  </div>
                 </div>
-                <div className="mt-1 grid gap-1 text-caption sm:grid-cols-2">
-                  <span className="min-w-0 text-neutral-400">Current: {suggestion.current_value || '—'}</span>
-                  <span className="min-w-0 text-neutral-900">Suggested: {suggestion.value}</span>
-                </div>
-                {suggestion.evidence && (
-                  <p className="mt-1 line-clamp-2 text-small text-neutral-400">{suggestion.evidence}</p>
-                )}
               </div>
-              <div className="flex shrink-0 gap-2">
-                <Button
-                  size="sm"
-                  variant="subtle"
-                  onClick={() => rejectMutation.mutate(suggestion)}
-                  disabled={rejectMutation.isPending || acceptMutation.isPending}
-                >
-                  Dismiss
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={() => acceptMutation.mutate(suggestion)}
-                  disabled={acceptMutation.isPending || rejectMutation.isPending}
-                >
-                  Accept
-                </Button>
-              </div>
-            </div>
+            ))}
           </div>
         ))}
       </div>

@@ -50,10 +50,44 @@ type acceptProductEnrichmentSuggestionRequest struct {
 	Fields []string `json:"fields,omitempty"`
 }
 
+type bulkProductEnrichmentSuggestionsRequest struct {
+	SuggestionIDs   []string `json:"suggestion_ids"`
+	RecomputePrices bool     `json:"recompute_prices"`
+}
+
+type bulkSuggestionAcceptedResponse struct {
+	SuggestionID string `json:"suggestion_id"`
+	Field        string `json:"field"`
+	Value        string `json:"value"`
+}
+
+type bulkSuggestionSkippedResponse struct {
+	SuggestionID string `json:"suggestion_id"`
+	Field        string `json:"field,omitempty"`
+	Reason       string `json:"reason"`
+}
+
+type productEnrichmentConflictResponse struct {
+	SuggestionID        string `json:"suggestion_id"`
+	Field               string `json:"field"`
+	Code                string `json:"code"`
+	Message             string `json:"message"`
+	ExistingProductID   string `json:"existing_product_id,omitempty"`
+	ExistingProductName string `json:"existing_product_name,omitempty"`
+	SuggestedMerge      bool   `json:"suggested_merge"`
+}
+
+type bulkProductEnrichmentSuggestionsResponse struct {
+	Accepted  []bulkSuggestionAcceptedResponse    `json:"accepted"`
+	Skipped   []bulkSuggestionSkippedResponse     `json:"skipped"`
+	Conflicts []productEnrichmentConflictResponse `json:"conflicts"`
+}
+
 type productEnrichmentSuggestionResponse struct {
 	ID           string    `json:"id"`
 	ProductID    string    `json:"product_id"`
 	LinkID       *string   `json:"product_link_id,omitempty"`
+	MetadataID   *string   `json:"external_metadata_id,omitempty"`
 	Source       string    `json:"source"`
 	SourceURL    string    `json:"source_url"`
 	Field        string    `json:"field"`
@@ -147,12 +181,19 @@ func scanProductLink(scanner rowScanner) (productLinkResponse, error) {
 	return l, nil
 }
 
+func (h *ProductHandler) productEnrichmentEnabled() bool {
+	return h.Cfg == nil || h.Cfg.ProductEnrichmentEnabled
+}
+
 // AddLink fetches a user-provided product URL and returns field-level
 // suggestions without overwriting product data.
 func (h *ProductHandler) AddLink(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
+	if !h.productEnrichmentEnabled() {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "product enrichment is disabled"})
+	}
 	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
@@ -196,6 +237,9 @@ func (h *ProductHandler) EnrichByUPC(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
+	if !h.productEnrichmentEnabled() {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "product enrichment is disabled"})
+	}
 	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
@@ -299,8 +343,11 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 		if errors.Is(err, identifiers.ErrIdentifierConflict) || isUniqueConstraintError(err) {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "accepted value conflicts with an existing product"})
+			return c.JSON(http.StatusConflict, h.suggestionConflict(ctx, householdID, s, err))
 		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	if err := recordProductFieldEdits(ctx, tx, productID, auth.UserIDFrom(c), map[string]struct{}{s.Field: {}}, "suggestion_accept"); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -317,7 +364,152 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
+	h.broadcastProductUpdated(householdID, productID, []string{s.Field})
 	return c.JSON(http.StatusOK, updated)
+}
+
+func (h *ProductHandler) BulkAcceptEnrichmentSuggestions(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req bulkProductEnrichmentSuggestionsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.SuggestionIDs) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "suggestion_ids is required"})
+	}
+
+	resp := bulkProductEnrichmentSuggestionsResponse{
+		Accepted:  []bulkSuggestionAcceptedResponse{},
+		Skipped:   []bulkSuggestionSkippedResponse{},
+		Conflicts: []productEnrichmentConflictResponse{},
+	}
+	changed := map[string]struct{}{}
+	toApply := make([]productEnrichmentSuggestionResponse, 0, len(req.SuggestionIDs))
+
+	for _, suggestionID := range req.SuggestionIDs {
+		suggestionID = strings.TrimSpace(suggestionID)
+		if suggestionID == "" {
+			continue
+		}
+		s, err := h.fetchSuggestion(ctx, productID, suggestionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			resp.Skipped = append(resp.Skipped, bulkSuggestionSkippedResponse{SuggestionID: suggestionID, Reason: "not_found"})
+			continue
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if suggestionAlreadyCurrent(s) {
+			resp.Skipped = append(resp.Skipped, bulkSuggestionSkippedResponse{SuggestionID: s.ID, Field: s.Field, Reason: "already_current"})
+			continue
+		}
+		toApply = append(toApply, s)
+	}
+
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	for _, s := range toApply {
+		if err := applySuggestion(ctx, tx, householdID, productID, s); err != nil {
+			if errors.Is(err, identifiers.ErrIdentifierConflict) || isUniqueConstraintError(err) {
+				resp.Conflicts = append(resp.Conflicts, h.suggestionConflict(ctx, householdID, s, err))
+				continue
+			}
+			if errors.Is(err, errInvalidSuggestionValue) {
+				resp.Skipped = append(resp.Skipped, bulkSuggestionSkippedResponse{SuggestionID: s.ID, Field: s.Field, Reason: err.Error()})
+				continue
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if err := recordProductFieldEdits(ctx, tx, productID, auth.UserIDFrom(c), map[string]struct{}{s.Field: {}}, "suggestion_accept"); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE product_enrichment_suggestions SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND product_id = ?",
+			s.ID, productID,
+		); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		resp.Accepted = append(resp.Accepted, bulkSuggestionAcceptedResponse{SuggestionID: s.ID, Field: s.Field, Value: s.Value})
+		changed[s.Field] = struct{}{}
+	}
+
+	if req.RecomputePrices && (hasField(changed, "pack_quantity") || hasField(changed, "pack_unit")) {
+		updated, err := h.recomputeProductPricesTx(ctx, tx, productID, householdID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to recompute price history"})
+		}
+		if updated > 0 {
+			changed["price_history"] = struct{}{}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	if len(changed) > 0 {
+		h.broadcastProductUpdated(householdID, productID, fieldsFromSet(changed))
+	}
+
+	status := http.StatusOK
+	if len(resp.Accepted) == 0 && len(resp.Skipped) == 0 && len(resp.Conflicts) > 0 {
+		status = http.StatusConflict
+	}
+	return c.JSON(status, resp)
+}
+
+func (h *ProductHandler) BulkRejectEnrichmentSuggestions(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req bulkProductEnrichmentSuggestionsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if len(req.SuggestionIDs) == 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "suggestion_ids is required"})
+	}
+
+	updated := 0
+	for _, suggestionID := range req.SuggestionIDs {
+		suggestionID = strings.TrimSpace(suggestionID)
+		if suggestionID == "" {
+			continue
+		}
+		result, err := h.DB.ExecContext(ctx,
+			"UPDATE product_enrichment_suggestions SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND product_id = ? AND status = 'pending'",
+			suggestionID, productID,
+		)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+		rows, _ := result.RowsAffected()
+		updated += int(rows)
+	}
+	if updated > 0 {
+		h.broadcastProductUpdated(householdID, productID, []string{"enrichment_suggestions"})
+	}
+	return c.JSON(http.StatusOK, map[string]int{"rejected": updated})
 }
 
 func (h *ProductHandler) RejectEnrichmentSuggestion(c echo.Context) error {
@@ -342,6 +534,7 @@ func (h *ProductHandler) RejectEnrichmentSuggestion(c echo.Context) error {
 	if rows == 0 {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "suggestion not found"})
 	}
+	h.broadcastProductUpdated(householdID, productID, []string{"enrichment_suggestions"})
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -397,8 +590,19 @@ func (h *ProductHandler) fetchProductLink(ctx context.Context, productID, linkID
 
 func (h *ProductHandler) storeSuggestions(ctx context.Context, productID string, linkID *string, suggestions []enrichment.Suggestion) ([]productEnrichmentSuggestionResponse, error) {
 	out := make([]productEnrichmentSuggestionResponse, 0, len(suggestions))
+	evidenceAt, hasEvidenceTime, err := h.suggestionEvidenceTime(ctx, productID, linkID)
+	if err != nil {
+		return nil, err
+	}
+	blockedFields, err := h.productFieldEditBlockedFields(ctx, productID, evidenceAt, hasEvidenceTime)
+	if err != nil {
+		return nil, err
+	}
 	for _, s := range suggestions {
 		if strings.TrimSpace(s.Value) == "" {
+			continue
+		}
+		if _, blocked := blockedFields[s.Field]; blocked {
 			continue
 		}
 		var id string
@@ -426,9 +630,55 @@ func (h *ProductHandler) storeSuggestions(ctx context.Context, productID string,
 	return out, nil
 }
 
+func (h *ProductHandler) suggestionEvidenceTime(ctx context.Context, productID string, linkID *string) (time.Time, bool, error) {
+	if linkID == nil || strings.TrimSpace(*linkID) == "" {
+		return time.Time{}, false, nil
+	}
+	var fetchedAt, createdAt sql.NullTime
+	if err := h.DB.QueryRowContext(ctx,
+		"SELECT fetched_at, created_at FROM product_links WHERE id = ? AND product_id = ?",
+		*linkID, productID,
+	).Scan(&fetchedAt, &createdAt); err != nil {
+		return time.Time{}, false, err
+	}
+	if fetchedAt.Valid {
+		return fetchedAt.Time, true, nil
+	}
+	if createdAt.Valid {
+		return createdAt.Time, true, nil
+	}
+	return time.Time{}, false, nil
+}
+
+func (h *ProductHandler) productFieldEditBlockedFields(ctx context.Context, productID string, evidenceAt time.Time, hasEvidenceTime bool) (map[string]struct{}, error) {
+	blocked := map[string]struct{}{}
+	if !hasEvidenceTime {
+		return blocked, nil
+	}
+	rows, err := h.DB.QueryContext(ctx,
+		`SELECT field
+		   FROM product_field_edits
+		  WHERE product_id = ?
+		    AND datetime(edited_at) > datetime(?)`,
+		productID, evidenceAt.Format("2006-01-02 15:04:05"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var field string
+		if err := rows.Scan(&field); err != nil {
+			return nil, err
+		}
+		blocked[field] = struct{}{}
+	}
+	return blocked, rows.Err()
+}
+
 func (h *ProductHandler) fetchProductEnrichmentSuggestions(productID string, pendingOnly bool) []productEnrichmentSuggestionResponse {
 	currentValues := h.currentValuesForProduct(productID)
-	query := `SELECT id, product_id, product_link_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at
+	query := `SELECT id, product_id, product_link_id, external_metadata_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at
 	            FROM product_enrichment_suggestions
 	           WHERE product_id = ?`
 	args := []interface{}{productID}
@@ -453,7 +703,7 @@ func (h *ProductHandler) fetchProductEnrichmentSuggestions(productID string, pen
 
 func (h *ProductHandler) fetchSuggestion(ctx context.Context, productID, suggestionID string) (productEnrichmentSuggestionResponse, error) {
 	return h.scanSuggestion(h.DB.QueryRowContext(ctx,
-		`SELECT id, product_id, product_link_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at
+		`SELECT id, product_id, product_link_id, external_metadata_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at
 		   FROM product_enrichment_suggestions
 		  WHERE id = ? AND product_id = ?`,
 		suggestionID, productID,
@@ -462,13 +712,16 @@ func (h *ProductHandler) fetchSuggestion(ctx context.Context, productID, suggest
 
 func (h *ProductHandler) scanSuggestion(scanner rowScanner, currentValues map[string]string) (productEnrichmentSuggestionResponse, error) {
 	var s productEnrichmentSuggestionResponse
-	var linkID, evidence sql.NullString
+	var linkID, metadataID, evidence sql.NullString
 	var confidence sql.NullFloat64
-	if err := scanner.Scan(&s.ID, &s.ProductID, &linkID, &s.Source, &s.SourceURL, &s.Field, &s.Value, &evidence, &confidence, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
+	if err := scanner.Scan(&s.ID, &s.ProductID, &linkID, &metadataID, &s.Source, &s.SourceURL, &s.Field, &s.Value, &evidence, &confidence, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
 		return s, err
 	}
 	if linkID.Valid {
 		s.LinkID = &linkID.String
+	}
+	if metadataID.Valid {
+		s.MetadataID = &metadataID.String
 	}
 	if evidence.Valid {
 		s.Evidence = &evidence.String
@@ -946,6 +1199,73 @@ func productFetchError(err error) string {
 func hashContent(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+func suggestionAlreadyCurrent(s productEnrichmentSuggestionResponse) bool {
+	if s.CurrentValue == nil {
+		return false
+	}
+	current := strings.TrimSpace(*s.CurrentValue)
+	value := strings.TrimSpace(s.Value)
+	if current == "" && value == "" {
+		return true
+	}
+	switch s.Field {
+	case "brand":
+		return matcher.NormalizeBrand(current) == matcher.NormalizeBrand(value)
+	case "upc":
+		currentUPC, currentErr := normalizeUPCValue(current)
+		valueUPC, valueErr := normalizeUPCValue(value)
+		return currentErr == nil && valueErr == nil && currentUPC == valueUPC
+	case "pack_quantity":
+		currentQty, currentErr := strconv.ParseFloat(current, 64)
+		valueQty, valueErr := strconv.ParseFloat(value, 64)
+		return currentErr == nil && valueErr == nil && currentQty == valueQty
+	case "pack_unit":
+		return canonicalProductUnit(current) == canonicalProductUnit(value)
+	default:
+		return strings.EqualFold(current, value)
+	}
+}
+
+func (h *ProductHandler) suggestionConflict(ctx context.Context, householdID string, s productEnrichmentSuggestionResponse, err error) productEnrichmentConflictResponse {
+	resp := productEnrichmentConflictResponse{
+		SuggestionID:   s.ID,
+		Field:          s.Field,
+		Code:           "value_conflict",
+		Message:        "accepted value conflicts with an existing product",
+		SuggestedMerge: false,
+	}
+	if s.Field == "upc" || errors.Is(err, identifiers.ErrIdentifierConflict) {
+		resp.Code = "identifier_conflict"
+		resp.Message = "UPC already belongs to another product"
+	}
+
+	var conflict *identifiers.IdentifierConflictError
+	if errors.As(err, &conflict) && conflict != nil {
+		resp.ExistingProductID = conflict.ExistingProductID
+	}
+	if resp.ExistingProductID == "" && s.Field == "upc" {
+		if normalized, normErr := normalizeUPCValue(s.Value); normErr == nil && normalized != "" {
+			_ = h.DB.QueryRowContext(ctx,
+				`SELECT id
+				   FROM products
+				  WHERE household_id = ?
+				    AND id != ?
+				    AND upc = ?
+				  LIMIT 1`,
+				householdID, s.ProductID, normalized,
+			).Scan(&resp.ExistingProductID)
+		}
+	}
+	if resp.ExistingProductID != "" {
+		resp.SuggestedMerge = true
+		_ = h.DB.QueryRowContext(ctx,
+			"SELECT name FROM products WHERE id = ? AND household_id = ?",
+			resp.ExistingProductID, householdID,
+		).Scan(&resp.ExistingProductName)
+	}
+	return resp
 }
 
 func fieldSelected(fields []string, field string) bool {

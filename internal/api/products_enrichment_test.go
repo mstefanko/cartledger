@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/mstefanko/cartledger/internal/enrichment"
 	"github.com/mstefanko/cartledger/internal/httpsafe"
+	"github.com/mstefanko/cartledger/internal/identifiers"
 )
 
 func TestAddProductLinkRejectsUnsafeURL(t *testing.T) {
@@ -132,6 +135,17 @@ func TestAddProductLinkReturnsKrogerSuggestionsAndAcceptsPackOnly(t *testing.T) 
 	if !strings.Contains(rec.Body.String(), `"status":"accepted"`) {
 		t.Fatalf("accepted response did not mark accepted: %s", rec.Body.String())
 	}
+
+	var editSource string
+	if err := h.DB.QueryRow(
+		"SELECT edit_source FROM product_field_edits WHERE product_id = ? AND field = 'pack_quantity'",
+		productID,
+	).Scan(&editSource); err != nil {
+		t.Fatalf("query field edit: %v", err)
+	}
+	if editSource != "suggestion_accept" {
+		t.Fatalf("edit_source = %q, want suggestion_accept", editSource)
+	}
 }
 
 func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
@@ -237,6 +251,49 @@ func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
 	}
 }
 
+func TestStoreSuggestionsSkipsEditedFieldsNewerThanLinkEvidence(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	_, _, _, productID := seedTestData(t, h)
+
+	var linkID string
+	if err := h.DB.QueryRow(
+		`INSERT INTO product_links
+		    (product_id, source, url, label, created_at, fetched_at)
+		 VALUES (?, 'openfoodfacts', 'https://world.openfoodfacts.org/product/0001111008404', 'Old snapshot', '2026-05-08 10:00:00', '2026-05-08 10:00:00')
+		 RETURNING id`,
+		productID,
+	).Scan(&linkID); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_field_edits (product_id, field, edit_source, edited_at)
+		 VALUES (?, 'name', 'manual', '2026-05-09 10:00:00')`,
+		productID,
+	); err != nil {
+		t.Fatalf("insert field edit: %v", err)
+	}
+
+	stored, err := h.storeSuggestions(context.Background(), productID, &linkID, []enrichment.Suggestion{
+		enrichment.NewSuggestion("openfoodfacts", "https://world.openfoodfacts.org/product/0001111008404", "name", "Stale provider name", "Older snapshot", 0.9),
+		enrichment.NewSuggestion("openfoodfacts", "https://world.openfoodfacts.org/product/0001111008404", "calories", "70", "Older snapshot", 0.9),
+	})
+	if err != nil {
+		t.Fatalf("storeSuggestions: %v", err)
+	}
+	if len(stored) != 1 || stored[0].Field != "calories" {
+		t.Fatalf("stored suggestions = %+v, want only calories after name edit suppression", stored)
+	}
+
+	var nameSuggestions int
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_enrichment_suggestions WHERE product_id = ? AND field = 'name'", productID).Scan(&nameSuggestions); err != nil {
+		t.Fatalf("count name suggestions: %v", err)
+	}
+	if nameSuggestions != 0 {
+		t.Fatalf("name suggestions = %d, want 0", nameSuggestions)
+	}
+}
+
 func TestAcceptNutritionSuggestionWithoutLinkUpdatesExistingRow(t *testing.T) {
 	h, _, cleanup := newTestHandler(t)
 	defer cleanup()
@@ -276,6 +333,138 @@ func TestAcceptNutritionSuggestionWithoutLinkUpdatesExistingRow(t *testing.T) {
 	}
 	if rowCount != 1 || !calories.Valid || calories.Float64 != 80 {
 		t.Fatalf("nutrition rowCount=%d calories=%+v, want one row updated to 80", rowCount, calories)
+	}
+}
+
+func TestBulkAcceptReportsUPCConflict(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	upc := "0001111008404"
+	var existingID string
+	if err := h.DB.QueryRow(
+		"INSERT INTO products (household_id, name) VALUES (?, 'Existing Tortillas') RETURNING id",
+		householdID,
+	).Scan(&existingID); err != nil {
+		t.Fatalf("insert existing product: %v", err)
+	}
+	confidence := 1.0
+	if _, err := identifiers.SetProductPrimaryGTIN(context.Background(), h.DB, householdID, existingID, upc, "manual", &confidence); err != nil {
+		t.Fatalf("set existing gtin: %v", err)
+	}
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_enrichment_suggestions
+		    (id, product_id, source, source_url, field, value, status)
+		 VALUES ('sug-conflicting-upc', ?, 'openfoodfacts', 'https://world.openfoodfacts.org/product/0001111008404', 'upc', ?, 'pending')`,
+		productID, upc,
+	); err != nil {
+		t.Fatalf("insert suggestion: %v", err)
+	}
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrichment-suggestions/bulk-accept", `{"suggestion_ids":["","sug-conflicting-upc"]}`, householdID, productID)
+	if err := h.BulkAcceptEnrichmentSuggestions(c); err != nil {
+		t.Fatalf("BulkAcceptEnrichmentSuggestions: %v", err)
+	}
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body bulkProductEnrichmentSuggestionsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(body.Accepted) != 0 || len(body.Conflicts) != 1 {
+		t.Fatalf("bulk response = %+v, want one conflict and no accepted", body)
+	}
+	conflict := body.Conflicts[0]
+	if conflict.Code != "identifier_conflict" || conflict.ExistingProductID != existingID || !conflict.SuggestedMerge {
+		t.Fatalf("conflict = %+v, want identifier conflict for %s", conflict, existingID)
+	}
+
+	var status string
+	if err := h.DB.QueryRow("SELECT status FROM product_enrichment_suggestions WHERE id = 'sug-conflicting-upc'").Scan(&status); err != nil {
+		t.Fatalf("query suggestion status: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("suggestion status = %q, want pending", status)
+	}
+}
+
+func TestBulkAcceptRollsBackOnHardError(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	if _, err := h.DB.Exec(
+		`CREATE TRIGGER fail_brand_update
+		 BEFORE UPDATE OF brand ON products
+		 WHEN NEW.brand = 'Fail'
+		 BEGIN
+		   SELECT RAISE(ABORT, 'forced brand failure');
+		 END`,
+	); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_enrichment_suggestions
+		    (id, product_id, source, source_url, field, value, status)
+		 VALUES
+		    ('sug-name-ok', ?, 'manual', 'manual://bulk', 'name', 'Better Widget', 'pending'),
+		    ('sug-brand-fails', ?, 'manual', 'manual://bulk', 'brand', 'fail', 'pending')`,
+		productID, productID,
+	); err != nil {
+		t.Fatalf("insert suggestions: %v", err)
+	}
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrichment-suggestions/bulk-accept", `{"suggestion_ids":["sug-name-ok","sug-brand-fails"]}`, householdID, productID)
+	if err := h.BulkAcceptEnrichmentSuggestions(c); err != nil {
+		t.Fatalf("BulkAcceptEnrichmentSuggestions: %v", err)
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var name string
+	if err := h.DB.QueryRow("SELECT name FROM products WHERE id = ?", productID).Scan(&name); err != nil {
+		t.Fatalf("query product name: %v", err)
+	}
+	if name != "Widget" {
+		t.Fatalf("name = %q, want original Widget after rollback", name)
+	}
+
+	var accepted int
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_enrichment_suggestions WHERE product_id = ? AND status = 'accepted'", productID).Scan(&accepted); err != nil {
+		t.Fatalf("count accepted suggestions: %v", err)
+	}
+	if accepted != 0 {
+		t.Fatalf("accepted suggestions = %d, want 0 after rollback", accepted)
+	}
+
+	var edits int
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_field_edits WHERE product_id = ?", productID).Scan(&edits); err != nil {
+		t.Fatalf("count field edits: %v", err)
+	}
+	if edits != 0 {
+		t.Fatalf("field edits = %d, want 0 after rollback", edits)
+	}
+}
+
+func TestEnrichByUPCRespectsGlobalDisable(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	h.Cfg.ProductEnrichmentEnabled = false
+	householdID, _, _, productID := seedTestData(t, h)
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrich/upc", `{"upc":"0001111008404"}`, householdID, productID)
+	if err := h.EnrichByUPC(c); err != nil {
+		t.Fatalf("EnrichByUPC: %v", err)
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

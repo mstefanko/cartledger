@@ -106,3 +106,57 @@ func TestList_SortLastPurchasedAt(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateRecordsManualProductFieldEdits(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	householdID, _, _, productID := seedTestData(t, h)
+	if _, err := h.DB.Exec(
+		"INSERT INTO users (id, household_id, email, name, password_hash) VALUES ('user-manual-editor', ?, 'editor@example.com', 'Editor', 'hash')",
+		householdID,
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPut, "/api/v1/products/"+productID, `{"brand":"Acme","pack_quantity":12,"pack_unit":"oz"}`, householdID, productID)
+	c.Set(auth.ContextKeyUserID, "user-manual-editor")
+	if err := h.Update(c); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := h.DB.Query(
+		`SELECT field, edited_by_user_id, edit_source
+		   FROM product_field_edits
+		  WHERE product_id = ?
+		  ORDER BY field`,
+		productID,
+	)
+	if err != nil {
+		t.Fatalf("query field edits: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var field, userID, source string
+		if err := rows.Scan(&field, &userID, &source); err != nil {
+			t.Fatalf("scan field edit: %v", err)
+		}
+		got[field] = userID + "/" + source
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("field edit rows: %v", err)
+	}
+	for _, field := range []string{"brand", "pack_quantity", "pack_unit"} {
+		if got[field] != "user-manual-editor/manual" {
+			t.Fatalf("field edit %s = %q, want user-manual-editor/manual; all=%+v", field, got[field], got)
+		}
+	}
+	if _, ok := got["name"]; ok {
+		t.Fatalf("name edit was recorded even though name was not in request: %+v", got)
+	}
+}

@@ -198,7 +198,7 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	storeHandler := &StoreHandler{DB: database, Cfg: cfg}
 	storeHandler.RegisterRoutes(protected)
 
-	productHandler := &ProductHandler{DB: database, Cfg: cfg}
+	productHandler := &ProductHandler{DB: database, Cfg: cfg, Hub: hub}
 	productHandler.RegisterRoutes(protected)
 
 	groupHandler := &GroupHandler{DB: database, Cfg: cfg}

@@ -84,6 +84,15 @@ export function connectWebSocket(queryClient: QueryClient): ReconnectingWebSocke
         break
       case 'product.updated':
         void queryClient.invalidateQueries({ queryKey: ['products'] })
+        {
+          const payload = (message.payload ?? {}) as { product_id?: string }
+          if (payload.product_id) {
+            void queryClient.invalidateQueries({ queryKey: ['product-detail', payload.product_id] })
+            void queryClient.invalidateQueries({ queryKey: ['product-usage', payload.product_id] })
+          } else {
+            void queryClient.invalidateQueries({ queryKey: ['product-detail'] })
+          }
+        }
         break
       case 'store.updated':
         void queryClient.invalidateQueries({ queryKey: ['stores'] })

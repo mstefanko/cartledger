@@ -1,10 +1,14 @@
 package worker
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/mstefanko/cartledger/internal/db"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/ws"
 )
 
 func TestNormalizeExtractedItems_AttachesCostcoCouponToReferencedItem(t *testing.T) {
@@ -131,6 +135,123 @@ func TestNormalizeExtractedItemsForStore_DoesNotOverwriteLLMFields(t *testing.T)
 	}
 	if got[0].ReceiptDescription == nil || *got[0].ReceiptDescription != "MILK" {
 		t.Fatalf("ReceiptDescription = %v, want MILK", got[0].ReceiptDescription)
+	}
+}
+
+func TestPackageContentForItemConfidenceSources(t *testing.T) {
+	got, confidence, source, ok := packageContentForItem(llm.ExtractedItem{
+		RawName:         "2% MILK 1GAL",
+		PackageLabel:    strPtr("1GAL"),
+		PackageQuantity: strPtr("1"),
+		PackageUnit:     strPtr("gal"),
+	})
+	if !ok || got.Quantity.String() != "1" || got.Unit != "gal" || source != "receipt_explicit" || confidence != receiptPackageLLMAgreementConfidence {
+		t.Fatalf("agreement package = %+v confidence=%v source=%q ok=%v", got, confidence, source, ok)
+	}
+
+	_, confidence, source, ok = packageContentForItem(llm.ExtractedItem{
+		RawName:         "MILK",
+		PackageQuantity: strPtr("1"),
+		PackageUnit:     strPtr("gal"),
+	})
+	if !ok || source != "receipt_llm" || confidence != receiptPackageLLMOnlyConfidence {
+		t.Fatalf("llm-only package confidence=%v source=%q ok=%v", confidence, source, ok)
+	}
+
+	_, confidence, source, ok = packageContentForItem(llm.ExtractedItem{
+		RawName: "TORTILLAS 12 OZ",
+	})
+	if !ok || source != "receipt_explicit" || confidence != receiptPackageDeterministicConfidence {
+		t.Fatalf("deterministic package confidence=%v source=%q ok=%v", confidence, source, ok)
+	}
+}
+
+func TestProductFieldEditBlocksReceiptPackageSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer database.Close()
+	if err := db.RunMigrations(database); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	var householdID string
+	if err := database.QueryRow("INSERT INTO households (name) VALUES ('Test') RETURNING id").Scan(&householdID); err != nil {
+		t.Fatalf("insert household: %v", err)
+	}
+	storeID := "store-field-edit"
+	productID := "product-field-edit"
+	if _, err := database.Exec("INSERT INTO stores (id, household_id, name) VALUES (?, ?, 'Costco Wholesale')", storeID, householdID); err != nil {
+		t.Fatalf("insert store: %v", err)
+	}
+	if _, err := database.Exec("INSERT INTO products (id, household_id, name) VALUES (?, ?, 'Milk')", productID, householdID); err != nil {
+		t.Fatalf("insert product: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO store_product_codes
+		    (id, household_id, store_id, product_id, store_item_code, label, source)
+		 VALUES ('spc-field-edit', ?, ?, ?, '8', '2% MILK 1GAL', 'manual')`,
+		householdID, storeID, productID,
+	); err != nil {
+		t.Fatalf("insert store code: %v", err)
+	}
+	receiptID := "receipt-field-edit"
+	if _, err := database.Exec(
+		"INSERT INTO receipts (id, household_id, receipt_date, total, status) VALUES (?, ?, '2026-05-08', '2.92', 'processing')",
+		receiptID, householdID,
+	); err != nil {
+		t.Fatalf("insert receipt: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO product_field_edits (product_id, field, edit_source, edited_at)
+		 VALUES (?, 'pack_quantity', 'manual', '2026-05-09 12:00:00'),
+		        (?, 'pack_unit', 'manual', '2026-05-09 12:00:00')`,
+		productID, productID,
+	); err != nil {
+		t.Fatalf("insert field edits: %v", err)
+	}
+
+	imageDir := filepath.Join(dir, "receipts", receiptID)
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		t.Fatalf("mkdir image dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(imageDir, "1.jpg"), []byte("fake image"), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	w := &ReceiptWorker{
+		llmClient: staticLLM{extraction: &llm.ReceiptExtraction{
+			StoreName:  "Costco Wholesale",
+			Date:       "2026-05-08",
+			Items:      []llm.ExtractedItem{{RawName: "8 2% MILK 1GAL", StoreItemCode: strPtr("8"), SuggestedName: "2% Milk", SuggestedCategory: "Dairy", Quantity: 1, Unit: strPtr("each"), TotalPrice: 2.92, LineNumber: 1, Confidence: 0.95}},
+			Subtotal:   2.92,
+			Total:      2.92,
+			Confidence: 0.95,
+		}},
+		matchEngine: matcher.NewEngine(database),
+		db:          database,
+		hub:         ws.NewHub(),
+	}
+	if err := w.processJob(ReceiptJob{ReceiptID: receiptID, HouseholdID: householdID, ImageDir: imageDir}); err != nil {
+		t.Fatalf("processJob: %v", err)
+	}
+
+	var suggestionCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM product_enrichment_suggestions WHERE product_id = ?", productID).Scan(&suggestionCount); err != nil {
+		t.Fatalf("count suggestions: %v", err)
+	}
+	if suggestionCount != 0 {
+		t.Fatalf("suggestionCount = %d, want 0 because later manual field edit blocks receipt evidence", suggestionCount)
+	}
+
+	var overrideSource string
+	if err := database.QueryRow("SELECT pack_override_source FROM line_items WHERE receipt_id = ?", receiptID).Scan(&overrideSource); err != nil {
+		t.Fatalf("query line override: %v", err)
+	}
+	if overrideSource != "receipt_explicit" {
+		t.Fatalf("overrideSource = %q, want receipt_explicit", overrideSource)
 	}
 }
 

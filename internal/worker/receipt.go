@@ -24,6 +24,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/matcher"
 	"github.com/mstefanko/cartledger/internal/prices"
+	"github.com/mstefanko/cartledger/internal/receiptline"
 	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/storecodes"
 	"github.com/mstefanko/cartledger/internal/upc"
@@ -38,6 +39,12 @@ var packPattern = regexp.MustCompile(`(?i)\d+\s*(PK|CT|COUNT|PACK)\b`)
 // canonical brand/category via BackfillProductMetadata. Below this, the
 // suggestion is too weak to write into user-visible data.
 const backfillMinConfidence = 0.5
+
+const (
+	receiptPackageDeterministicConfidence = 0.78
+	receiptPackageLLMAgreementConfidence  = 0.92
+	receiptPackageLLMOnlyConfidence       = 0.55
+)
 
 func extractionErrorMessage(err error, now time.Time) (string, bool) {
 	switch {
@@ -846,6 +853,17 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			discountAmount = &da
 		}
 
+		packageContent, packageConfidence, packageSource, hasPackageContent := packageContentForItem(item)
+		var packQuantityOverride, packUnitOverride, packOverrideSource *string
+		if hasPackageContent && packageSource == "receipt_explicit" {
+			qty := packageContent.Quantity.String()
+			unit := packageContent.Unit
+			source := "receipt_explicit"
+			packQuantityOverride = &qty
+			packUnitOverride = &unit
+			packOverrideSource = &source
+		}
+
 		itemUPC := upc.NormalizePointer(item.UPC)
 		var itemIdentifier *identifiers.Observation
 		var identifierObservations []identifiers.Observation
@@ -926,14 +944,14 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 			suggestedBrand = &item.SuggestedBrand
 		}
 		_, err = tx.Exec(
-			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, store_item_code, receipt_description, upc, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO line_items (id, receipt_id, product_id, raw_name, store_item_code, receipt_description, upc, quantity, unit, unit_price, total_price, regular_price, discount_amount, count_contribution, suggested_name, suggested_category, suggested_brand, suggested_product_id, matched, confidence, line_number, pack_quantity_override, pack_unit_override, pack_override_source, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			lineItemID, job.ReceiptID, productID, item.RawName,
 			item.StoreItemCode, item.ReceiptDescription, itemUPC,
 			quantity.String(), item.Unit, unitPrice, totalPrice.String(),
 			regularPrice, discountAmount, countContribution.String(),
 			suggestedName, suggestedCategory, suggestedBrand, suggestedProductID,
-			matched, confidence, lineNum, now,
+			matched, confidence, lineNum, packQuantityOverride, packUnitOverride, packOverrideSource, now,
 		)
 		if err != nil {
 			return fmt.Errorf("insert line item: %w", err)
@@ -1001,6 +1019,12 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 				}
 			}
 
+			if hasPackageContent {
+				if err := insertPackageSuggestionsFromLine(context.Background(), tx, *productID, lineItemID, job.ReceiptID, item, packageContent, packageConfidence, packageSource); err != nil {
+					return fmt.Errorf("insert package suggestion: %w", err)
+				}
+			}
+
 			if err := prices.RecordProductPriceFromLineItem(context.Background(), tx, lineItemID); err != nil {
 				return fmt.Errorf("record product price: %w", err)
 			}
@@ -1034,6 +1058,119 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	})
 
 	return nil
+}
+
+func packageContentForItem(item llm.ExtractedItem) (receiptline.PackageContent, float64, string, bool) {
+	deterministic, deterministicOK := receiptline.ParsePackageContent(item.RawName, ptrStringValue(item.ReceiptDescription))
+	modelPackage, modelOK := llmPackageContent(item)
+	if deterministicOK {
+		confidence := receiptPackageDeterministicConfidence
+		if modelOK && samePackageContent(deterministic, modelPackage) {
+			confidence = receiptPackageLLMAgreementConfidence
+		}
+		return deterministic, confidence, "receipt_explicit", true
+	}
+	if modelOK {
+		return modelPackage, receiptPackageLLMOnlyConfidence, "receipt_llm", true
+	}
+	return receiptline.PackageContent{}, 0, "", false
+}
+
+func llmPackageContent(item llm.ExtractedItem) (receiptline.PackageContent, bool) {
+	if item.PackageQuantity != nil && item.PackageUnit != nil {
+		parsed, ok := receiptline.ParsePackageContent(strings.TrimSpace(*item.PackageQuantity) + " " + strings.TrimSpace(*item.PackageUnit))
+		if ok {
+			if item.PackageLabel != nil && strings.TrimSpace(*item.PackageLabel) != "" {
+				parsed.Label = strings.TrimSpace(*item.PackageLabel)
+			}
+			return parsed, true
+		}
+	}
+	if item.PackageLabel != nil {
+		return receiptline.ParsePackageContent(*item.PackageLabel)
+	}
+	return receiptline.PackageContent{}, false
+}
+
+func samePackageContent(a, b receiptline.PackageContent) bool {
+	return a.Unit == b.Unit && a.Quantity.Equal(b.Quantity)
+}
+
+func insertPackageSuggestionsFromLine(ctx context.Context, tx *sql.Tx, productID, lineItemID, receiptID string, item llm.ExtractedItem, pkg receiptline.PackageContent, confidence float64, source string) error {
+	var currentQuantity sql.NullFloat64
+	var currentUnit sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		"SELECT pack_quantity, pack_unit FROM products WHERE id = ?",
+		productID,
+	).Scan(&currentQuantity, &currentUnit); err != nil {
+		return err
+	}
+
+	sourceURL := "receipt://" + receiptID + "/line-items/" + lineItemID
+	evidence := packageEvidence(item, pkg)
+	if !currentQuantity.Valid || currentQuantity.Float64 <= 0 {
+		if err := insertPackageSuggestion(ctx, tx, productID, receiptID, source, sourceURL, "pack_quantity", pkg.Quantity.String(), evidence, confidence); err != nil {
+			return err
+		}
+	}
+	if !currentUnit.Valid || strings.TrimSpace(currentUnit.String) == "" {
+		if err := insertPackageSuggestion(ctx, tx, productID, receiptID, source, sourceURL, "pack_unit", pkg.Unit, evidence, confidence); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertPackageSuggestion(ctx context.Context, tx *sql.Tx, productID, receiptID, source, sourceURL, field, value, evidence string, confidence float64) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	blocked, err := productFieldEditBlocksReceiptSuggestion(ctx, tx, productID, receiptID, field)
+	if err != nil || blocked {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO product_enrichment_suggestions
+		    (id, product_id, product_link_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at)
+		 SELECT lower(hex(randomblob(16))), ?, NULL, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		  WHERE NOT EXISTS (
+			SELECT 1
+			  FROM product_enrichment_suggestions
+			 WHERE product_id = ?
+			   AND source = ?
+			   AND field = ?
+			   AND value = ?
+		  )`,
+		productID, source, sourceURL, field, value, evidence, confidence,
+		productID, source, field, value,
+	)
+	return err
+}
+
+func productFieldEditBlocksReceiptSuggestion(ctx context.Context, tx *sql.Tx, productID, receiptID, field string) (bool, error) {
+	var exists int
+	err := tx.QueryRowContext(ctx,
+		`SELECT 1
+		   FROM product_field_edits pfe
+		   JOIN receipts r ON r.id = ?
+		  WHERE pfe.product_id = ?
+		    AND pfe.field = ?
+		    AND datetime(pfe.edited_at) > datetime(substr(r.receipt_date, 1, 19))
+		  LIMIT 1`,
+		receiptID, productID, field,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func packageEvidence(item llm.ExtractedItem, pkg receiptline.PackageContent) string {
+	if item.ReceiptDescription != nil && strings.TrimSpace(*item.ReceiptDescription) != "" {
+		return fmt.Sprintf("Receipt line package content %q from %q", pkg.Label, strings.TrimSpace(*item.ReceiptDescription))
+	}
+	return fmt.Sprintf("Receipt line package content %q from %q", pkg.Label, strings.TrimSpace(item.RawName))
 }
 
 // nilIfEmpty returns nil for empty strings, otherwise a pointer to the string.

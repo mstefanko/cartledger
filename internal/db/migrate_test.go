@@ -31,6 +31,9 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"store_product_codes",
 		"product_nutrition", "product_enrichment_suggestions",
 		"product_identifiers", "line_item_identifier_observations",
+		"product_external_metadata", "product_enrichment_jobs",
+		"product_enrichment_settings", "product_field_edits",
+		"store_external_refs",
 		"receipt_duplicate_candidates",
 		"products_fts", "product_aliases_fts",
 		"product_groups",
@@ -85,6 +88,11 @@ func TestMigrationsUpAndDown(t *testing.T) {
 		"idx_product_links_product", "idx_product_links_source",
 		"idx_product_nutrition_product", "idx_product_nutrition_product_no_link",
 		"idx_product_enrichment_suggestions_product",
+		"idx_product_external_metadata_product", "idx_product_external_metadata_source_record",
+		"idx_product_enrichment_suggestions_snapshot_unique",
+		"idx_product_enrichment_jobs_status", "idx_product_enrichment_jobs_product",
+		"idx_product_enrichment_jobs_active", "idx_product_field_edits_product",
+		"idx_store_external_refs_household_source",
 		"idx_products_group",
 	}
 	for _, idx := range indexes {
