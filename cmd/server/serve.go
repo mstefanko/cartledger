@@ -18,6 +18,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/backup"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
+	enrichmentrunner "github.com/mstefanko/cartledger/internal/enrichment/runner"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
@@ -153,6 +154,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Create matching engine and receipt worker.
 	matchEngine := matcher.NewEngine(database)
 	receiptWorker := worker.NewReceiptWorker(2, llmClient, llmGuard, matchEngine, database, hub, cfg)
+	enrichmentService := enrichmentrunner.NewService(database, cfg, hub)
+	enrichmentWorker := enrichmentrunner.NewWorker(2, enrichmentService)
 
 	// Re-enqueue any receipts left at status='pending' from a prior shutdown.
 	// Shutdown marks in-flight + buffered jobs pending, but doesn't re-submit
@@ -166,6 +169,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 			slog.Warn("worker: requeue pending failed (will retry next boot)", "err", err, "resubmitted", resubmitted)
 		} else if resubmitted > 0 {
 			slog.Info("worker: requeued pending receipts", "count", resubmitted)
+		}
+	}
+	{
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		recovered, err := enrichmentWorker.RecoverStaleRunning(reqCtx, 30*time.Minute, 3)
+		if err != nil {
+			slog.Warn("enrichment worker: stale running recovery failed", "err", err, "recovered", recovered)
+		}
+		resubmitted, err := enrichmentWorker.RequeueReady(reqCtx)
+		reqCancel()
+		if err != nil {
+			slog.Warn("enrichment worker: requeue ready failed", "err", err, "resubmitted", resubmitted)
+		} else if recovered > 0 || resubmitted > 0 {
+			slog.Info("enrichment worker: recovered jobs", "recovered", recovered, "resubmitted", resubmitted)
 		}
 	}
 
@@ -241,7 +258,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer stop()
 
 	// Set up Echo with router, middleware, and all routes.
-	e, rateLimiter := api.NewRouter(ctx, database, cfg, hub, receiptWorker, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore, matchEngine, mailer)
+	e, rateLimiter := api.NewRouter(ctx, database, cfg, hub, receiptWorker, enrichmentService, lockStore, bootstrap, llmGuard, metrics, backupRunner, backupStore, matchEngine, mailer)
 	defer rateLimiter.Close()
 
 	// Start the retention janitor now that we have a cancellable context.
@@ -283,6 +300,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer workerCancel()
 	if err := receiptWorker.Shutdown(workerShutdownCtx); err != nil {
 		slog.Error("worker shutdown error", "err", err)
+	}
+	if err := enrichmentWorker.Shutdown(workerShutdownCtx); err != nil {
+		slog.Error("enrichment worker shutdown error", "err", err)
 	}
 	slog.Info("server stopped")
 	return nil

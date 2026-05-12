@@ -326,6 +326,45 @@ export interface ProductEnrichmentSuggestion {
   updated_at: string
 }
 
+export interface ProductEnrichmentJob {
+  id: string
+  product_id: string
+  trigger: 'receipt_scan' | 'manual_lookup' | 'manual_refresh' | 'scheduled_refresh' | 'batch_backfill'
+  lookup_key: string
+  requested_sources?: string[]
+  status: 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled'
+  attempt_count: number
+  next_attempt_at?: string | null
+  last_error?: string | null
+  queued_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  updated_at: string
+}
+
+export interface ProductEnrichmentProviderAvailability {
+  configured: boolean
+  enabled: boolean
+  env_fallback_configured?: boolean
+  credential_source?: string
+  reason?: string
+}
+
+export interface ProductEnrichmentSettings {
+  household_id: string
+  global_enabled: boolean
+  manual_lookup_enabled: boolean
+  auto_on_scan_enabled: boolean
+  scheduled_sweep_enabled: boolean
+  provider_openfoodfacts_enabled: boolean
+  provider_usda_fdc_enabled: boolean
+  provider_kroger_enabled: boolean
+  first_run_backfill_limit: number
+  provider_availability: Record<string, ProductEnrichmentProviderAvailability>
+  created_at: string
+  updated_at: string
+}
+
 export interface ProductEnrichmentSuggestionConflict {
   suggestion_id: string
   field: string

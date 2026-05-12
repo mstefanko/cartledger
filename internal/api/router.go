@@ -18,6 +18,7 @@ import (
 	"github.com/mstefanko/cartledger/internal/backup"
 	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/db"
+	enrichmentrunner "github.com/mstefanko/cartledger/internal/enrichment/runner"
 	"github.com/mstefanko/cartledger/internal/llm"
 	"github.com/mstefanko/cartledger/internal/locks"
 	appmail "github.com/mstefanko/cartledger/internal/mail"
@@ -35,7 +36,7 @@ import (
 // that stand up a router with pre-populated users); the Setup handler then
 // rejects every call with 401, which matches the user-facing behavior of
 // "setup already completed".
-func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore, matchEngine spreadsheet.MatchEngine, mailer appmail.Mailer) (*echo.Echo, *RateLimiter) {
+func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub *ws.Hub, receiptWorker *worker.ReceiptWorker, enrichmentService *enrichmentrunner.Service, lockStore *locks.Store, bootstrap *Bootstrap, llmGuard *llm.GuardedExtractor, metrics *Metrics, backupRunner *backup.Runner, backupStore *db.BackupStore, matchEngine spreadsheet.MatchEngine, mailer appmail.Mailer) (*echo.Echo, *RateLimiter) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -198,7 +199,7 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	storeHandler := &StoreHandler{DB: database, Cfg: cfg}
 	storeHandler.RegisterRoutes(protected)
 
-	productHandler := &ProductHandler{DB: database, Cfg: cfg, Hub: hub}
+	productHandler := &ProductHandler{DB: database, Cfg: cfg, Hub: hub, Enrichment: enrichmentService}
 	productHandler.RegisterRoutes(protected)
 
 	groupHandler := &GroupHandler{DB: database, Cfg: cfg}
@@ -221,6 +222,9 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 
 	integrationHandler := NewIntegrationHandler(database, cfg)
 	integrationHandler.RegisterRoutes(protected)
+
+	productEnrichmentSettingsHandler := &ProductEnrichmentSettingsHandler{DB: database, Cfg: cfg}
+	productEnrichmentSettingsHandler.RegisterRoutes(protected)
 
 	importHandler := &ImportHandler{DB: database, Cfg: cfg, Integrations: integrationHandler.Store}
 	importHandler.RegisterRoutes(protected)

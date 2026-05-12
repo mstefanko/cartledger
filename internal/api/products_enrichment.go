@@ -20,6 +20,8 @@ import (
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/enrichment"
 	"github.com/mstefanko/cartledger/internal/enrichment/adapters"
+	"github.com/mstefanko/cartledger/internal/enrichment/runner"
+	estore "github.com/mstefanko/cartledger/internal/enrichment/store"
 	"github.com/mstefanko/cartledger/internal/httpsafe"
 	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/matcher"
@@ -44,6 +46,17 @@ var (
 
 type enrichUPCRequest struct {
 	UPC string `json:"upc"`
+}
+
+type createProductEnrichmentJobRequest struct {
+	Trigger string   `json:"trigger"`
+	Sources []string `json:"sources"`
+	UPC     string   `json:"upc"`
+	URL     string   `json:"url"`
+}
+
+type productEnrichmentJobResponse struct {
+	Job runner.Job `json:"job"`
 }
 
 type acceptProductEnrichmentSuggestionRequest struct {
@@ -185,6 +198,10 @@ func (h *ProductHandler) productEnrichmentEnabled() bool {
 	return h.Cfg == nil || h.Cfg.ProductEnrichmentEnabled
 }
 
+func (h *ProductHandler) enrichmentService() *runner.Service {
+	return h.Enrichment
+}
+
 // AddLink fetches a user-provided product URL and returns field-level
 // suggestions without overwriting product data.
 func (h *ProductHandler) AddLink(c echo.Context) error {
@@ -226,11 +243,131 @@ func (h *ProductHandler) AddLink(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	stored, err := h.storeSuggestions(ctx, productID, &link.ID, suggestions)
+	sourceURL := result.URL
+	payload := enrichment.MetadataPayload{
+		Version:        1,
+		Source:         source,
+		SourceRecordID: externalID,
+		SourceURL:      &sourceURL,
+		Evidence: []enrichment.EvidencePayload{{
+			Field: "visible_text",
+			Text:  truncateEvidence(visibleText, 2000),
+			URL:   &sourceURL,
+		}},
+	}
+	metadataID, err := estore.Repository{DB: h.DB}.UpsertMetadata(ctx, estore.MetadataInput{
+		HouseholdID:    householdID,
+		ProductID:      productID,
+		ProductLinkID:  &link.ID,
+		Source:         source,
+		SourceRecordID: externalID,
+		SourceURL:      &sourceURL,
+		LookupKey:      stringPtr("url:" + result.URL),
+		Payload:        payload,
+		ContentHash:    &contentHash,
+		FetchedAt:      result.FetchedAt,
+		HTTPStatus:     result.StatusCode,
+		Confidence:     sourceConfidence,
+	})
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	stored, err := h.storeSuggestionsForMetadata(ctx, productID, &link.ID, &metadataID, suggestions, false)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 	return c.JSON(http.StatusOK, addProductLinkResponse{Link: link, Suggestions: stored})
+}
+
+func (h *ProductHandler) CreateEnrichmentJob(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+	if !h.productEnrichmentEnabled() {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "product enrichment is disabled"})
+	}
+	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	var req createProductEnrichmentJobRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.Trigger = strings.TrimSpace(req.Trigger)
+	if req.Trigger == "" {
+		req.Trigger = runner.TriggerManualLookup
+	}
+	if req.Trigger != runner.TriggerManualLookup && req.Trigger != runner.TriggerManualRefresh {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unsupported enrichment trigger"})
+	}
+
+	lookupKey := ""
+	req.URL = strings.TrimSpace(req.URL)
+	if req.URL != "" {
+		validatedURL, err := httpsafe.ValidateURL(req.URL, h.Cfg != nil && h.Cfg.AllowPrivateIntegrations)
+		if err != nil {
+			return c.JSON(statusForFetchError(err), map[string]string{"error": productFetchError(err)})
+		}
+		lookupKey = "url:" + validatedURL.String()
+	} else {
+		upcValue := strings.TrimSpace(req.UPC)
+		if upcValue == "" {
+			p, err := h.fetchProduct(productID)
+			if err == nil && p.UPC != nil {
+				upcValue = *p.UPC
+			}
+		}
+		upc, err := normalizeUPCValue(upcValue)
+		if err != nil || upc == "" {
+			if err == nil {
+				err = fmt.Errorf("upc or url is required")
+			}
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		lookupKey = "upc:" + upc
+	}
+
+	service := h.enrichmentService()
+	if service == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "product enrichment worker is unavailable"})
+	}
+	job, _, err := service.QueueJob(ctx, runner.QueueJobRequest{
+		HouseholdID:       householdID,
+		ProductID:         productID,
+		RequestedByUserID: auth.UserIDFrom(c),
+		Trigger:           req.Trigger,
+		LookupKey:         lookupKey,
+		RequestedSources:  req.Sources,
+	})
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	return c.JSON(http.StatusAccepted, productEnrichmentJobResponse{Job: job})
+}
+
+func (h *ProductHandler) ListEnrichmentJobs(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	service := h.enrichmentService()
+	if service == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "product enrichment worker is unavailable"})
+	}
+	jobs, err := service.ListJobs(ctx, householdID, productID, 20)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	return c.JSON(http.StatusOK, map[string][]runner.Job{"jobs": jobs})
 }
 
 func (h *ProductHandler) EnrichByUPC(c echo.Context) error {
@@ -258,52 +395,21 @@ func (h *ProductHandler) EnrichByUPC(c echo.Context) error {
 		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
-
-	sourceURL := strings.TrimRight(openFoodFactsProductBase, "/") + "/" + url.PathEscape(upc)
-	apiURL := strings.TrimRight(openFoodFactsAPIBase, "/") + "/" + url.PathEscape(upc) + ".json"
-	suggestions := []enrichment.Suggestion{
-		enrichment.NewSuggestion("user_upc", sourceURL, "upc", upc, "UPC entered by user", 0.9),
+	service := h.enrichmentService()
+	if service == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "product enrichment worker is unavailable"})
 	}
-
-	allowPrivateProviders := h.Cfg != nil && h.Cfg.AllowPrivateIntegrations
-	client := httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, allowPrivateProviders)
-	result, fetchErr := client.Fetch(ctx, apiURL)
-	var fetchedAt time.Time
-	var status int
-	var contentHash *string
-	var lastError *string
-	if fetchErr == nil {
-		fetchedAt = result.FetchedAt
-		status = result.StatusCode
-		hash := hashContent(string(result.Body))
-		contentHash = &hash
-		suggestions = append(suggestions, suggestionsFromOpenFoodFacts(upc, sourceURL, result.Body)...)
-	} else {
-		msg := productFetchError(fetchErr)
-		lastError = &msg
-		fetchedAt = time.Now().UTC()
-	}
-
-	sourceConfidence := sourceConfidenceForSuggestions(suggestions)
-	link, err := h.upsertProductLink(ctx, productID, "openfoodfacts", &upc, sourceURL, stringPtr("Open Food Facts"), fetchedAt, status, ptrStringValueOrEmpty(contentHash), lastError, sourceConfidence)
+	job, _, err := service.QueueJob(ctx, runner.QueueJobRequest{
+		HouseholdID:       householdID,
+		ProductID:         productID,
+		RequestedByUserID: auth.UserIDFrom(c),
+		Trigger:           runner.TriggerManualLookup,
+		LookupKey:         "upc:" + upc,
+	})
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	stored, err := h.storeSuggestions(ctx, productID, &link.ID, suggestions)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
-	}
-	if h.Cfg != nil && strings.TrimSpace(h.Cfg.USDAFDCAPIKey) != "" {
-		usdaLink, usdaSuggestions, err := h.fetchUSDASuggestions(ctx, productID, upc, strings.TrimSpace(h.Cfg.USDAFDCAPIKey), allowPrivateProviders)
-		if err == nil && len(usdaSuggestions) > 0 {
-			usdaStored, err := h.storeSuggestions(ctx, productID, &usdaLink.ID, usdaSuggestions)
-			if err != nil {
-				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
-			}
-			stored = append(stored, usdaStored...)
-		}
-	}
-	return c.JSON(http.StatusOK, addProductLinkResponse{Link: link, Suggestions: stored})
+	return c.JSON(http.StatusAccepted, productEnrichmentJobResponse{Job: job})
 }
 
 func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
@@ -589,38 +695,16 @@ func (h *ProductHandler) fetchProductLink(ctx context.Context, productID, linkID
 }
 
 func (h *ProductHandler) storeSuggestions(ctx context.Context, productID string, linkID *string, suggestions []enrichment.Suggestion) ([]productEnrichmentSuggestionResponse, error) {
+	return h.storeSuggestionsForMetadata(ctx, productID, linkID, nil, suggestions, false)
+}
+
+func (h *ProductHandler) storeSuggestionsForMetadata(ctx context.Context, productID string, linkID, metadataID *string, suggestions []enrichment.Suggestion, bypassFieldEdits bool) ([]productEnrichmentSuggestionResponse, error) {
 	out := make([]productEnrichmentSuggestionResponse, 0, len(suggestions))
-	evidenceAt, hasEvidenceTime, err := h.suggestionEvidenceTime(ctx, productID, linkID)
+	ids, err := estore.Repository{DB: h.DB}.StoreSuggestions(ctx, productID, linkID, metadataID, suggestions, bypassFieldEdits)
 	if err != nil {
 		return nil, err
 	}
-	blockedFields, err := h.productFieldEditBlockedFields(ctx, productID, evidenceAt, hasEvidenceTime)
-	if err != nil {
-		return nil, err
-	}
-	for _, s := range suggestions {
-		if strings.TrimSpace(s.Value) == "" {
-			continue
-		}
-		if _, blocked := blockedFields[s.Field]; blocked {
-			continue
-		}
-		var id string
-		err := h.DB.QueryRowContext(ctx,
-			`INSERT INTO product_enrichment_suggestions
-			    (id, product_id, product_link_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at)
-			 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-			 ON CONFLICT(product_id, product_link_id, field, value) DO UPDATE SET
-			    evidence = excluded.evidence,
-			    confidence = excluded.confidence,
-			    status = CASE WHEN product_enrichment_suggestions.status = 'rejected' THEN 'pending' ELSE product_enrichment_suggestions.status END,
-			    updated_at = CURRENT_TIMESTAMP
-			 RETURNING id`,
-			productID, linkID, s.Source, s.SourceURL, s.Field, s.Value, nullableString(s.Evidence), nullableFloat(s.Confidence),
-		).Scan(&id)
-		if err != nil {
-			return nil, err
-		}
+	for _, id := range ids {
 		resp, err := h.fetchSuggestion(ctx, productID, id)
 		if err != nil {
 			return nil, err
@@ -1199,6 +1283,14 @@ func productFetchError(err error) string {
 func hashContent(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+func truncateEvidence(value string, max int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) <= max {
+		return value
+	}
+	return value[:max]
 }
 
 func suggestionAlreadyCurrent(s productEnrichmentSuggestionResponse) bool {

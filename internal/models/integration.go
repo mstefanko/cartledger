@@ -29,7 +29,13 @@ type MealieConfig struct {
 	Token   string `json:"token"`
 }
 
+type USDAFDCConfig struct {
+	Version int    `json:"version"`
+	APIKey  string `json:"api_key"`
+}
+
 // Integration type constants.
 const (
-	IntegrationTypeMealie = "mealie"
+	IntegrationTypeMealie  = "mealie"
+	IntegrationTypeUSDAFDC = "usda_fdc"
 )

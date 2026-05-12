@@ -49,8 +49,8 @@ Validated existing code:
 - `internal/api/products_enrichment.go` already supports manual URL fetch,
   Open Food Facts UPC lookup, USDA FoodData Central lookup when
   `USDA_FDC_API_KEY` is configured, source links, field suggestions, suggestion
-  acceptance/rejection, and accepted nutrition persistence; supporting tests
-  live in `internal/api/products_enrichment_test.go`.
+  acceptance/rejection, bulk accept/reject, and accepted nutrition persistence;
+  supporting tests live in `internal/api/products_enrichment_test.go`.
 - `internal/llm/guarded.go` and `internal/llm/breaker.go` already provide
   household token budgets, rate-limit detection, retry-after helpers,
   `ErrCircuitOpen`, and `ErrBudgetExceeded`. New LLM enrichment paths must go
@@ -82,6 +82,10 @@ Hard decisions resolved:
   scheduled refresh, 7 days for repeated failures, and allow an explicit manual
   refresh to bypass the success cooldown while still respecting provider rate
   limits.
+- Product enrichment jobs use a durable queue. Phase 2 wires the enrichment
+  worker and manual job endpoint; HTTP handlers enqueue or reuse a job row and
+  return `202` instead of calling providers inline. Phase 3 adds automatic
+  enqueueing and sweeps on top of the same worker.
 - Do not run a first-use backfill across the whole product table. At opt-in,
   offer a bounded first-run batch focused on recently purchased/high-value
   products, then let nightly sweeps and user-selected bulk lookup continue from
@@ -176,8 +180,11 @@ Implementation details:
 - Store image URLs as metadata/evidence only in v1. Do not download images.
 - Show attribution/source link in the UI.
 - Use a CartLedger-specific User-Agent with contact/configurable operator info.
-- Rate-limit adapter calls. Open Food Facts currently documents product-query
-  limits around 15 requests per minute and asks clients not to crawl the site.
+- Rate-limit adapter calls through a shared runner-owned provider limiter. Open
+  Food Facts currently caps direct product reads at 15 requests per minute per
+  IP and search reads at 10 requests per minute per IP. Phase 2 only uses direct
+  product reads; model this as a server-wide per-host limit because the
+  CartLedger server IP is the caller.
 
 Sources:
 
@@ -205,6 +212,11 @@ Implementation details:
 - Use USDA nutrients as nutrition suggestions. Do not use USDA to populate
   package size unless a branded record has explicit package text.
 - Keep USDA as optional config because it requires an API key.
+- Rate-limit adapter calls through the same shared provider limiter. FoodData
+  Central currently defaults to 1,000 requests per hour per IP address; model
+  this as a server-wide per-host limit. Record whether the effective credential
+  came from household settings or the env fallback for observability, but do not
+  treat the provider limit itself as per-household.
 
 Source:
 
@@ -789,6 +801,11 @@ Responsibilities:
 - load product, UPC, store codes, latest receipt descriptions, and store refs;
 - load `product_identifiers` through `internal/identifiers` rather than
   inventing a second identifier store;
+- load household `product_enrichment_settings` and provider integration
+  credentials;
+- enforce `PRODUCT_ENRICHMENT_ENABLED`, `manual_lookup_enabled`, automatic
+  trigger flags when relevant, per-provider enabled flags, and credential
+  availability before calling adapters;
 - choose providers based on trigger and available identifiers;
 - enforce per-provider rate limits and timeouts;
 - store `product_external_metadata`;
@@ -811,8 +828,12 @@ Provider order:
 Add product enrichment endpoints:
 
 - `POST /api/v1/products/:id/enrichment-jobs`
-  - body: `{ "trigger": "manual_lookup", "sources": ["openfoodfacts","usda","kroger"], "upc": "...", "url": "..." }`
-  - returns `202` with job response.
+  - body:
+    `{ "trigger": "manual_lookup", "sources": ["openfoodfacts","usda","kroger"], "upc": "...", "url": "..." }`
+  - creates or reuses a durable job row and returns before provider calls
+    finish; handlers do not call providers inline.
+  - returns `202` with job response:
+    `{ "job": { "id": "...", "status": "queued", "product_id": "...", "trigger": "manual_lookup", "requested_sources": ["openfoodfacts"], "lookup_key": "...", "next_attempt_at": null } }`.
 - `GET /api/v1/products/:id/enrichment-jobs`
   - returns recent jobs for status display.
 - `POST /api/v1/products/:id/enrichment-suggestions/bulk-accept`
@@ -823,9 +844,19 @@ Add product enrichment endpoints:
 - `POST /api/v1/products/:id/enrichment-suggestions/bulk-reject`
   - body: `{ "suggestion_ids": ["..."] }`.
 - Keep existing `POST /api/v1/products/:id/enrich/upc` as a compatibility
-  shortcut that queues or runs a `manual_lookup` job.
+  shortcut that queues the same `manual_lookup` job through the new endpoint
+  code path.
 - Keep existing `POST /api/v1/products/:id/links` for manual URL fetch, but
   have it also write an external metadata snapshot.
+
+Add product enrichment settings endpoints:
+
+- `GET /api/v1/product-enrichment/settings`
+  - returns the household `product_enrichment_settings` row plus effective
+    provider availability derived from integrations and env fallback config.
+- `PUT /api/v1/product-enrichment/settings`
+  - updates manual lookup, automatic lookup, scheduled sweep, per-provider flags,
+    and `first_run_backfill_limit`.
 
 Add store mapping endpoints:
 
@@ -838,7 +869,9 @@ Add settings integration support:
 - extend `integrations.type` constants with `kroger`, `usda_fdc`, and optional
   future paid providers;
 - Kroger config: `client_id`, `client_secret`, token metadata;
-- USDA config: API key. Keep env `USDA_FDC_API_KEY` as fallback.
+- USDA config: API key. Keep env `USDA_FDC_API_KEY` as fallback. API responses
+  may expose that an operator fallback is configured, but must never reveal the
+  env key.
 
 Bulk accept response:
 
@@ -876,6 +909,14 @@ WebSocket contract:
 - Suggestion acceptance, bulk acceptance, product update, product merge, and
   package-size recompute should broadcast `ws.EventProductUpdated`.
 - Payload: `{ "product_id": "...", "changed_fields": ["pack_quantity"] }`.
+- Enrichment worker should broadcast `ws.EventProductEnrichmentJobUpdated`
+  (`product.enrichment_job.updated`) when a job reaches a terminal `succeeded`,
+  `partial`, `failed`, or `cancelled` state.
+- Job event payload:
+  `{ "product_id": "...", "job_id": "...", "status": "...", "provider_status": { "openfoodfacts": "succeeded" }, "error": null }`.
+- Product Detail and settings batch pages use the `202` response plus short
+  polling for queued/running jobs; terminal WebSocket events stop polling and
+  invalidate visible data.
 - `web/src/api/ws.ts` must invalidate `['products']`,
   `['product-detail', product_id]`, and field-specific queries such as
   `['product-usage', product_id]` when relevant.
@@ -1004,6 +1045,15 @@ Skip:
   than `PRODUCT_ENRICHMENT_REFRESH_AFTER_DAYS`, unless the trigger is
   `manual_refresh`.
 
+Retention maintenance:
+
+- implement scheduled pruning with the Phase 3 sweeper, not Phase 2 manual
+  lookup. Phase 2 must store enough timestamps/status to make pruning safe.
+- prune failed-only snapshots after 30 days;
+- prune unaccepted stale snapshots after 180 days unless a pending suggestion,
+  accepted suggestion, product link, or current product evidence still references
+  them.
+
 ## UI/UX Plan
 
 ### Product Detail
@@ -1025,9 +1075,11 @@ Display:
 
 Actions:
 
-- `Lookup missing info` - queues provider chain using current UPC/name/store
-  context.
-- `Refresh sources` - re-fetches existing source links/snapshots.
+- `Lookup missing info` - calls
+  `POST /api/v1/products/:id/enrichment-jobs` with trigger `manual_lookup` and
+  current UPC/name/store context.
+- `Refresh sources` - calls the same job endpoint with trigger
+  `manual_refresh` to re-fetch existing source links/snapshots.
 - `Add URL` - current manual URL fetch.
 - `Accept selected` - bulk accept checked suggestions.
 - `Dismiss selected`.
@@ -1076,8 +1128,9 @@ Add a `Product metadata` area in Integrations.
 Sections:
 
 - Open Food Facts: enabled toggle, attribution note, no credentials.
-- USDA FoodData Central: API key, test button, optional global env fallback
-  status.
+- USDA FoodData Central: API key, test button, and read-only
+  `USDA_FDC_API_KEY` fallback status shown as configured by operator when
+  present. Never reveal the env key; a household key overrides it.
 - Kroger: OAuth credentials, test button, store mapping helper.
 - Paid providers: hidden/deferred or disabled "coming later", not a prominent
   promise.
@@ -1143,6 +1196,9 @@ Backend:
 - create package-size suggestions from line evidence;
 - update suggestion acceptance to record field edits and broadcast
   `product.updated`;
+- add or update bulk accept/reject endpoints so Product Detail bulk UI can ship
+  in the same phase; bulk accept records field edits for every applied
+  suggestion and returns accepted/skipped/conflict detail;
 - add tests for parser, worker persistence, and price normalization from line
   overrides.
 
@@ -1166,22 +1222,40 @@ Backend:
 - move current Open Food Facts/USDA logic from
   `internal/api/products_enrichment.go` into provider adapters;
 - store metadata snapshots before creating suggestions;
-- add runner and manual job endpoint;
-- keep existing UPC endpoint as a wrapper;
-- add provider rate limiting and provider-specific tests using fixtures;
+- update the existing manual URL/link enrichment path to write snapshots and use
+  the snapshot-aware suggestion store;
+- add runner, worker wiring in `cmd/server/serve.go`, receipt-worker-style
+  queue depth/shutdown/stale-running recovery, and a manual job endpoint that
+  queues durable jobs and returns `202`;
+- keep existing UPC endpoint as a wrapper around the same queueing path;
+- enforce `PRODUCT_ENRICHMENT_ENABLED`, `manual_lookup_enabled`, per-provider
+  enabled flags, and credential availability before adapter calls;
+- enforce `product_field_edits` suppression for provider-created suggestions,
+  except when the user explicitly runs `manual_refresh`;
+- add shared per-host provider rate limiting and provider-specific tests using
+  fixtures;
+- add job status list endpoint and terminal job WebSocket event;
+- add product enrichment settings API for household provider/manual/automatic
+  toggles;
 - add USDA integration row support while preserving `USDA_FDC_API_KEY`.
 
 Frontend:
 
-- settings toggles/API key for Open Food Facts and USDA;
-- `Lookup missing info` button on Product Detail;
+- settings provider toggles for Open Food Facts and USDA plus USDA API key,
+  including the operator-configured env fallback display for USDA;
+- `Lookup missing info` button on Product Detail routed to
+  `POST /api/v1/products/:id/enrichment-jobs`;
 - job status and provider error display.
 
 Acceptance:
 
 - user enters UPC and clicks lookup;
+- lookup endpoint returns `202` with a durable job response;
+- the Phase 2 worker processes the queued manual job without waiting for Phase 3;
 - OFF/USDA snapshots are stored;
 - suggestions appear without overwriting product fields;
+- disabled providers are skipped with visible status instead of being called;
+- terminal job events are emitted for succeeded/partial/failed/cancelled jobs;
 - accepting package size can recompute prices;
 - failing providers leave visible errors and do not remove old accepted data.
 
@@ -1189,11 +1263,12 @@ Acceptance:
 
 Backend:
 
-- start enrichment worker in `cmd/server/serve.go`;
-- mirror the receipt worker's queue depth, shutdown, and stale-running recovery
-  patterns;
+- reuse the Phase 2 enrichment worker for automatic scan and sweep jobs;
+- apply the existing queued/running recovery and queue caps to automatic jobs;
 - queue limited jobs after receipt scan commit;
 - add scheduler/sweeper with config gates;
+- add scheduled snapshot pruning for the 30-day failed-only and 180-day stale
+  unaccepted retention rules;
 - add metrics for jobs queued, succeeded, failed, provider latency, and
   provider status.
 
@@ -1311,6 +1386,13 @@ Deferred because value is uncertain or maintenance cost is high:
 - UPC accept follow-up: accepting a UPC should queue provider lookup only when
   the household has automatic lookup enabled or the user clicked a lookup action
   in the same flow. Otherwise show a `Lookup missing info` action.
+- Manual lookup routing: new UI calls
+  `POST /api/v1/products/:id/enrichment-jobs`. The legacy
+  `POST /api/v1/products/:id/enrich/upc` endpoint remains a compatibility
+  wrapper around the same queueing path.
+- Bulk suggestion endpoints: Phase 1 owns the backend and frontend together
+  because grouped Product Detail review depends on bulk accept/reject. Existing
+  bulk handlers should be updated rather than replaced where present.
 - Job status transport: use WebSocket events for invalidation and terminal
   state; use short polling while a Product Detail or settings batch page is
   visibly showing active jobs.
@@ -1351,17 +1433,25 @@ Backend tests:
 - worker stores package overrides and records normalized price from overrides;
 - Open Food Facts adapter maps fixtures to metadata and suggestions;
 - USDA adapter filters non-exact UPC matches;
+- runner honors global, manual, and per-provider settings before adapter calls;
+- provider rate limiter enforces Open Food Facts and USDA budgets and
+  reschedules on provider throttle responses;
 - Kroger adapter preserves existing visible-text fixture behavior and adds
   candidate scoring fixtures;
 - job idempotency and retry behavior;
 - stale running jobs recover on boot;
+- terminal enrichment job WebSocket event is emitted on
+  succeeded/partial/failed/cancelled;
 - suggestion accept conflicts for UPC uniqueness;
 - bulk accept returns accepted/skipped/conflicts and does not silently merge UPCs;
 - suggestion acceptance records `product_field_edits`;
+- runner suppresses suggestions blocked by newer `product_field_edits`;
 - suggestion acceptance broadcasts `product.updated`;
 - metadata payload allowlist rejects raw provider blobs;
 - safe HTTP client remains used for URL/manual fetch paths;
-- scheduled sweep caps jobs and skips recent failures.
+- scheduled sweep caps jobs and skips recent failures;
+- snapshot prune keeps referenced snapshots and deletes only eligible failed-only
+  or stale unaccepted snapshots.
 
 Frontend tests:
 
@@ -1371,6 +1461,7 @@ Frontend tests:
   caches;
 - accepting package-size suggestion offers recompute;
 - settings cards store/test provider config;
+- USDA settings show env fallback configured status without revealing the key;
 - settings expose granular provider and automatic lookup toggles;
 - product filters for missing metadata and failed lookups.
 

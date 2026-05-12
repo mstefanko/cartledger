@@ -9,10 +9,15 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
 	"github.com/mstefanko/cartledger/internal/enrichment"
+	"github.com/mstefanko/cartledger/internal/enrichment/providers"
+	"github.com/mstefanko/cartledger/internal/enrichment/providers/openfoodfacts"
+	"github.com/mstefanko/cartledger/internal/enrichment/providers/usda"
+	"github.com/mstefanko/cartledger/internal/enrichment/runner"
 	"github.com/mstefanko/cartledger/internal/httpsafe"
 	"github.com/mstefanko/cartledger/internal/identifiers"
 )
@@ -37,6 +42,24 @@ func TestAddProductLinkRejectsUnsafeURL(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("product_links count = %d, want 0", count)
+	}
+}
+
+func TestCreateEnrichmentJobRejectsUnsafeURLScheme(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrichment-jobs", `{"url":"javascript:alert(1)"}`, householdID, productID)
+	if err := h.CreateEnrichmentJob(c); err != nil {
+		t.Fatalf("CreateEnrichmentJob: %v", err)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "url scheme must be http or https") {
+		t.Fatalf("response = %s, want invalid scheme message", rec.Body.String())
 	}
 }
 
@@ -200,46 +223,78 @@ func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	oldOFFAPI := openFoodFactsAPIBase
-	oldOFFProduct := openFoodFactsProductBase
-	oldUSDASearch := usdaSearchAPIBase
-	oldUSDADetails := usdaFoodDetailsBase
-	openFoodFactsAPIBase = server.URL + "/off/api/v2/product"
-	openFoodFactsProductBase = server.URL + "/off/product"
-	usdaSearchAPIBase = server.URL + "/fdc/v1/foods/search"
-	usdaFoodDetailsBase = server.URL + "/fdc-app.html#/food-details/"
-	defer func() {
-		openFoodFactsAPIBase = oldOFFAPI
-		openFoodFactsProductBase = oldOFFProduct
-		usdaSearchAPIBase = oldUSDASearch
-		usdaFoodDetailsBase = oldUSDADetails
-	}()
+	client := httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, true)
+	h.Enrichment = runner.NewServiceWithProviders(h.DB, h.Cfg, nil, []providers.Provider{
+		&openfoodfacts.Provider{
+			Client:      client,
+			APIBase:     server.URL + "/off/api/v2/product",
+			ProductBase: server.URL + "/off/product",
+		},
+		&usda.Provider{
+			Client:          client,
+			SearchAPIBase:   server.URL + "/fdc/v1/foods/search",
+			FoodDetailsBase: server.URL + "/fdc-app.html#/food-details/",
+		},
+	})
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_enrichment_settings
+		    (household_id, provider_usda_fdc_enabled)
+		 VALUES (?, 1)
+		 ON CONFLICT(household_id) DO UPDATE SET provider_usda_fdc_enabled = 1`,
+		householdID,
+	); err != nil {
+		t.Fatalf("enable USDA provider: %v", err)
+	}
 
 	e := echo.New()
 	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrich/upc", `{"upc":"`+upc+`"}`, householdID, productID)
 	if err := h.EnrichByUPC(c); err != nil {
 		t.Fatalf("EnrichByUPC: %v", err)
 	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
 	}
 
-	var body addProductLinkResponse
+	var body productEnrichmentJobResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
+	if body.Job.Status != runner.StatusQueued {
+		t.Fatalf("job status = %q, want queued", body.Job.Status)
+	}
+	if err := h.Enrichment.ProcessJob(context.Background(), body.Job.ID); err != nil {
+		t.Fatalf("process enrichment job: %v", err)
+	}
+
 	bySourceField := map[string]string{}
-	for _, suggestion := range body.Suggestions {
-		bySourceField[suggestion.Source+"."+suggestion.Field] = suggestion.Value
+	rows, err := h.DB.Query(
+		`SELECT source, field, value
+		   FROM product_enrichment_suggestions
+		  WHERE product_id = ?`,
+		productID,
+	)
+	if err != nil {
+		t.Fatalf("query suggestions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var source, field, value string
+		if err := rows.Scan(&source, &field, &value); err != nil {
+			t.Fatalf("scan suggestion: %v", err)
+		}
+		bySourceField[source+"."+field] = value
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("suggestions rows: %v", err)
 	}
 	if bySourceField["openfoodfacts.name"] != "Mission Carb Balance Tortillas" {
-		t.Fatalf("OFF name missing; suggestions=%+v", body.Suggestions)
+		t.Fatalf("OFF name missing; suggestions=%+v", bySourceField)
 	}
 	if bySourceField["openfoodfacts.pack_quantity"] != "12" || bySourceField["openfoodfacts.calories"] != "70" {
-		t.Fatalf("OFF pack/nutrition missing; suggestions=%+v", body.Suggestions)
+		t.Fatalf("OFF pack/nutrition missing; suggestions=%+v", bySourceField)
 	}
 	if bySourceField["usda_fdc.sodium_mg"] != "280" || bySourceField["usda_fdc.calories"] != "72" {
-		t.Fatalf("USDA nutrition missing; suggestions=%+v", body.Suggestions)
+		t.Fatalf("USDA nutrition missing; suggestions=%+v", bySourceField)
 	}
 
 	var linkCount int
@@ -248,6 +303,20 @@ func TestEnrichByUPCReturnsOpenFoodFactsAndUSDASuggestions(t *testing.T) {
 	}
 	if linkCount != 2 {
 		t.Fatalf("product_links = %d, want OFF + USDA links", linkCount)
+	}
+	var metadataCount int
+	if err := h.DB.QueryRow("SELECT COUNT(*) FROM product_external_metadata WHERE product_id = ?", productID).Scan(&metadataCount); err != nil {
+		t.Fatalf("metadata count: %v", err)
+	}
+	if metadataCount != 2 {
+		t.Fatalf("product_external_metadata = %d, want OFF + USDA snapshots", metadataCount)
+	}
+	var jobStatus string
+	if err := h.DB.QueryRow("SELECT status FROM product_enrichment_jobs WHERE id = ?", body.Job.ID).Scan(&jobStatus); err != nil {
+		t.Fatalf("job status query: %v", err)
+	}
+	if jobStatus != runner.StatusSucceeded {
+		t.Fatalf("job status = %q, want succeeded", jobStatus)
 	}
 }
 

@@ -1,6 +1,6 @@
 import { get, put, del, post } from './client'
 
-export type IntegrationType = 'mealie'
+export type IntegrationType = 'mealie' | 'usda_fdc'
 
 export interface Integration {
   type: IntegrationType
@@ -14,6 +14,11 @@ export interface MealieConfigBody {
   token: string
 }
 
+export interface USDAFDCConfigBody {
+  api_key: string
+  enabled?: boolean
+}
+
 export interface TestResult {
   ok: boolean
   message?: string
@@ -25,7 +30,7 @@ export async function listIntegrations(): Promise<Integration[]> {
 
 export async function updateIntegration(
   type: IntegrationType,
-  body: MealieConfigBody,
+  body: MealieConfigBody | USDAFDCConfigBody,
 ): Promise<Integration> {
   return put<Integration>(`/integrations/${encodeURIComponent(type)}`, body)
 }
@@ -36,7 +41,7 @@ export async function deleteIntegration(type: IntegrationType): Promise<void> {
 
 export async function testIntegration(
   type: IntegrationType,
-  body: MealieConfigBody,
+  body: MealieConfigBody | USDAFDCConfigBody,
 ): Promise<TestResult> {
   return post<TestResult>(`/integrations/${encodeURIComponent(type)}/test`, body)
 }

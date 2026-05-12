@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -54,6 +55,11 @@ type mealieSaveRequest struct {
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
+type usdaFDCSaveRequest struct {
+	APIKey  string `json:"api_key"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
 // integrationResponse is the masked shape returned to clients. The token is
 // never present — only `configured` signals that a token is on file.
 type integrationResponse struct {
@@ -68,6 +74,8 @@ type testResult struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message,omitempty"`
 }
+
+var usdaFDCIntegrationTestBase = "https://api.nal.usda.gov/fdc/v1/foods/search"
 
 // --- Handlers ---
 
@@ -98,6 +106,8 @@ func (h *IntegrationHandler) Upsert(c echo.Context) error {
 	switch integrationType {
 	case models.IntegrationTypeMealie:
 		return h.upsertMealie(c, householdID)
+	case models.IntegrationTypeUSDAFDC:
+		return h.upsertUSDAFDC(c, householdID)
 	default:
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown integration type"})
 	}
@@ -148,6 +158,40 @@ func (h *IntegrationHandler) upsertMealie(c echo.Context, householdID string) er
 	return c.JSON(http.StatusOK, toIntegrationResponse(*it))
 }
 
+func (h *IntegrationHandler) upsertUSDAFDC(c echo.Context, householdID string) error {
+	var req usdaFDCSaveRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	if req.APIKey == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "api_key is required"})
+	}
+
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	cfgBytes, err := json.Marshal(models.USDAFDCConfig{
+		Version: 1,
+		APIKey:  req.APIKey,
+	})
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "marshal config"})
+	}
+
+	it := &models.Integration{
+		HouseholdID: householdID,
+		Type:        models.IntegrationTypeUSDAFDC,
+		Enabled:     enabled,
+		Config:      cfgBytes,
+	}
+	if err := h.Store.Upsert(c.Request().Context(), it); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	return c.JSON(http.StatusOK, toIntegrationResponse(*it))
+}
+
 // Delete removes the integration row for (household, type).
 // DELETE /api/v1/integrations/:type
 func (h *IntegrationHandler) Delete(c echo.Context) error {
@@ -172,6 +216,8 @@ func (h *IntegrationHandler) Test(c echo.Context) error {
 	switch integrationType {
 	case models.IntegrationTypeMealie:
 		return h.testMealie(c)
+	case models.IntegrationTypeUSDAFDC:
+		return h.testUSDAFDC(c)
 	default:
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown integration type"})
 	}
@@ -201,6 +247,68 @@ func (h *IntegrationHandler) testMealie(c echo.Context) error {
 	// connection result inline regardless of outcome. On failure, `message`
 	// is a short generic status — never the upstream body.
 	return c.JSON(http.StatusOK, testResult{OK: ok, Message: msg})
+}
+
+func (h *IntegrationHandler) testUSDAFDC(c echo.Context) error {
+	var req usdaFDCSaveRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if strings.TrimSpace(req.APIKey) == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "api_key is required"})
+	}
+	ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+	defer cancel()
+
+	ok, msg := pingUSDAFDC(ctx, strings.TrimSpace(req.APIKey))
+	return c.JSON(http.StatusOK, testResult{OK: ok, Message: msg})
+}
+
+func pingUSDAFDC(ctx context.Context, apiKey string) (bool, string) {
+	endpoint, err := url.Parse(usdaFDCIntegrationTestBase)
+	if err != nil {
+		return false, "invalid USDA endpoint"
+	}
+	query := endpoint.Query()
+	query.Set("api_key", apiKey)
+	query.Set("query", "milk")
+	query.Set("dataType", "Branded")
+	query.Set("pageSize", "1")
+	endpoint.RawQuery = query.Encode()
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return false, "invalid request"
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("User-Agent", "CartLedger/1.0")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return false, classifyNetError(err)
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return true, "connected"
+	case resp.StatusCode == http.StatusUnauthorized:
+		return false, "401 unauthorized"
+	case resp.StatusCode == http.StatusForbidden:
+		return false, "403 forbidden"
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return false, "rate limited"
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		return false, "unexpected redirect"
+	default:
+		return false, http.StatusText(resp.StatusCode)
+	}
 }
 
 // pingMealie performs a short GET against the Mealie /api/app/about endpoint

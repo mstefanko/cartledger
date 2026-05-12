@@ -6,6 +6,7 @@ import type {
   ProductImage,
   ProductLink,
   ProductDetail,
+  ProductEnrichmentJob,
   ProductEnrichmentSuggestion,
   BulkProductEnrichmentSuggestionsResponse,
   CreateProductRequest,
@@ -90,11 +91,29 @@ export async function addProductLink(
   )
 }
 
+export async function createProductEnrichmentJob(
+  productId: string,
+  data: { trigger?: 'manual_lookup' | 'manual_refresh'; sources?: string[]; upc?: string; url?: string },
+): Promise<{ job: ProductEnrichmentJob }> {
+  return post<{ job: ProductEnrichmentJob }>(
+    `/products/${encodeURIComponent(productId)}/enrichment-jobs`,
+    data,
+  )
+}
+
+export async function listProductEnrichmentJobs(
+  productId: string,
+): Promise<{ jobs: ProductEnrichmentJob[] }> {
+  return get<{ jobs: ProductEnrichmentJob[] }>(
+    `/products/${encodeURIComponent(productId)}/enrichment-jobs`,
+  )
+}
+
 export async function enrichProductByUPC(
   productId: string,
   data: { upc: string },
-): Promise<{ link: ProductLink; suggestions: ProductEnrichmentSuggestion[] }> {
-  return post<{ link: ProductLink; suggestions: ProductEnrichmentSuggestion[] }>(
+): Promise<{ job: ProductEnrichmentJob }> {
+  return post<{ job: ProductEnrichmentJob }>(
     `/products/${encodeURIComponent(productId)}/enrich/upc`,
     data,
   )

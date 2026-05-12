@@ -2,19 +2,20 @@ package ws
 
 // Event type constants for WebSocket messages.
 const (
-	EventListItemChecked      = "list.item.checked"
-	EventListItemAdded        = "list.item.added"
-	EventListItemRemoved      = "list.item.removed"
-	EventListItemUpdated      = "list.item.updated"
-	EventListItemsBulkUpdated = "list.items.bulk_updated"
-	EventListItemsBulkRemoved = "list.items.bulk_removed"
-	EventListLockAcquired     = "list.lock.acquired"
-	EventListLockReleased     = "list.lock.released"
-	EventListLockTakenOver    = "list.lock.taken_over"
-	EventReceiptProcessing    = "receipt.processing"
-	EventReceiptComplete      = "receipt.complete"
-	EventReceiptMatched       = "receipt.matched"
-	EventProductUpdated       = "product.updated"
+	EventListItemChecked             = "list.item.checked"
+	EventListItemAdded               = "list.item.added"
+	EventListItemRemoved             = "list.item.removed"
+	EventListItemUpdated             = "list.item.updated"
+	EventListItemsBulkUpdated        = "list.items.bulk_updated"
+	EventListItemsBulkRemoved        = "list.items.bulk_removed"
+	EventListLockAcquired            = "list.lock.acquired"
+	EventListLockReleased            = "list.lock.released"
+	EventListLockTakenOver           = "list.lock.taken_over"
+	EventReceiptProcessing           = "receipt.processing"
+	EventReceiptComplete             = "receipt.complete"
+	EventReceiptMatched              = "receipt.matched"
+	EventProductUpdated              = "product.updated"
+	EventProductEnrichmentJobUpdated = "product.enrichment_job.updated"
 )
 
 // Message represents a WebSocket message broadcast to household members.

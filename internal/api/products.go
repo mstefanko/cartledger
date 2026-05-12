@@ -18,6 +18,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	"github.com/mstefanko/cartledger/internal/enrichment/runner"
 	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/matcher"
@@ -29,9 +30,10 @@ import (
 
 // ProductHandler holds dependencies for product-related endpoints.
 type ProductHandler struct {
-	DB  *sql.DB
-	Cfg *config.Config
-	Hub *ws.Hub
+	DB         *sql.DB
+	Cfg        *config.Config
+	Hub        *ws.Hub
+	Enrichment *runner.Service
 }
 
 // --- Request types ---
@@ -141,6 +143,8 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products.DELETE("/:id/images/:imageId", h.DeleteImage)
 	products.GET("/:id/links", h.ListLinks)
 	products.POST("/:id/links", h.AddLink)
+	products.GET("/:id/enrichment-jobs", h.ListEnrichmentJobs)
+	products.POST("/:id/enrichment-jobs", h.CreateEnrichmentJob)
 	products.POST("/:id/enrich/upc", h.EnrichByUPC)
 	products.POST("/:id/enrichment-suggestions/bulk-accept", h.BulkAcceptEnrichmentSuggestions)
 	products.POST("/:id/enrichment-suggestions/bulk-reject", h.BulkRejectEnrichmentSuggestions)

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -7,7 +7,8 @@ import {
   deleteProduct,
   updateProduct,
   addProductLink,
-  enrichProductByUPC,
+  createProductEnrichmentJob,
+  listProductEnrichmentJobs,
   acceptProductEnrichmentSuggestion,
   rejectProductEnrichmentSuggestion,
   bulkAcceptProductEnrichmentSuggestions,
@@ -26,7 +27,7 @@ import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
 import { ProductMerge } from '@/components/products/ProductMerge'
-import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry, ProductGroup, GroupSuggestion, ProductEnrichmentSuggestion, ProductNutrition } from '@/types'
+import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry, ProductGroup, GroupSuggestion, ProductEnrichmentSuggestion, ProductNutrition, ProductEnrichmentJob } from '@/types'
 
 // --- Helper ---
 
@@ -69,6 +70,29 @@ function canonicalUnitPreview(unit: string): string {
   return aliases[normalized] ?? normalized
 }
 
+function isActiveEnrichmentJob(job: ProductEnrichmentJob): boolean {
+  return job.status === 'queued' || job.status === 'running'
+}
+
+function enrichmentJobStatusLabel(job: ProductEnrichmentJob): string {
+  switch (job.status) {
+    case 'queued':
+      return 'Queued'
+    case 'running':
+      return 'Looking up'
+    case 'succeeded':
+      return 'Lookup complete'
+    case 'partial':
+      return 'Lookup partially complete'
+    case 'failed':
+      return 'Lookup failed'
+    case 'cancelled':
+      return 'Lookup cancelled'
+    default:
+      return job.status
+  }
+}
+
 // --- Sub-components ---
 
 function ProductInfoSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
@@ -96,9 +120,33 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
     updateMutation.mutate({ upc: upc.trim() || null })
   }, [upc, updateMutation])
 
+  const jobsQuery = useQuery({
+    queryKey: ['product-enrichment-jobs', productId],
+    queryFn: () => listProductEnrichmentJobs(productId),
+    enabled: !!productId,
+    refetchInterval: (query) => {
+      const jobs = query.state.data?.jobs ?? []
+      return jobs.some(isActiveEnrichmentJob) ? 2000 : false
+    },
+  })
+  const jobs = jobsQuery.data?.jobs ?? []
+  const activeLookupJob = jobs.find(isActiveEnrichmentJob)
+  const latestLookupJob = jobs[0]
+
+  useEffect(() => {
+    if (latestLookupJob && !isActiveEnrichmentJob(latestLookupJob)) {
+      void queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    }
+  }, [latestLookupJob?.id, latestLookupJob?.status, productId, queryClient])
+
   const upcMutation = useMutation({
-    mutationFn: () => enrichProductByUPC(productId, { upc: upc.trim() }),
+    mutationFn: () =>
+      createProductEnrichmentJob(productId, {
+        trigger: 'manual_lookup',
+        upc: upc.trim(),
+      }),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-enrichment-jobs', productId] })
       queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
     },
   })
@@ -213,12 +261,23 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
               <Button
                 size="sm"
                 variant="subtle"
+                className="shrink-0 whitespace-nowrap"
                 onClick={() => upcMutation.mutate()}
-                disabled={upc.trim().length === 0 || upcMutation.isPending}
+                disabled={upc.trim().length === 0 || upcMutation.isPending || !!activeLookupJob}
               >
-                {upcMutation.isPending ? 'Looking...' : 'Lookup'}
+                {upcMutation.isPending ? 'Queueing...' : activeLookupJob ? 'Queued' : 'Lookup missing info'}
               </Button>
             </div>
+            {latestLookupJob && (
+              <div className="mt-1 text-small">
+                <span className={latestLookupJob.status === 'failed' ? 'text-expensive' : 'text-neutral-400'}>
+                  {enrichmentJobStatusLabel(latestLookupJob)}
+                </span>
+                {latestLookupJob.last_error && (
+                  <span className="ml-1 text-expensive">{latestLookupJob.last_error}</span>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Pack Quantity */}
@@ -915,6 +974,9 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
   const [open, setOpen] = useState(false)
   const [url, setURL] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const refreshUPC = detail.product.upc?.trim()
+  const refreshURL = detail.links[0]?.url?.trim()
+  const canRefreshSources = Boolean(refreshUPC || refreshURL)
 
   const mutation = useMutation({
     mutationFn: () => addProductLink(productId, { url: url.trim() }),
@@ -929,6 +991,18 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
     },
   })
 
+  const refreshMutation = useMutation({
+    mutationFn: () =>
+      createProductEnrichmentJob(productId, {
+        trigger: 'manual_refresh',
+        ...(refreshUPC ? { upc: refreshUPC } : { url: refreshURL ?? '' }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-enrichment-jobs', productId] })
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
+
   const handleSubmit = () => {
     if (!url.trim()) return
     setError(null)
@@ -940,9 +1014,19 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
       <div className="bg-white rounded-2xl shadow-subtle p-5">
         <div className="mb-3 flex items-center justify-between gap-3">
           <h2 className="font-display text-feature font-semibold text-neutral-900">Sources</h2>
-          <Button size="sm" variant="subtle" onClick={() => setOpen(true)}>
-            Add URL
-          </Button>
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button
+              size="sm"
+              variant="subtle"
+              onClick={() => refreshMutation.mutate()}
+              disabled={!canRefreshSources || refreshMutation.isPending}
+            >
+              {refreshMutation.isPending ? 'Queueing...' : 'Refresh sources'}
+            </Button>
+            <Button size="sm" variant="subtle" onClick={() => setOpen(true)}>
+              Add URL
+            </Button>
+          </div>
         </div>
         {detail.links.length === 0 ? (
           <p className="text-caption text-neutral-400">No source links yet.</p>
