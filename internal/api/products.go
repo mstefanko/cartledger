@@ -140,9 +140,11 @@ func (h *ProductHandler) RegisterRoutes(protected *echo.Group) {
 	products.GET("/:id/recompute-prices/preview", h.RecomputePricesPreview)
 	products.POST("/:id/recompute-prices", h.RecomputePrices)
 	products.POST("/:id/images", h.UploadImage)
+	products.GET("/:id/images/:imageId/file", h.ServeProductImage)
 	products.DELETE("/:id/images/:imageId", h.DeleteImage)
 	products.GET("/:id/links", h.ListLinks)
 	products.POST("/:id/links", h.AddLink)
+	products.DELETE("/:id/links/:linkId", h.DeleteLink)
 	products.GET("/:id/enrichment-jobs", h.ListEnrichmentJobs)
 	products.POST("/:id/enrichment-jobs", h.CreateEnrichmentJob)
 	products.POST("/:id/enrich/upc", h.EnrichByUPC)
@@ -960,6 +962,52 @@ func (h *ProductHandler) UploadImage(c echo.Context) error {
 	})
 }
 
+// ServeProductImage returns a product image after household ownership checks.
+// GET /api/v1/products/:id/images/:imageId/file
+func (h *ProductHandler) ServeProductImage(c echo.Context) error {
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+	imageID := c.Param("imageId")
+
+	var storageKey string
+	err := h.DB.QueryRowContext(c.Request().Context(),
+		`SELECT pi.image_path
+		   FROM product_images pi
+		   JOIN products p ON p.id = pi.product_id
+		  WHERE pi.id = ?
+		    AND pi.product_id = ?
+		    AND p.household_id = ?`,
+		imageID, productID, householdID,
+	).Scan(&storageKey)
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	localStore, err := storage.NewLocal(h.Cfg.DataDir)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "storage unavailable"})
+	}
+	path, err := localStore.Path(filepath.ToSlash(storageKey))
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+	if _, err := os.Stat(path); err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	}
+
+	switch strings.ToLower(filepath.Ext(storageKey)) {
+	case ".png":
+		c.Response().Header().Set(echo.HeaderContentType, "image/png")
+	case ".jpg", ".jpeg":
+		c.Response().Header().Set(echo.HeaderContentType, "image/jpeg")
+	}
+	c.Response().Header().Set("Cache-Control", "private, max-age=86400")
+	return c.File(path)
+}
+
 // DeleteImage removes a product image (DB row + file on disk).
 // DELETE /api/v1/products/:id/images/:imageId
 func (h *ProductHandler) DeleteImage(c echo.Context) error {
@@ -1349,6 +1397,24 @@ type productStoreCodeResponse struct {
 	LastSeenAt    string   `json:"last_seen_at"`
 }
 
+type productExternalMetadataResponse struct {
+	ID             string          `json:"id"`
+	ProductID      string          `json:"product_id"`
+	ProductLinkID  *string         `json:"product_link_id,omitempty"`
+	Source         string          `json:"source"`
+	SourceRecordID *string         `json:"source_record_id,omitempty"`
+	SourceURL      *string         `json:"source_url,omitempty"`
+	LookupKey      *string         `json:"lookup_key,omitempty"`
+	Payload        json.RawMessage `json:"payload"`
+	PayloadVersion int             `json:"payload_version"`
+	FetchedAt      *time.Time      `json:"fetched_at,omitempty"`
+	HTTPStatus     *int            `json:"http_status,omitempty"`
+	LastError      *string         `json:"last_error,omitempty"`
+	Confidence     *float64        `json:"confidence,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+}
+
 type productGroupInfo struct {
 	GroupID   string `json:"group_id"`
 	GroupName string `json:"group_name"`
@@ -1372,6 +1438,7 @@ type productDetailResponse struct {
 	Images                []productImageResponse                `json:"images"`
 	Links                 []productLinkResponse                 `json:"links"`
 	Nutrition             []productNutritionResponse            `json:"nutrition"`
+	ExternalMetadata      []productExternalMetadataResponse     `json:"external_metadata"`
 	EnrichmentSuggestions []productEnrichmentSuggestionResponse `json:"enrichment_suggestions"`
 	PriceHistory          []priceHistoryEntry                   `json:"price_history"`
 	StoreCompare          []storeComparison                     `json:"store_comparison"`
@@ -1411,6 +1478,7 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 		Images:                make([]productImageResponse, 0),
 		Links:                 make([]productLinkResponse, 0),
 		Nutrition:             make([]productNutritionResponse, 0),
+		ExternalMetadata:      make([]productExternalMetadataResponse, 0),
 		EnrichmentSuggestions: make([]productEnrichmentSuggestionResponse, 0),
 		PriceHistory:          make([]priceHistoryEntry, 0),
 		StoreCompare:          make([]storeComparison, 0),
@@ -1534,8 +1602,15 @@ func (h *ProductHandler) Detail(c echo.Context) error {
 		}
 	}
 
-	resp.Nutrition = h.fetchProductNutrition(productID)
-	resp.EnrichmentSuggestions = h.fetchProductEnrichmentSuggestions(productID, true)
+	if nutrition := h.fetchProductNutrition(productID); nutrition != nil {
+		resp.Nutrition = nutrition
+	}
+	if metadata := h.fetchProductExternalMetadata(productID); metadata != nil {
+		resp.ExternalMetadata = metadata
+	}
+	if suggestions := h.fetchProductEnrichmentSuggestions(productID, true); suggestions != nil {
+		resp.EnrichmentSuggestions = suggestions
+	}
 
 	// Fetch price history with store name.
 	priceRows, err := h.DB.Query(

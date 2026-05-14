@@ -5,6 +5,7 @@ import {
   useCallback,
   useMemo,
   type KeyboardEvent,
+  type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
 
@@ -17,6 +18,7 @@ interface AutocompleteCellProps {
   value: string
   displayValue: string
   suggestedValue?: { name: string; type: string } | null
+  displayNode?: ReactNode
   rowIndex: number
   columnId: string
   isActive: boolean
@@ -47,6 +49,7 @@ function AutocompleteCell({
   value,
   displayValue,
   suggestedValue,
+  displayNode,
   rowIndex,
   columnId,
   isActive,
@@ -270,6 +273,7 @@ function AutocompleteCell({
   const viewText = displayValue || suggestedValue?.name || 'Unmatched'
   const isSuggested = !hasMatch && !!suggestedValue
   const isUnmatched = !hasMatch && !suggestedValue
+  const hasCustomDisplay = displayNode != null
 
   return (
     <>
@@ -279,19 +283,21 @@ function AutocompleteCell({
         onClick={onStartEdit}
         onKeyDown={handleCellKeyDown}
         className={[
-          'w-full h-full px-2 py-1 text-caption font-body cursor-pointer truncate',
-          'leading-[36px]',
+          'w-full h-full px-2 py-1 text-caption font-body cursor-pointer',
+          hasCustomDisplay ? 'min-h-[56px]' : 'truncate leading-[36px]',
           isActive ? 'ring-2 ring-brand ring-inset rounded-sm' : '',
-          isSuggested
-            ? suggestedValue.type === 'new_product'
-              ? 'text-blue-600 italic'
-              : 'text-amber-600 italic'
-            : isUnmatched
-              ? 'text-neutral-400 italic'
-              : 'text-neutral-900',
+          hasCustomDisplay
+            ? 'text-neutral-900'
+            : isSuggested
+              ? suggestedValue.type === 'new_product'
+                ? 'text-blue-600 italic'
+                : 'text-amber-600 italic'
+              : isUnmatched
+                ? 'text-neutral-400 italic'
+                : 'text-neutral-900',
         ].join(' ')}
       >
-        {viewText}
+        {displayNode ?? viewText}
       </div>
       {dropdown}
     </>

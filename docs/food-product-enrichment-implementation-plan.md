@@ -1286,6 +1286,130 @@ Acceptance:
 - app restart leaves queued jobs recoverable;
 - users can disable all automatic external lookups.
 
+### Phase 3.5: Receipt Review Barcode Assist
+
+This is a narrow scanner assist, not a standalone grocery scanner or inventory
+workflow. Its primary use is receipt review when the user still has a newly
+purchased packaged item in hand and the receipt row is unmatched or would create
+a new product. Do not make receipt review the place to correct UPCs on already
+matched household products; keep that cleanup on Product Detail, where the user
+has source links, existing suggestions, merge context, and field history. The
+same scanner component may add a Product Detail UPC-field camera shortcut so
+existing-product corrections are still faster than typing.
+
+Why it belongs after Phase 3:
+
+- scanning a package barcode is faster and less error-prone than typing a UPC,
+  but only once the durable enrichment worker, provider settings, UPC conflict
+  handling, and receipt-review badges already exist;
+- the flow should reuse the same manual lookup gates as Product Detail, because
+  the user explicitly initiated the scan and automatic lookup opt-in should not
+  be required;
+- the feature improves the "new product on this receipt" loop without turning
+  CartLedger into a pantry/inventory scanner.
+
+Backend:
+
+- add a dedicated receipt-review barcode command endpoint instead of stretching
+  generic line-item update semantics, for example
+  `POST /api/v1/receipts/:id/line-items/:itemId/barcode`;
+- request body: `{ "upc": "...", "mode": "preview" | "apply", "create_product": false }`;
+- normalize UPC/GTIN through `internal/identifiers` / `internal/upc` and reject
+  invalid codes before any provider call;
+- limit eligibility to editable receipts and line items that are unmatched,
+  suggested as `new_product`, or explicitly being created from the Add Row flow;
+- on preview, return local household matches from `product_identifiers` and
+  `products.upc`, provider/manual-lookup availability, and any conflict details;
+- on apply with a local match, match the line item to that product and store the
+  line UPC/identifier observation; do not overwrite product fields;
+- on apply with `create_product=true`, create a product from the receipt text
+  plus scanned UPC, attach the primary GTIN using the existing conflict checks,
+  match the line item, and queue a Phase 2 enrichment job with trigger
+  `receipt_review_scan`;
+- if providers are disabled or unavailable, still store the scanned identifier
+  and show that lookup was skipped;
+- make the endpoint idempotent for repeated scans of the same UPC on the same
+  line item, and return a clear duplicate response when the scanned UPC already
+  belongs to another household product;
+- for Product Detail correction, reuse the existing product update and
+  enrichment-job endpoints; do not create a second product-UPC write path;
+- do not auto-merge products, auto-accept provider suggestions, or update
+  already matched existing products from receipt review.
+
+Frontend:
+
+- create a reusable `BarcodeScannerModal` that owns camera lifecycle, manual
+  fallback, duplicate debounce, and stream cleanup;
+- add a row-level scan affordance only for unmatched/new-product rows, plus an
+  optional toolbar action `Scan next new item` when any eligible rows remain;
+- open a `BarcodeScannerModal` that is locked to one receipt line and shows the
+  receipt text, price, and current suggestion context before the camera starts;
+- add a camera icon beside the Product Detail UPC input; on scan success, fill
+  the UPC field and use the existing save/lookup controls rather than adding a
+  separate correction flow;
+- implement a live camera scanner with a custom CartLedger modal using
+  `@zxing/browser` or a similarly small wrapper; do not depend solely on the
+  native `BarcodeDetector` API because it is still limited/experimental across
+  major browsers;
+- lazy-load the scanner code so desktop receipt review does not pay the camera
+  bundle cost until the user opens the modal;
+- include manual UPC entry in the same modal for denied camera permission,
+  unsupported browsers, damaged labels, and physical USB scanners that type into
+  the focused field;
+- after a successful scan, stop the camera stream immediately unless the user
+  enables `Keep scanner open`; the default should be scan, confirm, then
+  auto-advance to the next eligible row;
+- prefer the rear/environment camera, remember the last selected camera when the
+  browser exposes stable device IDs, and keep camera selection secondary to the
+  main scan/confirm task;
+- result states:
+  - existing household product found: show product name and `Match row`;
+  - no local product: show `Create product from receipt row` and queue lookup;
+  - lookup queued/running: show the same receipt row badge language as Phase 3;
+  - invalid/duplicate/conflicting UPC: show a blocking inline error with a
+    Product Detail or merge path when relevant;
+  - camera blocked/unsupported: keep manual entry available without dead-ending
+    the user;
+- keep detailed nutrition, ingredient, allergen, and source-snapshot review on
+  Product Detail. Receipt review should show only enough metadata to confirm that
+  the row is matched correctly.
+
+Acceptance:
+
+- reviewing a receipt on a phone, the user can tap scan on an unmatched packaged
+  item, scan the barcode, and match the row to an existing household product when
+  the UPC is already known;
+- scanning a UPC for a new product can create and match a product from the
+  receipt row, store the UPC, and queue provider lookup without typing the UPC;
+- manual UPC entry follows the same preview/apply path as camera scanning;
+- camera permission denial, unsupported camera APIs, and failed decodes do not
+  block manual review;
+- repeated scans of the same barcode do not create duplicate products or jobs;
+- existing matched products are not silently corrected from receipt review;
+- on Product Detail, scanning fills the UPC input and follows the existing
+  product save/conflict/lookup behavior;
+- the camera stream is stopped when the modal closes, the route changes, or the
+  scan is applied.
+
+References:
+
+- MyFitnessPal opens barcode scan from the food logging flow, then asks the user
+  to confirm the scanned item before adding it.
+- Open Food Facts and Yuka use barcode scanning as the product lookup front
+  door, but their broad health-analysis model is intentionally larger than this
+  CartLedger receipt-review assist.
+- Grocy and Barcode Buddy show the useful self-hosted pattern: barcode-ready
+  forms, field-adjacent camera buttons, optional browser/device-camera scanning,
+  physical scanner/manual entry fallback, and Open Food Facts lookup for unknown
+  products.
+- Technical references: [`@zxing/browser`](https://github.com/zxing-js/browser),
+  [`html5-qrcode`](https://github.com/mebjas/html5-qrcode),
+  [Grocy camera scanner component](https://github.com/grocy/grocy/blob/master/public/viewjs/components/camerabarcodescanner.js),
+  [MDN `BarcodeDetector`](https://developer.mozilla.org/en-US/docs/Web/API/BarcodeDetector/detect),
+  [MDN `getUserMedia`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia),
+  [Grocy](https://grocy.info/), and
+  [Barcode Buddy](https://barcodebuddy-documentation.readthedocs.io/en/latest/).
+
 ### Phase 4: Kroger Integration
 
 Backend:
@@ -1336,7 +1460,8 @@ Deferred because value is uncertain or maintenance cost is high:
 
 - scheduled web scraping of retailer product pages;
 - automatic download/storage of product photos;
-- browser barcode scanner;
+- standalone pantry/inventory barcode scanning, bulk shelf scanning, and
+  barcode-first product correction flows outside Product Detail;
 - full PLU database;
 - GS1/1WorldSync commercial catalog integration;
 - paid provider implementation;
@@ -1362,6 +1487,11 @@ Deferred because value is uncertain or maintenance cost is high:
 - Rate limits: scheduled jobs must be capped and back off per provider.
 - Privacy: automatic lookups disclose household purchase identifiers to third
   parties. Make automatic lookup opt-in.
+- Camera privacy: receipt-review barcode assist must request camera access only
+  after an explicit user action, stop streams on modal close/unmount, and keep
+  manual UPC entry available for users who decline permission.
+- Scanner ambiguity: camera scanning can decode the wrong barcode on crowded
+  packaging. Always show the scanned UPC and product candidate before applying.
 - Old price history: accepting package size changes can rewrite normalized
   analytics. Keep the current recompute confirmation.
 - Worker complexity: do not mix enrichment calls inside the receipt LLM worker's

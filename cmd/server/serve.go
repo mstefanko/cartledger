@@ -153,8 +153,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Create matching engine and receipt worker.
 	matchEngine := matcher.NewEngine(database)
-	receiptWorker := worker.NewReceiptWorker(2, llmClient, llmGuard, matchEngine, database, hub, cfg)
 	enrichmentService := enrichmentrunner.NewService(database, cfg, hub)
+	receiptWorker := worker.NewReceiptWorker(2, llmClient, llmGuard, matchEngine, database, hub, cfg)
+	receiptWorker.SetEnrichmentService(enrichmentService)
 	enrichmentWorker := enrichmentrunner.NewWorker(2, enrichmentService)
 
 	// Re-enqueue any receipts left at status='pending' from a prior shutdown.

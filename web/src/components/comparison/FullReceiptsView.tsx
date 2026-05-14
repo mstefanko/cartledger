@@ -16,7 +16,7 @@ function formatCurrency(value: string | null | undefined): string {
   return `$${num.toFixed(2)}`
 }
 
-function formatSize(item: LineItem): string {
+function formatPurchased(item: LineItem): string {
   const unit = item.unit?.replace(/_/g, ' ')
   if (item.quantity && unit) return `${item.quantity} ${unit}`
   if (item.quantity) return item.quantity
@@ -107,7 +107,7 @@ export function FullReceiptsView({ receipts }: FullReceiptsViewProps) {
                           </div>
                           <div className="mt-2 flex flex-wrap items-center gap-2">
                             <span className="rounded-md bg-neutral-50 px-2 py-0.5 text-small text-neutral-600">
-                              {formatSize(item)}
+                              Purchased {formatPurchased(item)}
                             </span>
                             {others > 0 && (
                               <span className="rounded-md bg-success-subtle px-2 py-0.5 text-small font-medium text-success-dark">

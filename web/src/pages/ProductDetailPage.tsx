@@ -1,12 +1,28 @@
-import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect, type ReactNode } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  Check,
+  ExternalLink,
+  Flame,
+  Link2,
+  Package as PackageIcon,
+  Plus,
+  RefreshCw,
+  Search,
+  ShieldAlert,
+  Trash2,
+  Wheat,
+  X,
+  Zap,
+} from 'lucide-react'
 import {
   getProductDetail,
   getProductUsage,
   deleteProduct,
   updateProduct,
   addProductLink,
+  deleteProductLink,
   createProductEnrichmentJob,
   listProductEnrichmentJobs,
   acceptProductEnrichmentSuggestion,
@@ -21,13 +37,27 @@ import {
   deleteProductAlias,
   type ProductUsage,
 } from '@/api/products'
+import { getProductEnrichmentSettings } from '@/api/product-enrichment'
 import { fetchGroups, fetchGroupSuggestions, createGroup } from '@/api/groups'
 import { listStores } from '@/api/stores'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Modal } from '@/components/ui/Modal'
 import { ProductMerge } from '@/components/products/ProductMerge'
-import type { ProductDetail, ProductImage, ProductAlias, Store, PriceHistoryEntry, ProductGroup, GroupSuggestion, ProductEnrichmentSuggestion, ProductNutrition, ProductEnrichmentJob } from '@/types'
+import type {
+  ProductDetail,
+  ProductImage,
+  ProductAlias,
+  Store,
+  PriceHistoryEntry,
+  ProductGroup,
+  GroupSuggestion,
+  ProductEnrichmentSuggestion,
+  ProductNutrition,
+  ProductEnrichmentJob,
+  ProductExternalMetadata,
+  ProductMetadataNutrients,
+} from '@/types'
 
 // --- Helper ---
 
@@ -93,7 +123,143 @@ function enrichmentJobStatusLabel(job: ProductEnrichmentJob): string {
   }
 }
 
+function enrichmentProviderLabel(source: string): string {
+  switch (source) {
+    case 'openfoodfacts':
+      return 'Open Food Facts'
+    case 'usda_fdc':
+      return 'USDA FoodData Central'
+    case 'url':
+      return 'URL'
+    default:
+      return source
+  }
+}
+
 // --- Sub-components ---
+
+function ProductCard({ children, className = '' }: { children: ReactNode; className?: string }) {
+  return (
+    <section className={['rounded-2xl border border-neutral-200 bg-white shadow-subtle', className].filter(Boolean).join(' ')}>
+      {children}
+    </section>
+  )
+}
+
+function ProductCardTitle({ title, meta }: { title: string; meta?: string }) {
+  return (
+    <div className="flex flex-wrap items-baseline gap-2">
+      <h2 className="font-display text-feature font-semibold text-neutral-900">{title}</h2>
+      {meta && (
+        <span className="text-small font-semibold uppercase text-neutral-400">
+          {meta}
+        </span>
+      )}
+    </div>
+  )
+}
+
+function fieldSuggestions(detail: ProductDetail, fields: string[]): ProductEnrichmentSuggestion[] {
+  const fieldSet = new Set(fields)
+  return (detail.enrichment_suggestions ?? []).filter(
+    (suggestion) => suggestion.status === 'pending' && fieldSet.has(suggestion.field),
+  )
+}
+
+function InlineSuggestionList({
+  productId,
+  suggestions,
+  showField = false,
+  className = '',
+}: {
+  productId: string
+  suggestions: ProductEnrichmentSuggestion[]
+  showField?: boolean
+  className?: string
+}) {
+  if (suggestions.length === 0) return null
+
+  return (
+    <div className={['space-y-1.5', className].filter(Boolean).join(' ')}>
+      {suggestions.map((suggestion) => (
+        <InlineSuggestion key={suggestion.id} productId={productId} suggestion={suggestion} showField={showField} />
+      ))}
+    </div>
+  )
+}
+
+function InlineSuggestion({
+  productId,
+  suggestion,
+  showField,
+}: {
+  productId: string
+  suggestion: ProductEnrichmentSuggestion
+  showField: boolean
+}) {
+  const queryClient = useQueryClient()
+  const acceptMutation = useMutation({
+    mutationFn: () => acceptProductEnrichmentSuggestion(productId, suggestion.id, { fields: [suggestion.field] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+  const rejectMutation = useMutation({
+    mutationFn: () => rejectProductEnrichmentSuggestion(productId, suggestion.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
+  const mutationPending = acceptMutation.isPending || rejectMutation.isPending
+
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-neutral-500">
+      <span className="inline-flex items-center gap-1 rounded-lg bg-brand-subtle px-2 py-0.5 text-small font-semibold text-brand">
+        <Zap className="h-3 w-3" aria-hidden="true" />
+        {sourceLabel(suggestion.source)}
+      </span>
+      <span>suggests</span>
+      {showField && <span className="font-semibold text-neutral-900">{fieldLabel(suggestion.field)}</span>}
+      <span className="font-semibold text-neutral-900">{suggestion.value}</span>
+      {suggestion.evidence && (
+        <span className="text-neutral-400">{suggestion.evidence}</span>
+      )}
+      <span className="text-neutral-300" aria-hidden="true">·</span>
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 font-semibold text-brand transition-colors hover:text-brand-deep disabled:opacity-50"
+        onClick={() => acceptMutation.mutate()}
+        disabled={mutationPending}
+      >
+        <Check className="h-3.5 w-3.5" aria-hidden="true" />
+        Accept
+      </button>
+      <span className="text-neutral-300" aria-hidden="true">·</span>
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 font-medium text-neutral-500 transition-colors hover:text-neutral-900 disabled:opacity-50"
+        onClick={() => rejectMutation.mutate()}
+        disabled={mutationPending}
+      >
+        <X className="h-3.5 w-3.5" aria-hidden="true" />
+        Dismiss
+      </button>
+    </div>
+  )
+}
+
+function ProductInfoRow({ label, hint, children }: { label: string; hint: string; children: ReactNode }) {
+  return (
+    <div className="grid gap-3 px-5 py-4 sm:grid-cols-[190px_minmax(0,1fr)] sm:gap-6">
+      <div>
+        <h3 className="text-caption font-semibold text-neutral-900">{label}</h3>
+        <p className="mt-0.5 text-small text-neutral-400">{hint}</p>
+      </div>
+      <div className="min-w-0">{children}</div>
+    </div>
+  )
+}
 
 function ProductInfoSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
   const queryClient = useQueryClient()
@@ -103,6 +269,7 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   const [packUnit, setPackUnit] = useState(detail.product.pack_unit ?? '')
   const [confirmMode, setConfirmMode] = useState<'save' | 'recompute' | null>(null)
   const [affectedCount, setAffectedCount] = useState<number | null>(null)
+  const [showPriceBasis, setShowPriceBasis] = useState(false)
 
   const updateMutation = useMutation({
     mutationFn: (data: { brand?: string; upc?: string | null; pack_quantity?: number; pack_unit?: string }) =>
@@ -133,17 +300,23 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   const activeLookupJob = jobs.find(isActiveEnrichmentJob)
   const latestLookupJob = jobs[0]
 
+  const { data: enrichmentSettings, isLoading: enrichmentSettingsLoading } = useQuery({
+    queryKey: ['product-enrichment-settings'],
+    queryFn: getProductEnrichmentSettings,
+  })
+
   useEffect(() => {
     if (latestLookupJob && !isActiveEnrichmentJob(latestLookupJob)) {
       void queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
     }
   }, [latestLookupJob?.id, latestLookupJob?.status, productId, queryClient])
 
-  const upcMutation = useMutation({
-    mutationFn: () =>
+  const lookupMutation = useMutation({
+    mutationFn: (sources?: string[]) =>
       createProductEnrichmentJob(productId, {
         trigger: 'manual_lookup',
         upc: upc.trim(),
+        sources,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['product-enrichment-jobs', productId] })
@@ -209,81 +382,141 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   }, [recomputeMutation])
 
   // Compute price per unit from latest price
-  const latestPrice = detail.price_history.length > 0
-    ? parseFloat(detail.price_history[0]?.unit_price ?? '0')
-    : null
+  const latestEntry = detail.price_history[0]
+  const latestPrice = latestEntry ? parseFloat(latestEntry.unit_price ?? '0') : null
   const packQty = detail.product.pack_quantity
   const pricePerUnit = (latestPrice && packQty && packQty > 0)
     ? latestPrice / packQty
     : null
-  const latestNormalized = detail.price_history.find((entry) => entry.normalized_price && entry.normalized_unit)
+  const latestNormalized = latestEntry?.normalized_price && latestEntry.normalized_unit ? latestEntry : undefined
+  const productContents = packQty && detail.product.pack_unit
+    ? `${packQty} ${detail.product.pack_unit}`
+    : null
+  const latestPurchased = latestEntry
+    ? `${latestEntry.quantity} ${latestEntry.unit || detail.product.default_unit || 'each'}`
+    : null
+  const comparedPrice = latestNormalized?.normalized_price && latestNormalized.normalized_unit
+    ? `$${parseFloat(latestNormalized.normalized_price).toFixed(2)} / ${latestNormalized.normalized_unit}`
+    : pricePerUnit != null
+      ? `$${pricePerUnit.toFixed(2)} / ${detail.product.pack_unit ?? 'unit'}`
+      : null
   const packChanged =
     packQuantity !== (detail.product.pack_quantity?.toString() ?? '') ||
     packUnit !== (detail.product.pack_unit ?? '')
   const canonicalUnit = packUnit.trim() ? canonicalUnitPreview(packUnit) : ''
   const savingPack = updateMutation.isPending || recomputeMutation.isPending
+  const providerAvailability = enrichmentSettings?.provider_availability ?? {}
+  const manualLookupEnabled = Boolean(enrichmentSettings?.global_enabled && enrichmentSettings?.manual_lookup_enabled)
+  const openFoodFactsEnabled = manualLookupEnabled && Boolean(providerAvailability.openfoodfacts?.enabled)
+  const usdaEnabled = manualLookupEnabled && Boolean(providerAvailability.usda_fdc?.enabled)
+  const lookupDisabled = enrichmentSettingsLoading || upc.trim().length === 0 || lookupMutation.isPending || !!activeLookupJob || !manualLookupEnabled
+  let lookupHelper: string | null = null
+  if (!enrichmentSettingsLoading) {
+    if (upc.trim().length === 0) {
+      lookupHelper = 'Add a UPC to search barcode providers.'
+    } else if (!manualLookupEnabled) {
+      lookupHelper = 'Manual lookup is disabled in Settings.'
+    } else if (providerAvailability.usda_fdc?.reason && !usdaEnabled) {
+      lookupHelper = `USDA unavailable: ${providerAvailability.usda_fdc.reason}.`
+    }
+  }
+  const latestLookupSources = latestLookupJob?.requested_sources?.length
+    ? latestLookupJob.requested_sources.map(enrichmentProviderLabel).join(', ')
+    : null
+  const brandSuggestions = fieldSuggestions(detail, ['brand'])
+  const upcSuggestions = fieldSuggestions(detail, ['upc'])
+  const packageSuggestions = fieldSuggestions(detail, ['pack_quantity', 'pack_unit'])
 
   return (
     <>
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Product Info</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          {/* Brand */}
-          <div>
-            <label className="block text-small font-medium text-neutral-400 mb-1">Brand</label>
-            <div className="flex gap-2">
+      <ProductCard className="overflow-hidden">
+        <div className="border-b border-neutral-200 px-5 py-4">
+          <ProductCardTitle title="Product Info" meta="Editable Fields" />
+        </div>
+        <div className="divide-y divide-neutral-200">
+          <ProductInfoRow label="Brand" hint="Saves automatically">
+            <div className="max-w-sm">
               <input
                 type="text"
                 value={brand}
                 onChange={(e) => setBrand(e.target.value)}
                 placeholder="e.g., Kirkland, Great Value"
-                className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-caption focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand"
                 onBlur={handleSaveBrand}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBrand() }}
               />
             </div>
-          </div>
+            <InlineSuggestionList productId={productId} suggestions={brandSuggestions} className="mt-2" />
+          </ProductInfoRow>
 
-          {/* UPC */}
-          <div>
-            <label className="block text-small font-medium text-neutral-400 mb-1">UPC</label>
-            <div className="flex gap-2">
+          <ProductInfoRow label="UPC" hint="Lookup required before save">
+            <div className="max-w-lg">
               <input
                 type="text"
                 value={upc}
                 onChange={(e) => setUpc(e.target.value)}
                 placeholder="Barcode"
                 inputMode="numeric"
-                className="min-w-0 flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-caption focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand"
                 onBlur={handleSaveUPC}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleSaveUPC() }}
               />
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
               <Button
                 size="sm"
                 variant="subtle"
-                className="shrink-0 whitespace-nowrap"
-                onClick={() => upcMutation.mutate()}
-                disabled={upc.trim().length === 0 || upcMutation.isPending || !!activeLookupJob}
+                className="gap-1.5"
+                onClick={() => lookupMutation.mutate(['openfoodfacts'])}
+                disabled={lookupDisabled || !openFoodFactsEnabled}
+                title={!openFoodFactsEnabled ? 'Open Food Facts lookup is disabled in Settings.' : undefined}
               >
-                {upcMutation.isPending ? 'Queueing...' : activeLookupJob ? 'Queued' : 'Lookup missing info'}
+                <Search className="h-3.5 w-3.5" aria-hidden="true" />
+                Search Open Food Facts
+              </Button>
+              <Button
+                size="sm"
+                variant="subtle"
+                className="gap-1.5"
+                onClick={() => lookupMutation.mutate(['usda_fdc'])}
+                disabled={lookupDisabled || !usdaEnabled}
+                title={providerAvailability.usda_fdc?.reason || undefined}
+              >
+                <Search className="h-3.5 w-3.5" aria-hidden="true" />
+                Search USDA
+              </Button>
+              <Button
+                size="sm"
+                variant="outlined"
+                className="gap-1.5"
+                onClick={() => lookupMutation.mutate(['openfoodfacts', 'usda_fdc'])}
+                disabled={lookupDisabled || (!openFoodFactsEnabled && !usdaEnabled)}
+              >
+                <Search className="h-3.5 w-3.5" aria-hidden="true" />
+                Lookup all
               </Button>
             </div>
+            {lookupHelper && (
+              <p className="mt-1 text-small text-neutral-400">{lookupHelper}</p>
+            )}
             {latestLookupJob && (
-              <div className="mt-1 text-small">
+              <div className="mt-2 text-small">
                 <span className={latestLookupJob.status === 'failed' ? 'text-expensive' : 'text-neutral-400'}>
                   {enrichmentJobStatusLabel(latestLookupJob)}
                 </span>
+                {latestLookupSources && (
+                  <span className="ml-1 text-neutral-400">({latestLookupSources})</span>
+                )}
                 {latestLookupJob.last_error && (
                   <span className="ml-1 text-expensive">{latestLookupJob.last_error}</span>
                 )}
               </div>
             )}
-          </div>
+            <InlineSuggestionList productId={productId} suggestions={upcSuggestions} className="mt-2" />
+          </ProductInfoRow>
 
-          {/* Pack Quantity */}
-          <div>
-            <label className="block text-small font-medium text-neutral-400 mb-1">Package size</label>
-            <div className="flex gap-2">
+          <ProductInfoRow label="Package contents" hint="What one purchased package contains">
+            <div className="flex max-w-2xl flex-col gap-2 md:flex-row md:items-center">
               <input
                 type="number"
                 value={packQuantity}
@@ -291,7 +524,7 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
                 placeholder="e.g., 12"
                 min="0"
                 step="any"
-                className="w-24 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-caption focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand md:w-32"
                 onKeyDown={(e) => { if (e.key === 'Enter' && packChanged) openSaveConfirm() }}
               />
               <input
@@ -299,43 +532,74 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
                 value={packUnit}
                 onChange={(e) => setPackUnit(e.target.value)}
                 placeholder="unit (e.g., oz, ct)"
-                className="flex-1 px-3 py-2 text-caption border border-neutral-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand focus:border-transparent"
+                className="min-w-0 flex-1 rounded-xl border border-neutral-200 px-3 py-2 text-caption focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand"
                 onKeyDown={(e) => { if (e.key === 'Enter' && packChanged) openSaveConfirm() }}
               />
+              <Button size="sm" onClick={openSaveConfirm} disabled={!packChanged || savingPack}>
+                {updateMutation.isPending ? 'Saving...' : 'Save contents'}
+              </Button>
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-small text-neutral-400">
-              <span>Used for price comparisons</span>
               {canonicalUnit && <span>Canonical: {canonicalUnit}</span>}
             </div>
-          </div>
-        </div>
+            <InlineSuggestionList productId={productId} suggestions={packageSuggestions} className="mt-2" showField />
+          </ProductInfoRow>
 
-        <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            {latestNormalized?.normalized_price && latestNormalized.normalized_unit ? (
-              <p className="text-body font-medium text-success-dark">
-                Latest normalized: ${parseFloat(latestNormalized.normalized_price).toFixed(2)} / {latestNormalized.normalized_unit}
-              </p>
-            ) : pricePerUnit != null ? (
-              <p className="text-body font-medium text-success-dark">
-                Price per unit: ${pricePerUnit.toFixed(2)} / {detail.product.pack_unit ?? 'unit'}
-              </p>
-            ) : (
-              <p className="text-caption text-neutral-400">
-                Set package size to see normalized prices
-              </p>
-            )}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" onClick={openSaveConfirm} disabled={!packChanged || savingPack}>
-              {updateMutation.isPending ? 'Saving...' : 'Save package size'}
-            </Button>
-            <Button size="sm" variant="subtle" onClick={openRecomputeConfirm} disabled={savingPack}>
-              {recomputeMutation.isPending ? 'Recomputing...' : 'Recompute price history'}
-            </Button>
-          </div>
+          <ProductInfoRow label="Price basis" hint="How CartLedger compares this product">
+            <div className="space-y-3">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                {comparedPrice ? (
+                  <p className="font-mono text-feature font-semibold text-success-dark">
+                    {comparedPrice}
+                  </p>
+                ) : (
+                  <p className="text-caption text-neutral-400">
+                    Add package contents to compare prices
+                  </p>
+                )}
+                <Button
+                  size="sm"
+                  variant="subtle"
+                  onClick={() => setShowPriceBasis((open) => !open)}
+                >
+                  {showPriceBasis ? 'Hide basis' : 'Why this price?'}
+                </Button>
+                <Button size="sm" variant="subtle" onClick={openRecomputeConfirm} disabled={savingPack}>
+                  {recomputeMutation.isPending ? 'Recomputing...' : 'Recompute price history'}
+                </Button>
+              </div>
+              {showPriceBasis && (
+                <div className="grid gap-2 rounded-xl border border-neutral-200 bg-neutral-50 p-3 text-caption sm:grid-cols-2">
+                  <div>
+                    <span className="block text-small font-medium text-neutral-400">Latest receipt price</span>
+                    <span className="mt-0.5 block font-semibold text-neutral-900">
+                      {latestEntry ? `$${Number(latestEntry.total_price).toFixed(2)}` : '\u2014'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-small font-medium text-neutral-400">Purchased as</span>
+                    <span className="mt-0.5 block font-semibold text-neutral-900">
+                      {latestPurchased ?? '\u2014'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-small font-medium text-neutral-400">Product default contents</span>
+                    <span className="mt-0.5 block font-semibold text-neutral-900">
+                      {productContents ?? 'Not set'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-small font-medium text-neutral-400">Compared price</span>
+                    <span className="mt-0.5 block font-semibold text-neutral-900">
+                      {comparedPrice ?? '\u2014'}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </ProductInfoRow>
         </div>
-      </div>
+      </ProductCard>
 
       <Modal
         open={confirmMode !== null}
@@ -345,7 +609,7 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
             setAffectedCount(null)
           }
         }}
-        title={confirmMode === 'save' ? 'Save Package Size' : 'Recompute Price History'}
+        title={confirmMode === 'save' ? 'Save Package Contents' : 'Recompute Price History'}
         footer={(
           <>
             <Button variant="secondary" size="sm" onClick={() => setConfirmMode(null)} disabled={savingPack}>
@@ -370,7 +634,7 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
           {previewMutation.isPending || affectedCount === null
             ? 'Checking linked purchase history...'
             : confirmMode === 'save'
-              ? `Save this package size and recompute ${affectedCount} linked historical purchases?`
+              ? `Save these package contents and recompute ${affectedCount} linked historical purchases?`
               : `Recompute ${affectedCount} linked historical purchases from their receipt lines?`}
         </p>
       </Modal>
@@ -389,9 +653,9 @@ function PriceTrendSection({ detail }: { detail: ProductDetail }) {
   const range = max - min || 1
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
+    <ProductCard className="p-5">
       <div className="flex items-center justify-between mb-3">
-        <h2 className="font-display text-feature font-semibold text-neutral-900">Price Trend</h2>
+        <ProductCardTitle title="Price Trend" />
         {direction !== 'flat' && (
           <Badge variant={direction === 'up' ? 'error' : 'success'}>
             {direction === 'up' ? '+' : '-'}{pct}% {direction === 'up' ? '\u2191' : '\u2193'}
@@ -429,6 +693,94 @@ function PriceTrendSection({ detail }: { detail: ProductDetail }) {
           Total saved: ${Number(detail.stats.total_saved).toFixed(2)}
         </div>
       )}
+    </ProductCard>
+  )
+}
+
+function isSourceImageSuggestion(suggestion: ProductEnrichmentSuggestion): boolean {
+  return ['image_front_url', 'image_nutrition_url', 'image_ingredients_url', 'image_packaging_url'].includes(suggestion.field)
+}
+
+function sourceImageSuggestionLabel(field: string): string {
+  const labels: Record<string, string> = {
+    image_front_url: 'Front photo',
+    image_nutrition_url: 'Nutrition photo',
+    image_ingredients_url: 'Ingredients photo',
+    image_packaging_url: 'Package photo',
+  }
+  return labels[field] ?? 'Source photo'
+}
+
+function productImageURL(productId: string, image: ProductImage): string {
+  return `${window.location.origin}/api/v1/products/${encodeURIComponent(productId)}/images/${encodeURIComponent(image.id)}/file`
+}
+
+function SourcePhotoSuggestion({ productId, suggestion }: { productId: string; suggestion: ProductEnrichmentSuggestion }) {
+  const queryClient = useQueryClient()
+  const acceptMutation = useMutation({
+    mutationFn: () => acceptProductEnrichmentSuggestion(productId, suggestion.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+  const rejectMutation = useMutation({
+    mutationFn: () => rejectProductEnrichmentSuggestion(productId, suggestion.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+    },
+  })
+  const mutationPending = acceptMutation.isPending || rejectMutation.isPending
+
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-brand/20 bg-brand-subtle/50 p-3 sm:flex-row sm:items-center">
+      <a
+        href={suggestion.value}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="block h-20 w-20 shrink-0 overflow-hidden rounded-lg border border-neutral-200 bg-white"
+        aria-label={`Open ${sourceImageSuggestionLabel(suggestion.field).toLowerCase()}`}
+      >
+        <img
+          src={suggestion.value}
+          alt={sourceImageSuggestionLabel(suggestion.field)}
+          className="h-full w-full object-cover"
+          referrerPolicy="no-referrer"
+          loading="lazy"
+        />
+      </a>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2 text-caption">
+          <span className="inline-flex items-center gap-1 rounded-lg bg-white px-2 py-0.5 text-small font-semibold text-brand">
+            <Zap className="h-3 w-3" aria-hidden="true" />
+            {sourceLabel(suggestion.source)}
+          </span>
+          <span className="font-semibold text-neutral-900">suggests</span>
+          <span className="font-semibold text-neutral-900">{sourceImageSuggestionLabel(suggestion.field)}</span>
+          {suggestion.evidence && <span className="text-neutral-400">{suggestion.evidence}</span>}
+        </div>
+      </div>
+      <div className="flex shrink-0 flex-wrap gap-2">
+        <Button
+          size="sm"
+          className="gap-1.5"
+          onClick={() => acceptMutation.mutate()}
+          disabled={mutationPending}
+        >
+          <Check className="h-3.5 w-3.5" aria-hidden="true" />
+          {acceptMutation.isPending ? 'Saving...' : 'Save photo'}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          className="gap-1.5"
+          onClick={() => rejectMutation.mutate()}
+          disabled={mutationPending}
+        >
+          <X className="h-3.5 w-3.5" aria-hidden="true" />
+          {rejectMutation.isPending ? 'Dismissing...' : 'Dismiss'}
+        </Button>
+      </div>
     </div>
   )
 }
@@ -439,6 +791,7 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
   const [uploading, setUploading] = useState(false)
   const [lightboxImage, setLightboxImage] = useState<ProductImage | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<ProductImage | null>(null)
+  const sourcePhotoSuggestions = detail.enrichment_suggestions.filter(isSourceImageSuggestion)
 
   const uploadMutation = useMutation({
     mutationFn: (file: File) => uploadProductImage(productId, file),
@@ -484,16 +837,18 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
 
   return (
     <>
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="font-display text-feature font-semibold text-neutral-900">Photos</h2>
+      <ProductCard className="p-5">
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <ProductCardTitle title="Photos" meta={detail.images.length === 0 ? 'None Yet' : `${detail.images.length} saved`} />
           <Button
             size="sm"
             variant="subtle"
+            className="gap-1.5"
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading}
           >
-            {uploading ? 'Uploading...' : '+ Add Photo'}
+            <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+            {uploading ? 'Uploading...' : 'Add Photo'}
           </Button>
           <input
             ref={fileInputRef}
@@ -503,8 +858,26 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
             onChange={handleFileSelect}
           />
         </div>
+        {sourcePhotoSuggestions.length > 0 && (
+          <div className="mb-4 space-y-2">
+            {sourcePhotoSuggestions.map((suggestion) => (
+              <SourcePhotoSuggestion key={suggestion.id} productId={productId} suggestion={suggestion} />
+            ))}
+          </div>
+        )}
         {detail.images.length === 0 ? (
-          <p className="text-caption text-neutral-400">No photos yet. Add one to help identify this product.</p>
+          <div className="grid max-w-2xl grid-cols-2 gap-3 sm:grid-cols-4">
+            {['primary', 'add', 'add', 'add'].map((label, index) => (
+              <button
+                key={`${label}-${index}`}
+                type="button"
+                className="aspect-square rounded-xl border border-dashed border-neutral-200 bg-neutral-50 text-small font-semibold text-neutral-400 transition-colors hover:border-brand hover:bg-brand-subtle hover:text-brand"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         ) : (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
             {detail.images.map((img) => (
@@ -515,7 +888,7 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
                   onClick={() => setLightboxImage(img)}
                 >
                   <img
-                    src={`${window.location.origin}/${img.image_path}`}
+                    src={productImageURL(productId, img)}
                     alt={img.caption ?? 'Product photo'}
                     className="w-full h-full object-cover"
                   />
@@ -534,13 +907,13 @@ function PhotosSection({ detail, productId }: { detail: ProductDetail; productId
             ))}
           </div>
         )}
-      </div>
+      </ProductCard>
 
       {/* Lightbox Modal */}
       <Modal open={!!lightboxImage} onClose={() => setLightboxImage(null)}>
         {lightboxImage && (
           <img
-            src={`${window.location.origin}/${lightboxImage.image_path}`}
+            src={productImageURL(productId, lightboxImage)}
             alt={lightboxImage.caption ?? 'Product photo'}
             className="w-full rounded-xl"
           />
@@ -674,11 +1047,21 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
 
   return (
     <>
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="font-display text-feature font-semibold text-neutral-900">Aliases</h2>
-          <Button size="sm" variant="subtle" onClick={() => setShowAdd(!showAdd)}>
-            {showAdd ? 'Cancel' : '+ Add Alias'}
+      <ProductCard className="p-5">
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <ProductCardTitle title="Aliases" meta="Store-Specific Names" />
+          <Button size="sm" variant="subtle" className="gap-1.5" onClick={() => setShowAdd(!showAdd)}>
+            {showAdd ? (
+              <>
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
+                Cancel
+              </>
+            ) : (
+              <>
+                <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                Add Alias
+              </>
+            )}
           </Button>
         </div>
 
@@ -751,7 +1134,7 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
             )}
           </div>
         )}
-      </div>
+      </ProductCard>
 
       {/* Delete Alias Confirmation */}
       <Modal
@@ -785,17 +1168,19 @@ function AliasesSection({ detail, productId, stores }: { detail: ProductDetail; 
 function StoreCodesSection({ detail }: { detail: ProductDetail }) {
   const codes = detail.store_codes ?? []
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Store Codes</h2>
+    <ProductCard className="p-5">
+      <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <ProductCardTitle title="Store SKUs / PLUs" meta={`${codes.length} mapped`} />
+      </div>
       {codes.length === 0 ? (
-        <p className="text-caption text-neutral-400">No store codes yet.</p>
+        <p className="text-caption text-neutral-400">No store SKUs or PLUs mapped yet.</p>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-left">
             <thead>
               <tr className="border-b border-neutral-200">
                 <th className="py-2 text-small font-medium text-neutral-400">Store</th>
-                <th className="py-2 text-small font-medium text-neutral-400">Code</th>
+                <th className="py-2 text-small font-medium text-neutral-400">SKU / PLU</th>
                 <th className="py-2 text-small font-medium text-neutral-400">Source</th>
                 <th className="py-2 text-small font-medium text-neutral-400 text-right">Last Seen</th>
               </tr>
@@ -821,18 +1206,8 @@ function StoreCodesSection({ detail }: { detail: ProductDetail }) {
           </table>
         </div>
       )}
-    </div>
+    </ProductCard>
   )
-}
-
-function formatNormalizedPrice(rawPrice: string | null, rawUnit: string, normalizedPrice: string | null | undefined, normalizedUnit: string | null | undefined): string {
-  const raw = formatPrice(rawPrice, rawUnit)
-  if (!normalizedPrice || !normalizedUnit) return raw
-  // Don't show normalized if it's the same unit
-  if (rawUnit === normalizedUnit) return raw
-  const normNum = parseFloat(normalizedPrice)
-  if (isNaN(normNum)) return raw
-  return `${raw} ($${normNum.toFixed(2)}/${normalizedUnit})`
 }
 
 function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
@@ -859,21 +1234,33 @@ function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
   }
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Price Comparison</h2>
+    <ProductCard className="overflow-hidden">
+      <div className="border-b border-neutral-200 px-5 py-4">
+        <ProductCardTitle
+          title="Price Comparison"
+          meta={`${detail.store_comparison.length} store${detail.store_comparison.length === 1 ? '' : 's'}`}
+        />
+      </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left">
           <thead>
             <tr className="border-b border-neutral-200">
-              <th className="pb-2 text-small font-medium text-neutral-400">Store</th>
-              <th className="pb-2 text-small font-medium text-neutral-400 text-right">Unit Price</th>
-              <th className="pb-2 text-small font-medium text-neutral-400 text-right">Last Purchased</th>
-              <th className="pb-2 text-small font-medium text-neutral-400 text-right"></th>
+              <th className="px-5 py-3 text-small font-semibold uppercase text-neutral-400">Store</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400">Receipt Unit Price</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400">Compared Price</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400">Last Purchased</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400"></th>
             </tr>
           </thead>
           <tbody>
             {detail.store_comparison.map((sp) => {
               const norm = storeNormalized.get(sp.store_id)
+              const normalizedPrice = norm?.normalized_price ? parseFloat(norm.normalized_price) : null
+              const normalizedUnit = norm?.normalized_unit ?? null
+              const normalizedPriceText =
+                normalizedPrice != null && Number.isFinite(normalizedPrice) && normalizedUnit
+                  ? `$${normalizedPrice.toFixed(2)}/${normalizedUnit}`
+                  : '\u2014'
               return (
                 <tr
                   key={sp.store_id}
@@ -881,14 +1268,17 @@ function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
                     sp.is_cheapest ? 'bg-success-subtle/30' : ''
                   }`}
                 >
-                  <td className="py-2.5 text-body-medium text-neutral-900">{sp.store_name}</td>
-                  <td className={`py-2.5 text-right font-medium ${sp.is_cheapest ? 'text-success-dark' : 'text-neutral-600'}`}>
-                    {formatNormalizedPrice(sp.latest_price, unit, norm?.normalized_price, norm?.normalized_unit)}
+                  <td className="px-5 py-3 text-body-medium text-neutral-900">{sp.store_name}</td>
+                  <td className="px-5 py-3 text-right font-medium text-neutral-600">
+                    {formatPrice(sp.latest_price, unit)}
                   </td>
-                  <td className="py-2.5 text-right text-caption text-neutral-400">
+                  <td className={`px-5 py-3 text-right font-mono font-semibold ${sp.is_cheapest ? 'text-success-dark' : 'text-neutral-600'}`}>
+                    {normalizedPriceText}
+                  </td>
+                  <td className="px-5 py-3 text-right text-caption text-neutral-400">
                     {sp.latest_date}
                   </td>
-                  <td className="py-2.5 text-right">
+                  <td className="px-5 py-3 text-right">
                     {sp.is_cheapest && <Badge variant="success">Best</Badge>}
                   </td>
                 </tr>
@@ -897,7 +1287,7 @@ function PriceComparisonSection({ detail }: { detail: ProductDetail }) {
           </tbody>
         </table>
       </div>
-    </div>
+    </ProductCard>
   )
 }
 
@@ -909,34 +1299,39 @@ function TransactionsSection({ detail }: { detail: ProductDetail }) {
   }
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">All Transactions</h2>
+    <ProductCard className="overflow-hidden">
+      <div className="border-b border-neutral-200 px-5 py-4">
+        <ProductCardTitle
+          title="All Transactions"
+          meta={`${detail.price_history.length} record${detail.price_history.length === 1 ? '' : 's'}`}
+        />
+      </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left">
           <thead>
             <tr className="border-b border-neutral-200">
-              <th className="pb-2 text-small font-medium text-neutral-400">Date</th>
-              <th className="pb-2 text-small font-medium text-neutral-400">Store</th>
-              <th className="pb-2 text-small font-medium text-neutral-400 text-right">Qty</th>
-              <th className="pb-2 text-small font-medium text-neutral-400 text-right">Unit Price</th>
-              <th className="pb-2 text-small font-medium text-neutral-400 text-right">Total</th>
+              <th className="px-5 py-3 text-small font-semibold uppercase text-neutral-400">Date</th>
+              <th className="px-5 py-3 text-small font-semibold uppercase text-neutral-400">Store</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400">Purchased</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400">Receipt Unit Price</th>
+              <th className="px-5 py-3 text-right text-small font-semibold uppercase text-neutral-400">Total</th>
             </tr>
           </thead>
           <tbody>
             {detail.price_history.map((entry, i) => (
               <tr key={i} className="border-b border-neutral-200 last:border-0">
-                <td className="py-2.5 text-caption text-neutral-600">{entry.date}</td>
-                <td className="py-2.5 text-caption text-neutral-900">{entry.store_name}</td>
-                <td className="py-2.5 text-right text-caption text-neutral-600">
+                <td className="px-5 py-3 text-caption text-neutral-600">{entry.date}</td>
+                <td className="px-5 py-3 text-caption text-neutral-900">{entry.store_name}</td>
+                <td className="px-5 py-3 text-right text-caption text-neutral-600">
                   {parseFloat(entry.quantity)} {entry.unit || unit}
                 </td>
-                <td className="py-2.5 text-right text-caption font-medium text-neutral-900">
+                <td className="px-5 py-3 text-right text-caption font-medium text-neutral-900">
                   {formatPrice(entry.unit_price, entry.unit || unit)}
                   {entry.is_sale && (
                     <span className="ml-1 text-xs text-green-600 font-medium">Sale</span>
                   )}
                 </td>
-                <td className="py-2.5 text-right text-caption text-neutral-600">
+                <td className="px-5 py-3 text-right text-caption text-neutral-600">
                   {formatPrice(entry.total_price)}
                 </td>
               </tr>
@@ -944,7 +1339,7 @@ function TransactionsSection({ detail }: { detail: ProductDetail }) {
           </tbody>
         </table>
       </div>
-    </div>
+    </ProductCard>
   )
 }
 
@@ -958,11 +1353,15 @@ function sourceLabel(source: string): string {
       return 'Kroger'
     case 'openfoodfacts':
       return 'Open Food Facts'
+    case 'usda_fdc':
+      return 'USDA FoodData Central'
     case 'user_upc':
       return 'UPC'
     case 'receipt_explicit':
       return 'Receipt'
     case 'receipt_llm':
+      return 'Receipt'
+    case 'receipt':
       return 'Receipt'
     default:
       return source
@@ -974,6 +1373,7 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
   const [open, setOpen] = useState(false)
   const [url, setURL] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [deleteConfirm, setDeleteConfirm] = useState<ProductDetail['links'][number] | null>(null)
   const refreshUPC = detail.product.upc?.trim()
   const refreshURL = detail.links[0]?.url?.trim()
   const canRefreshSources = Boolean(refreshUPC || refreshURL)
@@ -988,6 +1388,15 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
     },
     onError: (err: Error) => {
       setError(err.message)
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (linkId: string) => deleteProductLink(productId, linkId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
+      queryClient.invalidateQueries({ queryKey: ['product-enrichment-jobs', productId] })
+      setDeleteConfirm(null)
     },
   })
 
@@ -1011,33 +1420,35 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
 
   return (
     <>
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <h2 className="font-display text-feature font-semibold text-neutral-900">Sources</h2>
+      <ProductCard className="overflow-hidden">
+        <div className="flex flex-col gap-3 border-b border-neutral-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <ProductCardTitle title="Sources" meta={`${detail.links.length} connected`} />
           <div className="flex flex-wrap justify-end gap-2">
             <Button
               size="sm"
               variant="subtle"
+              className="gap-1.5"
               onClick={() => refreshMutation.mutate()}
               disabled={!canRefreshSources || refreshMutation.isPending}
             >
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
               {refreshMutation.isPending ? 'Queueing...' : 'Refresh sources'}
             </Button>
-            <Button size="sm" variant="subtle" onClick={() => setOpen(true)}>
+            <Button size="sm" variant="subtle" className="gap-1.5" onClick={() => setOpen(true)}>
+              <Plus className="h-3.5 w-3.5" aria-hidden="true" />
               Add URL
             </Button>
           </div>
         </div>
-        {detail.links.length === 0 ? (
-          <p className="text-caption text-neutral-400">No source links yet.</p>
-        ) : (
-          <div className="space-y-2">
+        <div className={detail.links.length === 0 ? 'px-5 py-5' : ''}>
+          {detail.links.length === 0 ? (
+            <p className="text-caption text-neutral-400">No source links yet.</p>
+          ) : (
+            <div className="divide-y divide-neutral-200">
             {detail.links.map((link) => (
-              <div key={link.id} className="rounded-xl border border-neutral-200 px-3 py-2">
+              <div key={link.id} className="px-5 py-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <svg className="w-4 h-4 text-brand flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                  </svg>
+                  <ExternalLink className="h-4 w-4 flex-shrink-0 text-brand" aria-hidden="true" />
                   <a
                     href={link.url}
                     target="_blank"
@@ -1050,19 +1461,28 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
                   {link.http_status && (
                     <span className="text-small text-neutral-400">HTTP {link.http_status}</span>
                   )}
+                  <button
+                    type="button"
+                    className="ml-auto inline-flex h-8 w-8 items-center justify-center rounded-lg text-neutral-400 transition-colors hover:bg-expensive-subtle hover:text-expensive focus:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2"
+                    onClick={() => setDeleteConfirm(link)}
+                    aria-label={`Remove ${link.label ?? sourceLabel(link.source)} source`}
+                    title="Remove source"
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </button>
                 </div>
-                {(link.fetched_at || link.last_error || link.source_confidence != null) && (
+                {(link.fetched_at || link.last_error) && (
                   <div className="mt-1 flex flex-wrap gap-3 text-small text-neutral-400">
                     {link.fetched_at && <span>Fetched {new Date(link.fetched_at).toLocaleDateString()}</span>}
-                    {link.source_confidence != null && <span>{Math.round(link.source_confidence * 100)}% confidence</span>}
                     {link.last_error && <span className="text-expensive">{link.last_error}</span>}
                   </div>
                 )}
               </div>
             ))}
-          </div>
-        )}
-      </div>
+            </div>
+          )}
+        </div>
+      </ProductCard>
 
       <Modal
         open={open}
@@ -1096,6 +1516,35 @@ function SourcesSection({ detail, productId }: { detail: ProductDetail; productI
           {error && <p className="text-small text-expensive">{error}</p>}
         </div>
       </Modal>
+
+      <Modal
+        open={!!deleteConfirm}
+        onClose={() => {
+          if (!deleteMutation.isPending) {
+            setDeleteConfirm(null)
+          }
+        }}
+        title="Remove Source"
+        footer={(
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setDeleteConfirm(null)} disabled={deleteMutation.isPending}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="bg-expensive text-white hover:opacity-90"
+              onClick={() => deleteConfirm && deleteMutation.mutate(deleteConfirm.id)}
+              disabled={deleteMutation.isPending}
+            >
+              {deleteMutation.isPending ? 'Removing...' : 'Remove'}
+            </Button>
+          </>
+        )}
+      >
+        <p className="text-body text-neutral-600">
+          Remove {deleteConfirm?.label ?? sourceLabel(deleteConfirm?.source ?? 'source')} and its source suggestions?
+        </p>
+      </Modal>
     </>
   )
 }
@@ -1104,9 +1553,11 @@ function fieldLabel(field: string): string {
   const labels: Record<string, string> = {
     name: 'Name',
     brand: 'Brand',
+    category: 'Category',
+    default_unit: 'Default unit',
     upc: 'UPC',
-    pack_quantity: 'Pack quantity',
-    pack_unit: 'Pack unit',
+    pack_quantity: 'Package contents quantity',
+    pack_unit: 'Package contents unit',
     serving_quantity: 'Serving quantity',
     serving_unit: 'Serving unit',
     serving_label: 'Serving size',
@@ -1124,226 +1575,410 @@ function fieldLabel(field: string): string {
     protein_g: 'Protein',
     ingredients: 'Ingredients',
     allergens: 'Allergens',
+    image_front_url: 'Front photo',
+    image_nutrition_url: 'Nutrition photo',
+    image_ingredients_url: 'Ingredients photo',
+    image_packaging_url: 'Package photo',
   }
   return labels[field] ?? field
 }
 
-function suggestionGroup(field: string): string {
-  if (['name', 'brand', 'upc'].includes(field)) return 'Identity'
-  if (['pack_quantity', 'pack_unit'].includes(field)) return 'Package'
-  if (['ingredients', 'allergens'].includes(field)) return 'Ingredients'
-  return 'Nutrition'
+type NutrientField = keyof ProductMetadataNutrients
+
+const NUTRIENT_FIELDS: Array<{ field: NutrientField; label: string; unit: string }> = [
+  { field: 'calories', label: 'Calories', unit: '' },
+  { field: 'total_fat_g', label: 'Total fat', unit: 'g' },
+  { field: 'saturated_fat_g', label: 'Saturated fat', unit: 'g' },
+  { field: 'trans_fat_g', label: 'Trans fat', unit: 'g' },
+  { field: 'cholesterol_mg', label: 'Cholesterol', unit: 'mg' },
+  { field: 'sodium_mg', label: 'Sodium', unit: 'mg' },
+  { field: 'total_carbohydrate_g', label: 'Carbs', unit: 'g' },
+  { field: 'dietary_fiber_g', label: 'Fiber', unit: 'g' },
+  { field: 'total_sugars_g', label: 'Sugars', unit: 'g' },
+  { field: 'added_sugars_g', label: 'Added sugars', unit: 'g' },
+  { field: 'protein_g', label: 'Protein', unit: 'g' },
+]
+
+const nutritionFieldFromRow = (row: ProductNutrition | null, field: NutrientField): number | null | undefined => {
+  if (!row) return null
+  return row[field]
 }
 
-function SuggestionsSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
-  const queryClient = useQueryClient()
-  const suggestions = detail.enrichment_suggestions ?? []
-  const [selectedIds, setSelectedIds] = useState<string[]>([])
-  const [bulkRecomputePrices, setBulkRecomputePrices] = useState(false)
-  const groupedSuggestions = useMemo(() => {
-    return suggestions.reduce<Record<string, ProductEnrichmentSuggestion[]>>((groups, suggestion) => {
-      const group = suggestionGroup(suggestion.field)
-      groups[group] = [...(groups[group] ?? []), suggestion]
-      return groups
-    }, {})
-  }, [suggestions])
-  const selectedHasPackageSuggestion = suggestions.some((suggestion) =>
-    selectedIds.includes(suggestion.id) && ['pack_quantity', 'pack_unit'].includes(suggestion.field),
-  )
+function numberValue(value: number | string | null | undefined): number | null {
+  if (value == null) return null
+  const parsed = typeof value === 'number' ? value : parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
 
+function compactNumber(value: number): string {
+  const maximumFractionDigits = value > 20 ? 0 : value >= 1 ? 1 : 3
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits }).format(value)
+}
+
+function nutritionAmount(value: number | null | undefined, unit: string): string {
+  if (value == null) return '\u2014'
+  const formatted = compactNumber(value)
+  return unit ? `${formatted}${unit}` : formatted
+}
+
+function firstText(...values: Array<string | null | undefined>): string | null {
+  for (const value of values) {
+    const trimmed = value?.trim()
+    if (trimmed) return trimmed
+  }
+  return null
+}
+
+function metadataHasNutrition(metadata: ProductExternalMetadata): boolean {
+  const payload = metadata.payload
+  const nutrientValues = payload.nutrients ? Object.values(payload.nutrients) : []
+  return Boolean(
+    nutrientValues.some((value) => value != null) ||
+      payload.serving ||
+      payload.ingredients ||
+      (payload.allergens && payload.allergens.length > 0) ||
+      (payload.image_urls && Object.keys(payload.image_urls).length > 0),
+  )
+}
+
+function chooseNutritionMetadata(detail: ProductDetail, row: ProductNutrition | null): ProductExternalMetadata | null {
+  const snapshots = detail.external_metadata ?? []
+  if (row?.product_link_id) {
+    const linked = snapshots.find((metadata) => metadata.product_link_id === row.product_link_id)
+    if (linked) return linked
+  }
+  return snapshots.find(metadataHasNutrition) ?? snapshots[0] ?? null
+}
+
+function sourceSuggestion(detail: ProductDetail, field: string, metadata: ProductExternalMetadata | null): ProductEnrichmentSuggestion | null {
+  const suggestions = detail.enrichment_suggestions ?? []
+  if (metadata) {
+    const linked = suggestions.find((suggestion) =>
+      suggestion.field === field &&
+      (suggestion.external_metadata_id === metadata.id ||
+        suggestion.product_link_id === metadata.product_link_id ||
+        suggestion.source === metadata.source),
+    )
+    if (linked) return linked
+  }
+  return suggestions.find((suggestion) => suggestion.field === field) ?? null
+}
+
+function nutrientValue(detail: ProductDetail, row: ProductNutrition | null, metadata: ProductExternalMetadata | null, field: NutrientField): number | null {
+  return (
+    numberValue(nutritionFieldFromRow(row, field)) ??
+    numberValue(metadata?.payload.nutrients?.[field]) ??
+    numberValue(sourceSuggestion(detail, field, metadata)?.value)
+  )
+}
+
+function suggestionText(detail: ProductDetail, field: string, metadata: ProductExternalMetadata | null): string | null {
+  return firstText(sourceSuggestion(detail, field, metadata)?.value)
+}
+
+function servingText(detail: ProductDetail, row: ProductNutrition | null, metadata: ProductExternalMetadata | null): string | null {
+  const quantity = row?.serving_quantity != null
+    ? nutritionAmount(row.serving_quantity, row.serving_unit ? ` ${row.serving_unit}` : '')
+    : null
+  return firstText(row?.serving_label, quantity, metadata?.payload.serving?.label, suggestionText(detail, 'serving_label', metadata))
+}
+
+function servingsPerContainer(detail: ProductDetail, row: ProductNutrition | null, metadata: ProductExternalMetadata | null): number | null {
+  return (
+    numberValue(row?.servings_per_container) ??
+    numberValue(metadata?.payload.serving?.servings_per_container) ??
+    numberValue(sourceSuggestion(detail, 'servings_per_container', metadata)?.value)
+  )
+}
+
+function packageText(metadata: ProductExternalMetadata | null): string | null {
+  const pkg = metadata?.payload.package
+  if (!pkg) return null
+  return firstText(pkg.label, pkg.quantity != null ? `${compactNumber(pkg.quantity)} ${pkg.unit ?? ''}`.trim() : null)
+}
+
+function allergenList(detail: ProductDetail, row: ProductNutrition | null, metadata: ProductExternalMetadata | null): string[] {
+  if (row?.allergens_json) {
+    try {
+      const parsed = JSON.parse(row.allergens_json)
+      if (Array.isArray(parsed)) {
+        return parsed.map(String).map((item) => item.trim()).filter(Boolean)
+      }
+    } catch {
+      // Fall through to comma parsing for older rows.
+    }
+    const fallback = row.allergens_json.split(/[,;]/).map((item) => item.trim()).filter(Boolean)
+    if (fallback.length > 0) return fallback
+  }
+  if (metadata?.payload.allergens?.length) return metadata.payload.allergens
+  const suggested = suggestionText(detail, 'allergens', metadata)
+  return suggested ? suggested.split(/[,;]/).map((item) => item.trim()).filter(Boolean) : []
+}
+
+function providerLevelBadges(metadata: ProductExternalMetadata | null): string[] {
+  const meta = metadata?.payload.provider_meta ?? {}
+  return Object.entries(meta)
+    .filter(([key, value]) => key.startsWith('nutrient_level_') && value)
+    .map(([key, value]) => {
+      const nutrient = key.replace('nutrient_level_', '').replace(/[-_]/g, ' ')
+      return `${nutrient}: ${value}`
+    })
+}
+
+type NutritionSuggestionGroup = {
+  key: string
+  source: string
+  sourceURL: string
+  suggestions: ProductEnrichmentSuggestion[]
+}
+
+function nutritionSuggestionGroups(suggestions: ProductEnrichmentSuggestion[]): NutritionSuggestionGroup[] {
+  const groups = new Map<string, NutritionSuggestionGroup>()
+  for (const suggestion of suggestions) {
+    const key = suggestion.external_metadata_id ?? suggestion.product_link_id ?? `${suggestion.source}:${suggestion.source_url}`
+    const existing = groups.get(key)
+    if (existing) {
+      existing.suggestions.push(suggestion)
+      continue
+    }
+    groups.set(key, {
+      key,
+      source: suggestion.source,
+      sourceURL: suggestion.source_url,
+      suggestions: [suggestion],
+    })
+  }
+  return Array.from(groups.values())
+}
+
+function NutritionSourceSuggestion({
+  productId,
+  group,
+}: {
+  productId: string
+  group: NutritionSuggestionGroup
+}) {
+  const queryClient = useQueryClient()
+  const suggestionIds = group.suggestions.map((suggestion) => suggestion.id)
+  const fields = group.suggestions.map((suggestion) => fieldLabel(suggestion.field))
+  const fieldSummary = fields.length === 1 ? fields[0] : `${fields.length} fields`
   const acceptMutation = useMutation({
-    mutationFn: (suggestion: ProductEnrichmentSuggestion) =>
-      acceptProductEnrichmentSuggestion(productId, suggestion.id, { fields: [suggestion.field] }),
+    mutationFn: () => bulkAcceptProductEnrichmentSuggestions(productId, { suggestion_ids: suggestionIds }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
       queryClient.invalidateQueries({ queryKey: ['products'] })
     },
   })
   const rejectMutation = useMutation({
-    mutationFn: (suggestion: ProductEnrichmentSuggestion) =>
-      rejectProductEnrichmentSuggestion(productId, suggestion.id),
+    mutationFn: () => bulkRejectProductEnrichmentSuggestions(productId, { suggestion_ids: suggestionIds }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
     },
   })
-  const bulkAcceptMutation = useMutation({
-    mutationFn: () =>
-      bulkAcceptProductEnrichmentSuggestions(productId, {
-        suggestion_ids: selectedIds,
-        recompute_prices: selectedHasPackageSuggestion && bulkRecomputePrices,
-      }),
-    onSuccess: () => {
-      setSelectedIds([])
-      setBulkRecomputePrices(false)
-      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
-      queryClient.invalidateQueries({ queryKey: ['products'] })
-    },
-  })
-  const bulkRejectMutation = useMutation({
-    mutationFn: () =>
-      bulkRejectProductEnrichmentSuggestions(productId, {
-        suggestion_ids: selectedIds,
-      }),
-    onSuccess: () => {
-      setSelectedIds([])
-      setBulkRecomputePrices(false)
-      queryClient.invalidateQueries({ queryKey: ['product-detail', productId] })
-    },
-  })
-
-  if (suggestions.length === 0) {
-    return null
-  }
-
-  const mutationPending =
-    acceptMutation.isPending ||
-    rejectMutation.isPending ||
-    bulkAcceptMutation.isPending ||
-    bulkRejectMutation.isPending
-  const toggleSelected = (id: string) => {
-    setSelectedIds((current) =>
-      current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
-    )
-  }
+  const mutationPending = acceptMutation.isPending || rejectMutation.isPending
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h2 className="font-display text-feature font-semibold text-neutral-900">Suggestions</h2>
-        <div className="flex flex-wrap gap-2">
-          {selectedHasPackageSuggestion && (
-            <label className="flex items-center gap-2 rounded-lg border border-neutral-200 px-2 py-1 text-small text-neutral-600">
-              <input
-                type="checkbox"
-                className="h-4 w-4 rounded border-neutral-300 text-brand focus:ring-brand"
-                checked={bulkRecomputePrices}
-                onChange={(event) => setBulkRecomputePrices(event.target.checked)}
-                disabled={mutationPending}
-              />
-              Recompute prices
-            </label>
-          )}
-          <Button
-            size="sm"
-            variant="subtle"
-            onClick={() => bulkRejectMutation.mutate()}
-            disabled={selectedIds.length === 0 || mutationPending}
-          >
-            Dismiss selected
-          </Button>
-          <Button
-            size="sm"
-            onClick={() => bulkAcceptMutation.mutate()}
-            disabled={selectedIds.length === 0 || mutationPending}
-          >
-            Accept selected
-          </Button>
+    <div className="flex flex-col gap-3 rounded-xl border border-brand/20 bg-brand-subtle/50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2 text-caption">
+          <span className="inline-flex items-center gap-1 rounded-lg bg-white px-2 py-0.5 text-small font-semibold text-brand">
+            <Zap className="h-3 w-3" aria-hidden="true" />
+            {sourceLabel(group.source)}
+          </span>
+          <span className="font-semibold text-neutral-900">suggested nutrition facts</span>
+          <span className="text-neutral-400">{fieldSummary}</span>
         </div>
       </div>
-      <div className="space-y-4">
-        {Object.entries(groupedSuggestions).map(([group, groupSuggestions]) => (
-          <div key={group} className="space-y-2">
-            <h3 className="text-caption font-semibold text-neutral-500">{group}</h3>
-            {groupSuggestions.map((suggestion) => (
-              <div key={suggestion.id} className="rounded-xl border border-neutral-200 px-3 py-2">
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="flex min-w-0 gap-3">
-                    <input
-                      type="checkbox"
-                      className="mt-1 h-4 w-4 rounded border-neutral-300 text-brand focus:ring-brand"
-                      checked={selectedIds.includes(suggestion.id)}
-                      onChange={() => toggleSelected(suggestion.id)}
-                      disabled={mutationPending}
-                      aria-label={`Select ${fieldLabel(suggestion.field)} suggestion`}
-                    />
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-caption font-semibold text-neutral-900">{fieldLabel(suggestion.field)}</span>
-                        <Badge variant="neutral">{sourceLabel(suggestion.source)}</Badge>
-                        {suggestion.confidence != null && (
-                          <span className="text-small text-neutral-400">{Math.round(suggestion.confidence * 100)}%</span>
-                        )}
-                      </div>
-                      <div className="mt-1 grid gap-1 text-caption sm:grid-cols-2">
-                        <span className="min-w-0 text-neutral-400">Current: {suggestion.current_value || '—'}</span>
-                        <span className="min-w-0 text-neutral-900">Suggested: {suggestion.value}</span>
-                      </div>
-                      {suggestion.evidence && (
-                        <p className="mt-1 line-clamp-2 text-small text-neutral-400">{suggestion.evidence}</p>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 gap-2">
-                    <Button
-                      size="sm"
-                      variant="subtle"
-                      onClick={() => rejectMutation.mutate(suggestion)}
-                      disabled={mutationPending}
-                    >
-                      Dismiss
-                    </Button>
-                    <Button
-                      size="sm"
-                      onClick={() => acceptMutation.mutate(suggestion)}
-                      disabled={mutationPending}
-                    >
-                      Accept
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        ))}
+      <div className="flex shrink-0 flex-wrap gap-2">
+        <Button
+          size="sm"
+          className="gap-1.5"
+          onClick={() => acceptMutation.mutate()}
+          disabled={mutationPending}
+        >
+          <Check className="h-3.5 w-3.5" aria-hidden="true" />
+          {acceptMutation.isPending ? 'Accepting...' : 'Accept source'}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          className="gap-1.5"
+          onClick={() => rejectMutation.mutate()}
+          disabled={mutationPending}
+        >
+          <X className="h-3.5 w-3.5" aria-hidden="true" />
+          {rejectMutation.isPending ? 'Dismissing...' : 'Dismiss'}
+        </Button>
       </div>
     </div>
   )
 }
 
-function NutritionSection({ nutrition }: { nutrition: ProductNutrition[] }) {
-  if (!nutrition || nutrition.length === 0) {
+function NutritionSection({ detail, productId }: { detail: ProductDetail; productId: string }) {
+  const row = detail.nutrition?.[0] ?? null
+  const candidateMetadata = chooseNutritionMetadata(detail, row)
+  const nutritionSuggestionFields = [
+    ...NUTRIENT_FIELDS.map((item) => item.field),
+    'serving_quantity',
+    'serving_unit',
+    'serving_label',
+    'servings_per_container',
+    'ingredients',
+    'allergens',
+  ]
+  const nutritionSuggestions = fieldSuggestions(detail, nutritionSuggestionFields)
+  const sourceSuggestionGroups = nutritionSuggestionGroups(nutritionSuggestions)
+  const metadata = row || nutritionSuggestions.length > 0 ? candidateMetadata : null
+  const linkedSource = row?.product_link_id ? detail.links.find((link) => link.id === row.product_link_id) : null
+  const firstNutritionSuggestion = detail.enrichment_suggestions.find((suggestion) =>
+    NUTRIENT_FIELDS.some((field) => field.field === suggestion.field) || ['ingredients', 'allergens', 'serving_label'].includes(suggestion.field),
+  )
+  const sourceName = metadata?.source ?? linkedSource?.source ?? sourceSuggestion(detail, 'calories', metadata)?.source ?? firstNutritionSuggestion?.source
+  const sourceURL = metadata?.source_url ?? metadata?.payload.source_url ?? linkedSource?.url
+  const fetchedAt = metadata?.fetched_at ?? linkedSource?.fetched_at
+  const nutriScore = metadata?.payload.provider_meta?.nutriscore_grade
+  const levels = providerLevelBadges(metadata)
+  const serving = servingText(detail, row, metadata)
+  const servings = servingsPerContainer(detail, row, metadata)
+  const pkg = packageText(metadata)
+  const ingredients = firstText(row?.ingredients, metadata?.payload.ingredients, suggestionText(detail, 'ingredients', metadata))
+  const allergens = allergenList(detail, row, metadata)
+  const nutrients = NUTRIENT_FIELDS.map((item) => ({
+    ...item,
+    value: nutrientValue(detail, row, metadata, item.field),
+  })).filter((item) => item.value != null)
+  const calories = nutrients.find((item) => item.field === 'calories')?.value ?? null
+  const hasData = Boolean(
+    row ||
+      (metadata && metadataHasNutrition(metadata)) ||
+      nutrients.length > 0 ||
+      serving ||
+      ingredients ||
+      allergens.length > 0 ||
+      nutritionSuggestions.length > 0,
+  )
+
+  if (!hasData) {
     return (
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Nutrition</h2>
-        <p className="text-caption text-neutral-400">No nutrition accepted yet.</p>
-      </div>
+      <ProductCard className="p-5">
+        <ProductCardTitle title="Nutrition" />
+        <p className="text-caption text-neutral-400">No nutrition found yet.</p>
+      </ProductCard>
     )
   }
-  const row = nutrition[0]!
-  const nutrients: Array<[string, number | null | undefined, string]> = [
-    ['Calories', row.calories, ''],
-    ['Fat', row.total_fat_g, 'g'],
-    ['Sat fat', row.saturated_fat_g, 'g'],
-    ['Sodium', row.sodium_mg, 'mg'],
-    ['Carbs', row.total_carbohydrate_g, 'g'],
-    ['Fiber', row.dietary_fiber_g, 'g'],
-    ['Sugars', row.total_sugars_g, 'g'],
-    ['Protein', row.protein_g, 'g'],
-  ]
 
   return (
-    <div className="bg-white rounded-2xl shadow-subtle p-5">
-      <h2 className="font-display text-feature font-semibold text-neutral-900 mb-3">Nutrition</h2>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {nutrients.filter(([, value]) => value != null).map(([label, value, unit]) => (
-          <div key={label} className="rounded-xl bg-neutral-50 px-3 py-2">
-            <span className="block text-small text-neutral-400">{label}</span>
-            <span className="text-caption font-semibold text-neutral-900">{value}{unit}</span>
+    <ProductCard className="p-5">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <ProductCardTitle title="Nutrition" />
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {row?.accepted_by_user && <Badge variant="success">Accepted</Badge>}
+            {sourceName && <Badge variant="neutral">{sourceLabel(sourceName)}</Badge>}
+            {fetchedAt && (
+              <span className="text-small text-neutral-400">Fetched {new Date(fetchedAt).toLocaleDateString()}</span>
+            )}
           </div>
-        ))}
+        </div>
+        {sourceURL && (
+          <a
+            href={sourceURL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-neutral-200 text-brand transition-colors hover:bg-brand-subtle focus:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2"
+            aria-label="Open nutrition source"
+            title="Open source"
+          >
+            <ExternalLink className="h-4 w-4" aria-hidden="true" />
+          </a>
+        )}
       </div>
-      {(row.serving_label || row.serving_quantity || row.servings_per_container) && (
-        <p className="mt-3 text-caption text-neutral-500">
-          Serving: {row.serving_label ?? `${row.serving_quantity ?? ''} ${row.serving_unit ?? ''}`.trim()}
-          {row.servings_per_container != null ? `; ${row.servings_per_container} servings/container` : ''}
-        </p>
+
+      {sourceSuggestionGroups.length > 0 && (
+        <div className="mb-4 space-y-2">
+          {sourceSuggestionGroups.map((group) => (
+            <NutritionSourceSuggestion key={group.key} productId={productId} group={group} />
+          ))}
+        </div>
       )}
-      {row.ingredients && (
-        <p className="mt-3 text-small text-neutral-500">
-          <span className="font-medium text-neutral-700">Ingredients:</span> {row.ingredients}
-        </p>
-      )}
-    </div>
+
+      <div className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-3">
+            {calories != null && (
+              <div className="rounded-xl bg-neutral-50 px-3 py-3">
+                <span className="flex items-center gap-1.5 text-small text-neutral-400">
+                  <Flame className="h-3.5 w-3.5" aria-hidden="true" />
+                  Calories
+                </span>
+                <span className="mt-1 block text-feature font-semibold text-neutral-900">{compactNumber(calories)}</span>
+              </div>
+            )}
+            {serving && (
+              <div className="rounded-xl bg-neutral-50 px-3 py-3">
+                <span className="flex items-center gap-1.5 text-small text-neutral-400">
+                  <PackageIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                  Serving
+                </span>
+                <span className="mt-1 block text-caption font-semibold text-neutral-900">{serving}</span>
+                {servings != null && <span className="mt-0.5 block text-small text-neutral-400">{compactNumber(servings)} servings/container</span>}
+              </div>
+            )}
+            {(pkg || nutriScore) && (
+              <div className="rounded-xl bg-neutral-50 px-3 py-3">
+                <span className="block text-small text-neutral-400">{nutriScore ? 'Nutri-Score' : 'Package'}</span>
+                <span className="mt-1 block text-caption font-semibold text-neutral-900">{nutriScore ? nutriScore.toUpperCase() : pkg}</span>
+                {pkg && nutriScore && <span className="mt-0.5 block text-small text-neutral-400">{pkg}</span>}
+              </div>
+            )}
+          </div>
+
+          {nutrients.length > 0 && (
+            <div>
+              <h3 className="mb-2 text-caption font-semibold text-neutral-700">Nutrition facts</h3>
+              <div className="grid gap-x-6 gap-y-0 sm:grid-cols-2">
+                {nutrients.map((item) => (
+                  <div key={item.field} className="flex items-center justify-between border-b border-neutral-200 py-2 text-caption">
+                    <span className="text-neutral-500">{item.label}</span>
+                    <span className="font-semibold text-neutral-900">{nutritionAmount(item.value, item.unit)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {levels.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {levels.map((level) => (
+                <Badge key={level} variant="success">{level}</Badge>
+              ))}
+            </div>
+          )}
+
+          {ingredients && (
+            <div className="space-y-1">
+              <h3 className="flex items-center gap-1.5 text-caption font-semibold text-neutral-700">
+                <Wheat className="h-4 w-4 text-neutral-400" aria-hidden="true" />
+                Ingredients
+              </h3>
+              <p className="text-caption text-neutral-500">{ingredients}</p>
+            </div>
+          )}
+
+          {allergens.length > 0 && (
+            <div className="space-y-2">
+              <h3 className="flex items-center gap-1.5 text-caption font-semibold text-neutral-700">
+                <ShieldAlert className="h-4 w-4 text-neutral-400" aria-hidden="true" />
+                Allergens
+              </h3>
+              <div className="flex flex-wrap gap-2">
+                {allergens.map((allergen) => (
+                  <Badge key={allergen} variant="neutral">{allergen}</Badge>
+                ))}
+              </div>
+            </div>
+          )}
+      </div>
+    </ProductCard>
   )
 }
 
@@ -1406,9 +2041,9 @@ function ProductGroupSection({ detail, productId }: { detail: ProductDetail; pro
   // If product is in a group, show group info
   if (hasGroup) {
     return (
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="font-display text-feature font-semibold text-neutral-900">Product Group</h2>
+      <ProductCard className="p-5">
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <ProductCardTitle title="Product Group" />
           <Button
             size="sm"
             variant="subtle"
@@ -1425,7 +2060,7 @@ function ProductGroupSection({ detail, productId }: { detail: ProductDetail; pro
         >
           View group page
         </Link>
-      </div>
+      </ProductCard>
     )
   }
 
@@ -1435,10 +2070,11 @@ function ProductGroupSection({ detail, productId }: { detail: ProductDetail; pro
 
   return (
     <>
-      <div className="bg-white rounded-2xl shadow-subtle p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="font-display text-feature font-semibold text-neutral-900">Product Group</h2>
-          <Button size="sm" variant="subtle" onClick={() => setShowLinkModal(true)}>
+      <ProductCard className="p-5">
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <ProductCardTitle title="Product Group" />
+          <Button size="sm" variant="subtle" className="gap-1.5" onClick={() => setShowLinkModal(true)}>
+            <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
             Link to Group
           </Button>
         </div>
@@ -1471,7 +2107,7 @@ function ProductGroupSection({ detail, productId }: { detail: ProductDetail; pro
             Not in a group. Link this product to a group to compare prices across brands and stores.
           </p>
         )}
-      </div>
+      </ProductCard>
 
       {/* Link to Group Modal */}
       <Modal open={showLinkModal} onClose={() => setShowLinkModal(false)} title="Link to Product Group">
@@ -1688,9 +2324,10 @@ function ProductDetailPage() {
   }
 
   const { product } = detail
+  const headerSuggestions = fieldSuggestions(detail, ['name', 'category', 'default_unit'])
 
   return (
-    <div className="py-8 max-w-4xl">
+    <div className="mx-auto w-full max-w-6xl py-8">
       {/* Breadcrumb */}
       <div className="mb-4">
         <Link to="/products" className="text-caption text-brand hover:underline">
@@ -1702,11 +2339,11 @@ function ProductDetailPage() {
 
       {/* Header */}
       <div className="mb-6">
-        <div className="flex items-start justify-between">
-          <h1 className="font-display text-subhead font-bold text-neutral-900 tracking-tight">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <h1 className="font-display text-subhead font-bold text-neutral-900">
             {product.name}
           </h1>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2 sm:justify-end">
             <Button size="sm" variant="outlined" onClick={() => setMergeOpen(true)}>
               Merge with Another Product
             </Button>
@@ -1723,7 +2360,7 @@ function ProductDetailPage() {
             </Button>
           </div>
         </div>
-        <div className="flex items-center gap-3 mt-2">
+        <div className="mt-2 flex flex-wrap items-center gap-3">
           {product.brand && <Badge variant="neutral">{product.brand}</Badge>}
           {product.category && <Badge variant="neutral">{product.category}</Badge>}
           {product.default_unit && (
@@ -1732,6 +2369,7 @@ function ProductDetailPage() {
             </span>
           )}
         </div>
+        <InlineSuggestionList productId={productId} suggestions={headerSuggestions} showField className="mt-3" />
       </div>
 
       {/* Content sections */}
@@ -1739,8 +2377,7 @@ function ProductDetailPage() {
         <ProductInfoSection detail={detail} productId={productId} />
         <ProductGroupSection detail={detail} productId={productId} />
         <SourcesSection detail={detail} productId={productId} />
-        <SuggestionsSection detail={detail} productId={productId} />
-        <NutritionSection nutrition={detail.nutrition} />
+        <NutritionSection detail={detail} productId={productId} />
         <PriceTrendSection detail={detail} />
         <PhotosSection detail={detail} productId={productId} />
         <StoreCodesSection detail={detail} />

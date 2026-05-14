@@ -24,7 +24,7 @@ function formatUnit(unit: string): string {
   return unit.replace(/_/g, ' ')
 }
 
-function formatSize(appearance: CompareAppearance): string | null {
+function formatPurchased(appearance: CompareAppearance): string | null {
   if (appearance.quantity && appearance.unit) {
     return `${appearance.quantity} ${formatUnit(appearance.unit)}`
   }
@@ -69,7 +69,7 @@ function ComparisonCell({
     )
   }
 
-  const size = formatSize(appearance)
+  const purchased = formatPurchased(appearance)
   const unitPrice =
     appearance.size_known && appearance.normalized_price && appearance.normalized_unit
       ? `${formatCurrency(appearance.normalized_price)}/${formatUnit(appearance.normalized_unit)}`
@@ -87,9 +87,9 @@ function ComparisonCell({
         <span className="font-medium tabular-nums text-neutral-900">
           {formatCurrency(appearance.total_price)}
         </span>
-        {size && (
+        {purchased && (
           <span className="max-w-full break-words text-small text-neutral-500">
-            ({size})
+            Purchased {purchased}
           </span>
         )}
       </div>
@@ -102,9 +102,9 @@ function ComparisonCell({
           type="button"
           className="mt-2"
           onClick={() => onSetSize(appearance)}
-          aria-label={`Set package size for ${appearance.raw_name}`}
+          aria-label={`Set package contents for ${appearance.raw_name}`}
         >
-          <Badge variant="warning">size unknown</Badge>
+          <Badge variant="warning">contents needed</Badge>
         </button>
       )}
       <div className="mt-1 line-clamp-2 break-words text-small text-neutral-400">
@@ -240,7 +240,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
       >
         <div className="space-y-3">
           {(linePicker?.lines ?? []).map((line) => {
-            const size = line.quantity
+            const purchased = line.quantity
               ? `${line.quantity}${line.unit ? ` ${formatUnit(line.unit)}` : ''}`
               : null
             return (
@@ -256,7 +256,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
               >
                 <span className="block text-body-medium text-neutral-900">{line.raw_name}</span>
                 <span className="mt-1 block text-caption text-neutral-500">
-                  {[size, formatCurrency(line.total_price)].filter(Boolean).join(' · ')}
+                  {[purchased ? `Purchased ${purchased}` : null, formatCurrency(line.total_price)].filter(Boolean).join(' · ')}
                 </span>
               </button>
             )
@@ -267,7 +267,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
       <Modal
         open={editing !== null}
         onClose={() => setEditing(null)}
-        title="Set Package Size"
+        title="Package Contents"
         footer={(
           <>
             <Button variant="secondary" size="sm" onClick={() => setEditing(null)}>
@@ -278,7 +278,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
               onClick={() => saveSizeMutation.mutate()}
               disabled={!packQuantity.trim() || !packUnit.trim() || saveSizeMutation.isPending}
             >
-              {saveSizeMutation.isPending ? 'Saving...' : 'Save for this receipt'}
+              {saveSizeMutation.isPending ? 'Saving...' : 'Save contents'}
             </Button>
           </>
         )}
@@ -290,9 +290,17 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
               {editing ? `${formatCurrency(editing.total_price)} on this receipt` : ''}
             </p>
           </div>
+          {editing && (
+            <div className="rounded-xl bg-neutral-50 px-3 py-2">
+              <span className="block text-small font-medium text-neutral-400">Purchased on receipt</span>
+              <span className="mt-0.5 block text-caption font-semibold text-neutral-900">
+                {formatPurchased(editing) ?? '\u2014'}
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] gap-2">
             <label className="block">
-              <span className="mb-1 block text-small font-medium text-neutral-400">Quantity</span>
+              <span className="mb-1 block text-small font-medium text-neutral-400">Contents Qty</span>
               <input
                 type="number"
                 min="0"
@@ -304,7 +312,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
               />
             </label>
             <label className="block">
-              <span className="mb-1 block text-small font-medium text-neutral-400">Unit</span>
+              <span className="mb-1 block text-small font-medium text-neutral-400">Contents Unit</span>
               <input
                 type="text"
                 value={packUnit}
@@ -315,7 +323,7 @@ export function ComparisonGrid({ receipts, products }: ComparisonGridProps) {
             </label>
           </div>
           <p className="text-caption text-neutral-400">
-            Saves an override for this line item only.
+            Receipt-only override
           </p>
         </div>
       </Modal>

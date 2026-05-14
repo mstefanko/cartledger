@@ -54,7 +54,27 @@ export async function getProductUsage(id: string): Promise<ProductUsage> {
 }
 
 export async function getProductDetail(id: string): Promise<ProductDetail> {
-  return get<ProductDetail>(`/products/${encodeURIComponent(id)}/detail`)
+  const detail = await get<ProductDetail>(`/products/${encodeURIComponent(id)}/detail`)
+  return normalizeProductDetail(detail)
+}
+
+function arrayOrEmpty<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : []
+}
+
+function normalizeProductDetail(detail: ProductDetail): ProductDetail {
+  return {
+    ...detail,
+    aliases: arrayOrEmpty(detail.aliases),
+    store_codes: arrayOrEmpty(detail.store_codes),
+    images: arrayOrEmpty(detail.images),
+    links: arrayOrEmpty(detail.links),
+    nutrition: arrayOrEmpty(detail.nutrition),
+    external_metadata: arrayOrEmpty(detail.external_metadata),
+    enrichment_suggestions: arrayOrEmpty(detail.enrichment_suggestions),
+    price_history: arrayOrEmpty(detail.price_history),
+    store_comparison: arrayOrEmpty(detail.store_comparison),
+  }
 }
 
 export async function previewProductPriceRecompute(id: string): Promise<{ affected_count: number }> {
@@ -89,6 +109,10 @@ export async function addProductLink(
     `/products/${encodeURIComponent(productId)}/links`,
     data,
   )
+}
+
+export async function deleteProductLink(productId: string, linkId: string): Promise<void> {
+  return del<void>(`/products/${encodeURIComponent(productId)}/links/${encodeURIComponent(linkId)}`)
 }
 
 export async function createProductEnrichmentJob(

@@ -22,8 +22,11 @@ import (
 )
 
 const (
+	TriggerReceiptScan   = "receipt_scan"
 	TriggerManualLookup  = "manual_lookup"
 	TriggerManualRefresh = "manual_refresh"
+	TriggerScheduled     = "scheduled_refresh"
+	TriggerBatchBackfill = "batch_backfill"
 
 	StatusQueued    = "queued"
 	StatusRunning   = "running"
@@ -265,6 +268,11 @@ func (s *Service) ProcessJob(ctx context.Context, jobID string) error {
 	}
 	if isManualTrigger(job.Trigger) && !settings.ManualLookupEnabled {
 		msg := "manual enrichment lookup is disabled"
+		s.finishJob(ctx, job, StatusFailed, map[string]string{}, msg, 0)
+		return errors.New(msg)
+	}
+	if job.Trigger == TriggerReceiptScan && !settings.AutoOnScanEnabled {
+		msg := "automatic enrichment lookup on scan is disabled"
 		s.finishJob(ctx, job, StatusFailed, map[string]string{}, msg, 0)
 		return errors.New(msg)
 	}
@@ -564,6 +572,14 @@ func (s *Service) loadSettings(ctx context.Context, householdID string) (setting
 		ProviderKrogerEnabled:        raw.kroger != 0,
 		FirstRunBackfillLimit:        raw.limit,
 	}, nil
+}
+
+func (s *Service) AutoOnScanEnabled(ctx context.Context, householdID string) (bool, error) {
+	settings, err := s.loadSettings(ctx, householdID)
+	if err != nil {
+		return false, err
+	}
+	return s.globalEnabled() && settings.AutoOnScanEnabled, nil
 }
 
 func (s *Service) usdaAPIKey(ctx context.Context, householdID string) (string, string) {

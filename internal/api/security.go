@@ -8,8 +8,10 @@ import (
 //
 // Rationale:
 //   - default-src 'self': deny by default, only same-origin.
-//   - img-src 'self' data: blob:: receipt thumbnails may be loaded from data: URLs
-//     (drag-and-drop previews) or blob: URLs (File API). No remote image hosts are used.
+//   - img-src 'self' https://images.openfoodfacts.org data: blob:: receipt
+//     thumbnails may be loaded from data: URLs (drag-and-drop previews) or blob:
+//     URLs (File API); Open Food Facts source snapshots render their hosted
+//     product, nutrition, and ingredient photos.
 //   - style-src 'self' 'unsafe-inline': Tailwind's generated stylesheet is same-origin,
 //     but React/Vite-built apps still emit a few inline style attributes. 'unsafe-inline'
 //     on styles is a well-known, low-risk compromise.
@@ -19,7 +21,7 @@ import (
 //   - object-src 'none', base-uri 'self', frame-ancestors 'none': standard hardening
 //     (frame-ancestors complements X-Frame-Options: DENY for browsers that honor both).
 const contentSecurityPolicy = "default-src 'self'; " +
-	"img-src 'self' data: blob:; " +
+	"img-src 'self' https://images.openfoodfacts.org data: blob:; " +
 	"style-src 'self' 'unsafe-inline'; " +
 	"script-src 'self'; " +
 	"connect-src 'self' ws: wss:; " +

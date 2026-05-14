@@ -68,7 +68,7 @@ export function ItemPriceDetail({ item }: ItemPriceDetailProps) {
   if (!canCompare) {
     return (
       <div className="py-2 text-xs text-neutral-400">
-        {item.price_basis === 'missing_package' ? 'Add package details for comparable pricing.' : 'Package price only.'}
+        {item.price_basis === 'missing_package' ? 'Add package contents for comparable pricing.' : 'Receipt price only.'}
       </div>
     )
   }

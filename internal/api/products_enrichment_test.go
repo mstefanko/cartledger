@@ -1,12 +1,18 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -168,6 +174,260 @@ func TestAddProductLinkReturnsKrogerSuggestionsAndAcceptsPackOnly(t *testing.T) 
 	}
 	if editSource != "suggestion_accept" {
 		t.Fatalf("edit_source = %q, want suggestion_accept", editSource)
+	}
+}
+
+func TestDeleteProductLinkRemovesSourceArtifacts(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	var linkID string
+	if err := h.DB.QueryRow(
+		`INSERT INTO product_links
+		    (product_id, source, external_id, url, label, fetched_at, http_status)
+		 VALUES (?, 'openfoodfacts', '0001111008404', 'https://world.openfoodfacts.org/product/0001111008404', 'Open Food Facts', CURRENT_TIMESTAMP, 200)
+		 RETURNING id`,
+		productID,
+	).Scan(&linkID); err != nil {
+		t.Fatalf("insert source link: %v", err)
+	}
+	var metadataID string
+	if err := h.DB.QueryRow(
+		`INSERT INTO product_external_metadata
+		    (household_id, product_id, product_link_id, source, source_record_id, source_url, payload_json, fetched_at, http_status)
+		 VALUES (?, ?, ?, 'openfoodfacts', '0001111008404', 'https://world.openfoodfacts.org/product/0001111008404',
+		         '{"version":1,"source":"openfoodfacts","nutrients":{"calories":70}}', CURRENT_TIMESTAMP, 200)
+		 RETURNING id`,
+		householdID, productID, linkID,
+	).Scan(&metadataID); err != nil {
+		t.Fatalf("insert source metadata: %v", err)
+	}
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_enrichment_suggestions
+		    (product_id, product_link_id, external_metadata_id, source, source_url, field, value, status)
+		 VALUES (?, ?, ?, 'openfoodfacts', 'https://world.openfoodfacts.org/product/0001111008404', 'calories', '70', 'pending')`,
+		productID, linkID, metadataID,
+	); err != nil {
+		t.Fatalf("insert source suggestion: %v", err)
+	}
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_nutrition
+		    (product_id, product_link_id, calories, accepted_by_user)
+		 VALUES (?, ?, 70, 1)`,
+		productID, linkID,
+	); err != nil {
+		t.Fatalf("insert accepted source nutrition: %v", err)
+	}
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodDelete, "/products/"+productID+"/links/"+linkID, "", householdID, productID)
+	c.SetParamNames("id", "linkId")
+	c.SetParamValues(productID, linkID)
+	if err := h.DeleteLink(c); err != nil {
+		t.Fatalf("DeleteLink: %v", err)
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+
+	for _, tc := range []struct {
+		table string
+		query string
+		arg   string
+	}{
+		{"product_links", "SELECT COUNT(*) FROM product_links WHERE id = ?", linkID},
+		{"product_external_metadata", "SELECT COUNT(*) FROM product_external_metadata WHERE id = ?", metadataID},
+		{"product_enrichment_suggestions", "SELECT COUNT(*) FROM product_enrichment_suggestions WHERE product_link_id = ?", linkID},
+		{"product_nutrition", "SELECT COUNT(*) FROM product_nutrition WHERE product_link_id = ?", linkID},
+	} {
+		var count int
+		if err := h.DB.QueryRow(tc.query, tc.arg).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", tc.table, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s count = %d, want 0 after source delete", tc.table, count)
+		}
+	}
+}
+
+func TestProductDetailIncludesExternalMetadataSnapshots(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	var linkID string
+	if err := h.DB.QueryRow(
+		`INSERT INTO product_links
+		    (product_id, source, external_id, url, label, fetched_at, http_status)
+		 VALUES (?, 'openfoodfacts', '0001111008404', 'https://world.openfoodfacts.org/product/0001111008404', 'Open Food Facts', CURRENT_TIMESTAMP, 200)
+		 RETURNING id`,
+		productID,
+	).Scan(&linkID); err != nil {
+		t.Fatalf("insert source link: %v", err)
+	}
+	if _, err := h.DB.Exec(
+		`INSERT INTO product_external_metadata
+		    (household_id, product_id, product_link_id, source, source_record_id, source_url, payload_json, fetched_at, http_status, confidence)
+		 VALUES (?, ?, ?, 'openfoodfacts', '0001111008404', 'https://world.openfoodfacts.org/product/0001111008404',
+		         '{"version":1,"source":"openfoodfacts","image_urls":{"front":"https://images.example/front.jpg"},"nutrients":{"calories":70}}',
+		         CURRENT_TIMESTAMP, 200, 0.84)`,
+		householdID, productID, linkID,
+	); err != nil {
+		t.Fatalf("insert source metadata: %v", err)
+	}
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodGet, "/products/"+productID+"/detail", "", householdID, productID)
+	if err := h.Detail(c); err != nil {
+		t.Fatalf("Detail: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var body productDetailResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	if len(body.ExternalMetadata) != 1 {
+		t.Fatalf("external metadata len = %d, want 1", len(body.ExternalMetadata))
+	}
+	got := body.ExternalMetadata[0]
+	if got.ProductLinkID == nil || *got.ProductLinkID != linkID || got.Confidence == nil || *got.Confidence != 0.84 {
+		t.Fatalf("external metadata = %+v", got)
+	}
+	if !strings.Contains(string(got.Payload), `"front":"https://images.example/front.jpg"`) {
+		t.Fatalf("payload = %s, want image URL", string(got.Payload))
+	}
+}
+
+func TestAcceptVirtualSourceImageSuggestionStoresProductImage(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	h.Cfg.AllowPrivateIntegrations = true
+	householdID, _, _, productID := seedTestData(t, h)
+
+	imageBytes := testPNG(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/front.png" {
+			t.Fatalf("unexpected image path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(imageBytes)
+	}))
+	defer server.Close()
+
+	metadataID := insertSourceImageMetadata(t, h, householdID, productID, "front", server.URL+"/front.png")
+	suggestions := h.fetchProductEnrichmentSuggestions(productID, true)
+	var suggestionID string
+	for _, suggestion := range suggestions {
+		if suggestion.Field == "image_front_url" {
+			suggestionID = suggestion.ID
+			break
+		}
+	}
+	if suggestionID == "" || !strings.HasPrefix(suggestionID, virtualSourceImageSuggestionPrefix) {
+		t.Fatalf("virtual image suggestion not found: %+v", suggestions)
+	}
+	encodedSuggestionID := url.PathEscape(suggestionID)
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrichment-suggestions/"+encodedSuggestionID+"/accept", `{}`, householdID, productID)
+	c.SetParamNames("id", "suggestionId")
+	c.SetParamValues(productID, encodedSuggestionID)
+	if err := h.AcceptEnrichmentSuggestion(c); err != nil {
+		t.Fatalf("AcceptEnrichmentSuggestion: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var imageID, imagePath, imageType, caption string
+	var isPrimary bool
+	if err := h.DB.QueryRow(
+		"SELECT id, image_path, type, caption, is_primary FROM product_images WHERE product_id = ?",
+		productID,
+	).Scan(&imageID, &imagePath, &imageType, &caption, &isPrimary); err != nil {
+		t.Fatalf("query product image: %v", err)
+	}
+	if imageType != "packaging" || caption != "Open Food Facts front photo" || !isPrimary {
+		t.Fatalf("image row path=%q type=%q caption=%q primary=%t", imagePath, imageType, caption, isPrimary)
+	}
+	if _, err := os.Stat(filepath.Join(h.Cfg.DataDir, imagePath)); err != nil {
+		t.Fatalf("saved image file: %v", err)
+	}
+
+	c, rec = makeContext(e, http.MethodGet, "/products/"+productID+"/images/"+imageID+"/file", "", householdID, productID)
+	c.SetParamNames("id", "imageId")
+	c.SetParamValues(productID, imageID)
+	if err := h.ServeProductImage(c); err != nil {
+		t.Fatalf("ServeProductImage: %v", err)
+	}
+	if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+		t.Fatalf("serve image status=%d body_len=%d", rec.Code, rec.Body.Len())
+	}
+	if contentType := rec.Header().Get(echo.HeaderContentType); !strings.HasPrefix(contentType, "image/png") {
+		t.Fatalf("content-type = %q, want image/png", contentType)
+	}
+
+	var status string
+	if err := h.DB.QueryRow(
+		`SELECT status FROM product_enrichment_suggestions
+		  WHERE product_id = ? AND external_metadata_id = ? AND field = 'image_front_url'`,
+		productID, metadataID,
+	).Scan(&status); err != nil {
+		t.Fatalf("query image suggestion: %v", err)
+	}
+	if status != "accepted" {
+		t.Fatalf("suggestion status = %q, want accepted", status)
+	}
+}
+
+func TestRejectVirtualSourceImageSuggestionPersistsDismissal(t *testing.T) {
+	h, _, cleanup := newTestHandler(t)
+	defer cleanup()
+	householdID, _, _, productID := seedTestData(t, h)
+
+	metadataID := insertSourceImageMetadata(t, h, householdID, productID, "nutrition", "https://images.example/nutrition.jpg")
+	suggestions := h.fetchProductEnrichmentSuggestions(productID, true)
+	var suggestionID string
+	for _, suggestion := range suggestions {
+		if suggestion.Field == "image_nutrition_url" {
+			suggestionID = suggestion.ID
+			break
+		}
+	}
+	if suggestionID == "" {
+		t.Fatalf("virtual nutrition image suggestion not found: %+v", suggestions)
+	}
+	encodedSuggestionID := url.PathEscape(suggestionID)
+
+	e := echo.New()
+	c, rec := makeContext(e, http.MethodPost, "/products/"+productID+"/enrichment-suggestions/"+encodedSuggestionID+"/reject", "", householdID, productID)
+	c.SetParamNames("id", "suggestionId")
+	c.SetParamValues(productID, encodedSuggestionID)
+	if err := h.RejectEnrichmentSuggestion(c); err != nil {
+		t.Fatalf("RejectEnrichmentSuggestion: %v", err)
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var status string
+	if err := h.DB.QueryRow(
+		`SELECT status FROM product_enrichment_suggestions
+		  WHERE product_id = ? AND external_metadata_id = ? AND field = 'image_nutrition_url'`,
+		productID, metadataID,
+	).Scan(&status); err != nil {
+		t.Fatalf("query image suggestion: %v", err)
+	}
+	if status != "rejected" {
+		t.Fatalf("suggestion status = %q, want rejected", status)
+	}
+	for _, suggestion := range h.fetchProductEnrichmentSuggestions(productID, true) {
+		if suggestion.Field == "image_nutrition_url" {
+			t.Fatalf("dismissed source image returned as pending: %+v", suggestion)
+		}
 	}
 }
 
@@ -535,6 +795,45 @@ func TestEnrichByUPCRespectsGlobalDisable(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+func insertSourceImageMetadata(t *testing.T, h *ProductHandler, householdID, productID, key, imageURL string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]interface{}{
+		"version": 1,
+		"source":  "openfoodfacts",
+		"image_urls": map[string]string{
+			key: imageURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var metadataID string
+	if err := h.DB.QueryRow(
+		`INSERT INTO product_external_metadata
+		    (household_id, product_id, source, source_record_id, source_url, payload_json, fetched_at, http_status)
+		 VALUES (?, ?, 'openfoodfacts', ?, 'https://world.openfoodfacts.org/product/0001111008404', ?, CURRENT_TIMESTAMP, 200)
+		 RETURNING id`,
+		householdID, productID, "source-image-"+key, string(payload),
+	).Scan(&metadataID); err != nil {
+		t.Fatalf("insert source metadata: %v", err)
+	}
+	return metadataID
+}
+
+func testPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	img.Set(1, 0, color.RGBA{G: 255, A: 255})
+	img.Set(0, 1, color.RGBA{B: 255, A: 255})
+	img.Set(1, 1, color.RGBA{R: 255, G: 255, A: 255})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
 }
 
 type sqlNullFloat struct {

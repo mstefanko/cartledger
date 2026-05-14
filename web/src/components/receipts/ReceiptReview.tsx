@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useEffect, type FormEvent } from 'react
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
-import { Check, Circle, CircleAlert, FileCode2, Loader2, Wrench } from 'lucide-react'
+import { Check, ChevronDown, Circle, CircleAlert, ExternalLink, FileCode2, Loader2, Search, Wrench } from 'lucide-react'
 import { EditableTable, type AutocompleteOption } from '@/components/ui/EditableTable'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
@@ -16,7 +16,7 @@ import {
 } from '@/components/receipts/ManualLineItemGrid'
 // CreateRuleModal replaced by inline batch rule modal
 import { getReceipt, updateLineItem, createLineItem, createLineItems, repairReceiptPreview, applyRepairPreview, acceptSuggestions, confirmReceipt, type CreateLineItemRequest, type ManualLineItemInput, type ReceiptDetail, type RepairPreviewResponse } from '@/api/receipts'
-import { addProductLink, listProducts } from '@/api/products'
+import { listProducts, updateProduct } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { AcceptSuggestionsResponse, LineItem, Product } from '@/types'
 
@@ -102,8 +102,8 @@ const emptyNewRow: CreateLineItemRequest = {
 
 type UnitCategory = 'weight' | 'volume' | 'count' | 'unknown' | 'blank'
 
-type PackageSizeStatus =
-  | { kind: 'label'; label: string }
+type PackageContentsStatus =
+  | { kind: 'label'; label: string; source: 'receipt' | 'product' }
   | { kind: 'set' }
   | { kind: 'ambiguous' }
   | { kind: 'none' }
@@ -192,18 +192,63 @@ function productPackLabel(item: LineItem): string | null {
   return `${formatProductPackQuantity(item.product_pack_quantity)} ${item.product_pack_unit}`
 }
 
+function hasProductPackageContents(item: LineItem): boolean {
+  return item.product_pack_quantity != null && Boolean(item.product_pack_unit?.trim())
+}
+
 function materiallyDifferentReceiptDescription(item: LineItem): string | null {
   const description = item.receipt_description?.trim()
   if (!description) return null
   const raw = item.raw_name.trim()
   const normalizedDescription = description.toLowerCase().replace(/\s+/g, ' ')
   const normalizedRaw = raw.toLowerCase().replace(/\s+/g, ' ')
-  return normalizedDescription !== normalizedRaw ? description : null
+  if (normalizedDescription === normalizedRaw || normalizedRaw.includes(normalizedDescription)) {
+    return null
+  }
+  return description
 }
 
-function packageSizeStatus(item: LineItem): PackageSizeStatus {
+function purchasedLabel(item: Pick<LineItem, 'quantity' | 'unit'>): string {
+  return `${item.quantity}${item.unit ? ` ${item.unit}` : ''}`.trim()
+}
+
+function suggestedProductName(item: LineItem): string | null {
+  if (item.matched !== 'unmatched' || !item.suggestion_type) return null
+  if (item.suggestion_type === 'new_product') return item.suggested_name
+  return item.suggested_product_name
+}
+
+function suggestionTone(item: LineItem): { label: string; className: string } | null {
+  if (item.suggestion_type === 'new_product') {
+    return {
+      label: 'Suggested new',
+      className: 'border-blue-200 bg-blue-50 text-blue-700',
+    }
+  }
+  if (item.suggestion_type === 'cross_store_match') {
+    return {
+      label: 'Cross-store suggestion',
+      className: 'border-purple-200 bg-purple-50 text-purple-700',
+    }
+  }
+  if (item.suggestion_type === 'existing_match') {
+    return {
+      label: 'Suggested match',
+      className: 'border-amber-200 bg-amber-50 text-amber-700',
+    }
+  }
+  return null
+}
+
+function matchMethodLabel(matched: LineItem['matched']): string | null {
+  if (matched === 'code') return 'code match'
+  if (matched === 'identifier') return 'ID match'
+  return null
+}
+
+function packageContentsStatus(item: LineItem): PackageContentsStatus {
   if (item.pack_quantity_override && item.pack_unit_override) {
-    return { kind: 'label', label: `${item.pack_quantity_override} ${item.pack_unit_override}` }
+    return { kind: 'label', label: `${item.pack_quantity_override} ${item.pack_unit_override}`, source: 'receipt' }
   }
 
   const packLabel = productPackLabel(item)
@@ -219,11 +264,11 @@ function packageSizeStatus(item: LineItem): PackageSizeStatus {
     }
   }
 
-  if (lineCategory === 'weight' || lineCategory === 'volume') {
-    return { kind: 'label', label: `${item.quantity} ${item.unit}` }
-  }
   if (packLabel) {
-    return { kind: 'label', label: packLabel }
+    return { kind: 'label', label: packLabel, source: 'product' }
+  }
+  if (lineCategory === 'weight' || lineCategory === 'volume') {
+    return { kind: 'none' }
   }
   if (item.product_id) {
     return { kind: 'set' }
@@ -288,6 +333,81 @@ function EmptyReceiptManualEntry({
   )
 }
 
+function ReceiptEvidenceLine({ item }: { item: LineItemRow }) {
+  const cleanedDescription = materiallyDifferentReceiptDescription(item)
+
+  return (
+    <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-small text-neutral-500">
+      <span className="block min-w-0 max-w-full truncate font-mono text-neutral-500">
+        {item.raw_name}
+      </span>
+      {item.store_item_code && (
+        <span className="rounded-md bg-brand-subtle px-1.5 py-0.5 font-mono font-medium text-brand">
+          SKU/PLU {item.store_item_code}
+        </span>
+      )}
+      {item.upc && (
+        <span className="rounded-md bg-neutral-50 px-1.5 py-0.5 font-mono font-medium text-neutral-600">
+          UPC {item.upc}
+        </span>
+      )}
+      {cleanedDescription && (
+        <>
+          <span className="text-neutral-300" aria-hidden="true">·</span>
+          <span className="min-w-0 truncate text-neutral-400">
+            {cleanedDescription}
+          </span>
+        </>
+      )}
+    </div>
+  )
+}
+
+function ProductMatchDisplay({ item }: { item: LineItemRow }) {
+  const methodLabel = matchMethodLabel(item.matched)
+  const suggestedName = suggestedProductName(item)
+  const suggestion = suggestionTone(item)
+
+  return (
+    <div className="min-w-0 py-1">
+      {item.product_id ? (
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="block min-w-0 truncate text-body-medium font-semibold text-neutral-900">
+            {item.product_name || 'Matched product'}
+          </span>
+          <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-neutral-400" aria-hidden="true" />
+          <Link
+            to={`/products/${item.product_id}`}
+            className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md text-neutral-400 transition-colors hover:bg-neutral-50 hover:text-brand"
+            title="Open product"
+            aria-label={`Open ${item.product_name || 'product'} page`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+          </Link>
+          {methodLabel && <Badge variant="neutral">{methodLabel}</Badge>}
+        </div>
+      ) : suggestedName && suggestion ? (
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className={['inline-flex items-center rounded-md border px-1.5 py-0.5 text-small font-semibold', suggestion.className].join(' ')}>
+            {suggestion.label}
+          </span>
+          <span className="block min-w-0 truncate text-body-medium font-semibold text-neutral-900">
+            {suggestedName}
+          </span>
+          <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-neutral-400" aria-hidden="true" />
+        </div>
+      ) : (
+        <span className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-caption font-semibold text-amber-700">
+          <Search className="h-3.5 w-3.5" aria-hidden="true" />
+          Match product
+        </span>
+      )}
+      <ReceiptEvidenceLine item={item} />
+    </div>
+  )
+}
+
 function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   const queryClient = useQueryClient()
 
@@ -320,9 +440,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   const [sizeEditItem, setSizeEditItem] = useState<LineItemRow | null>(null)
   const [sizeQuantity, setSizeQuantity] = useState('')
   const [sizeUnit, setSizeUnit] = useState('')
-  const [productUrlItem, setProductUrlItem] = useState<LineItemRow | null>(null)
-  const [productUrl, setProductUrl] = useState('')
-  const [productUrlError, setProductUrlError] = useState<string | null>(null)
+  const [savePackageDefault, setSavePackageDefault] = useState(false)
   const [identifierWarnings, setIdentifierWarnings] = useState<IdentifierWarning[]>([])
 
   useEffect(() => {
@@ -367,41 +485,37 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
     },
   })
 
+  const closePackageContentsEditor = useCallback(() => {
+    setSizeEditItem(null)
+    setSizeQuantity('')
+    setSizeUnit('')
+    setSavePackageDefault(false)
+  }, [])
+
   const sizeMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!sizeEditItem) throw new Error('missing line item')
-      return updateLineItem(receiptId, sizeEditItem.id, {
-        pack_quantity_override: sizeQuantity.trim(),
-        pack_unit_override: sizeUnit.trim(),
+      const trimmedQuantity = sizeQuantity.trim()
+      const trimmedUnit = sizeUnit.trim()
+      const lineItem = await updateLineItem(receiptId, sizeEditItem.id, {
+        pack_quantity_override: trimmedQuantity,
+        pack_unit_override: trimmedUnit,
         pack_override_source: 'user',
       })
+      if (savePackageDefault && sizeEditItem.product_id) {
+        await updateProduct(sizeEditItem.product_id, {
+          pack_quantity: Number(trimmedQuantity),
+          pack_unit: trimmedUnit,
+        })
+      }
+      return lineItem
     },
     onSuccess: () => {
-      setSizeEditItem(null)
-      setSizeQuantity('')
-      setSizeUnit('')
+      closePackageContentsEditor()
       queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
       queryClient.invalidateQueries({ queryKey: ['receipts', 'compare'] })
-      queryClient.invalidateQueries({ queryKey: ['product-detail'] })
-    },
-  })
-
-  const productUrlMutation = useMutation({
-    mutationFn: () => {
-      if (!productUrlItem?.product_id) throw new Error('missing product')
-      return addProductLink(productUrlItem.product_id, { url: productUrl.trim() })
-    },
-    onSuccess: () => {
-      setProductUrlItem(null)
-      setProductUrl('')
-      setProductUrlError(null)
       queryClient.invalidateQueries({ queryKey: ['products'] })
-      if (productUrlItem?.product_id) {
-        queryClient.invalidateQueries({ queryKey: ['product-detail', productUrlItem.product_id] })
-      }
-    },
-    onError: (err: Error) => {
-      setProductUrlError(err.message)
+      queryClient.invalidateQueries({ queryKey: ['product-detail'] })
     },
   })
 
@@ -745,72 +859,16 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         },
       },
       {
-        accessorKey: 'raw_name',
-        header: 'Receipt Text',
-        size: 200,
-        cell: ({ row }) => {
-          const item = row.original
-          const cleanedDescription = materiallyDifferentReceiptDescription(item)
-          return (
-            <div className="min-w-0">
-              <span className="block truncate">{item.raw_name}</span>
-              {(item.store_item_code || cleanedDescription) && (
-                <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                  {item.store_item_code && (
-                    <span className="rounded-md bg-neutral-50 px-1.5 py-0.5 text-small text-neutral-500">
-                      Store code {item.store_item_code}
-                    </span>
-                  )}
-                  {cleanedDescription && (
-                    <span className="text-small text-neutral-400">
-                      {cleanedDescription}
-                    </span>
-                  )}
-                </div>
-              )}
-              {item.product_id && item.product_name && (
-                <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
-                  <Link
-                    to={`/products/${item.product_id}`}
-                    className="text-xs text-brand hover:underline"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {item.product_name}
-                  </Link>
-                  {item.matched === 'code' && (
-                    <Badge variant="neutral">code match</Badge>
-                  )}
-                  {item.matched === 'identifier' && (
-                    <Badge variant="success">ID match</Badge>
-                  )}
-                  <button
-                    type="button"
-                    className="text-xs text-neutral-400 hover:text-brand"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      setProductUrlItem(item)
-                      setProductUrl('')
-                      setProductUrlError(null)
-                    }}
-                  >
-                    Add URL
-                  </button>
-                </div>
-              )}
-            </div>
-          )
-        },
-      },
-      {
         accessorKey: 'product_id',
         header: 'Product',
-        size: 220,
+        size: 420,
         meta: {
           editable: true,
           cellType: 'autocomplete' as const,
           autocompleteOptions,
           onAutocompleteSearch: setProductSearch,
           onAutocompleteCreate: handleAutocompleteCreate,
+          displayRenderer: ({ row }) => <ProductMatchDisplay item={row.original} />,
           getDisplayValue: (value: unknown) => {
             const id = value as string | null
             if (!id) return ''
@@ -825,8 +883,8 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       },
       {
         accessorKey: 'quantity',
-        header: 'Qty',
-        size: 70,
+        header: 'Purchased Qty',
+        size: 95,
         meta: {
           editable: true,
           cellType: 'number' as const,
@@ -834,22 +892,29 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       },
       {
         accessorKey: 'unit',
-        header: 'Unit',
-        size: 80,
+        header: 'Purchased Unit',
+        size: 110,
         meta: {
           editable: true,
           cellType: 'text' as const,
         },
       },
       {
-        id: 'package_size',
-        header: 'Size',
-        size: 100,
+        id: 'package_contents',
+        header: 'Package Contents',
+        size: 145,
         cell: ({ row }) => {
           const item = row.original
-          const status = packageSizeStatus(item)
+          const status = packageContentsStatus(item)
           if (status.kind === 'label') {
-            return <span className="text-caption text-neutral-500">{status.label}</span>
+            return (
+              <div className="min-w-0">
+                <span className="block text-caption text-neutral-600">{status.label}</span>
+                <span className="block text-small text-neutral-400">
+                  {status.source === 'receipt' ? 'receipt override' : 'product default'}
+                </span>
+              </div>
+            )
           }
           if (status.kind === 'none') {
             return <span className="text-caption text-neutral-300">—</span>
@@ -863,10 +928,11 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                 setSizeEditItem(item)
                 setSizeQuantity(item.pack_quantity_override ?? (item.product_pack_quantity != null ? formatProductPackQuantity(item.product_pack_quantity) : ''))
                 setSizeUnit(item.pack_unit_override ?? item.product_pack_unit ?? '')
+                setSavePackageDefault(Boolean(item.product_id) && !hasProductPackageContents(item))
               }}
             >
               <Badge variant={status.kind === 'ambiguous' ? 'warning' : 'neutral'}>
-                {status.kind === 'ambiguous' ? 'Ambiguous' : 'Set size'}
+                {status.kind === 'ambiguous' ? 'Check contents' : 'Set contents'}
               </Badge>
             </button>
           )
@@ -1122,7 +1188,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
           data={rows}
           onCellUpdate={handleCellUpdate}
           getRowClassName={getRowClassName}
-          virtualizeRows={rows.length > 50}
+          virtualizeRows={false}
           enableSorting={false}
         />
       )}
@@ -1167,7 +1233,8 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               disabled={
                 createLineItemMutation.isPending ||
                 newRow.raw_name.trim() === '' ||
-                newRow.total_price.trim() === ''
+                newRow.total_price.trim() === '' ||
+                ((newRow.pack_quantity_override?.trim() ?? '') === '' ? (newRow.pack_unit_override?.trim() ?? '') !== '' : (newRow.pack_unit_override?.trim() ?? '') === '')
               }
             >
               {createLineItemMutation.isPending ? 'Adding...' : 'Add Row'}
@@ -1186,7 +1253,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             />
           </label>
           <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
-            Qty
+            Purchased Qty
             <input
               value={newRow.quantity ?? ''}
               onChange={(e) => updateNewRow('quantity', e.target.value)}
@@ -1194,10 +1261,26 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
             />
           </label>
           <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
-            Unit
+            Purchased Unit
             <input
               value={newRow.unit ?? ''}
               onChange={(e) => updateNewRow('unit', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Contents Qty
+            <input
+              value={newRow.pack_quantity_override ?? ''}
+              onChange={(e) => updateNewRow('pack_quantity_override', e.target.value)}
+              className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            Contents Unit
+            <input
+              value={newRow.pack_unit_override ?? ''}
+              onChange={(e) => updateNewRow('pack_unit_override', e.target.value)}
               className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
             />
           </label>
@@ -1308,7 +1391,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                   <tr>
                     <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Line</th>
                     <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Item</th>
-                    <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Qty</th>
+                    <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Purchased</th>
                     <th className="px-2 py-1 text-left text-caption font-semibold text-neutral-600">Price</th>
                   </tr>
                 </thead>
@@ -1317,7 +1400,9 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
                     <tr key={`${item.line_number}-${item.raw_name}-${index}`} className="border-t border-neutral-200">
                       <td className="px-2 py-1 text-caption text-neutral-600">{item.line_number}</td>
                       <td className="px-2 py-1 text-caption text-neutral-900 truncate">{item.raw_name}</td>
-                      <td className="px-2 py-1 text-caption text-neutral-600">{item.quantity}</td>
+                      <td className="px-2 py-1 text-caption text-neutral-600">
+                        {[item.quantity, item.unit].filter(Boolean).join(' ')}
+                      </td>
                       <td className="px-2 py-1 text-caption tabular-nums text-neutral-900">
                         ${Number(item.total_price).toFixed(2)}
                       </td>
@@ -1332,11 +1417,11 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
 
       <Modal
         open={sizeEditItem !== null}
-        onClose={() => setSizeEditItem(null)}
-        title="Set Package Size"
+        onClose={closePackageContentsEditor}
+        title="Package Contents"
         footer={
           <>
-            <Button variant="secondary" size="sm" onClick={() => setSizeEditItem(null)}>
+            <Button variant="secondary" size="sm" onClick={closePackageContentsEditor}>
               Cancel
             </Button>
             <Button
@@ -1344,7 +1429,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               onClick={() => sizeMutation.mutate()}
               disabled={!sizeQuantity.trim() || !sizeUnit.trim() || sizeMutation.isPending}
             >
-              {sizeMutation.isPending ? 'Saving...' : 'Save for this receipt'}
+              {sizeMutation.isPending ? 'Saving...' : 'Save contents'}
             </Button>
           </>
         }
@@ -1356,9 +1441,17 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               <p className="text-caption text-neutral-400">{sizeEditItem.product_name}</p>
             )}
           </div>
+          {sizeEditItem && (
+            <div className="rounded-xl bg-neutral-50 px-3 py-2">
+              <span className="block text-small font-medium text-neutral-400">Purchased on receipt</span>
+              <span className="mt-0.5 block text-caption font-semibold text-neutral-900">
+                {purchasedLabel(sizeEditItem)}
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] gap-2">
             <label className="block">
-              <span className="mb-1 block text-small font-medium text-neutral-400">Quantity</span>
+              <span className="mb-1 block text-small font-medium text-neutral-400">Contents Qty</span>
               <input
                 type="number"
                 min="0"
@@ -1370,7 +1463,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               />
             </label>
             <label className="block">
-              <span className="mb-1 block text-small font-medium text-neutral-400">Unit</span>
+              <span className="mb-1 block text-small font-medium text-neutral-400">Contents Unit</span>
               <input
                 type="text"
                 value={sizeUnit}
@@ -1380,61 +1473,23 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               />
             </label>
           </div>
-          <p className="text-caption text-neutral-400">
-            Optional cleanup for this receipt line only.
-          </p>
-        </div>
-      </Modal>
-
-      <Modal
-        open={productUrlItem !== null}
-        onClose={() => {
-          if (!productUrlMutation.isPending) {
-            setProductUrlItem(null)
-            setProductUrl('')
-            setProductUrlError(null)
-          }
-        }}
-        title="Add Product URL"
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setProductUrlItem(null)}
-              disabled={productUrlMutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => {
-                setProductUrlError(null)
-                productUrlMutation.mutate()
-              }}
-              disabled={!productUrl.trim() || productUrlMutation.isPending}
-            >
-              {productUrlMutation.isPending ? 'Fetching...' : 'Add URL'}
-            </Button>
-          </>
-        }
-      >
-        <div className="space-y-3">
-          <div>
-            <p className="text-body-medium text-neutral-900">{productUrlItem?.product_name}</p>
-            <p className="text-caption text-neutral-400">{productUrlItem?.raw_name}</p>
-          </div>
-          <input
-            type="url"
-            value={productUrl}
-            onChange={(e) => setProductUrl(e.target.value)}
-            placeholder="https://www.kroger.com/p/..."
-            className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-body focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
-            autoFocus
-          />
-          {productUrlError && (
-            <p className="text-small text-expensive">{productUrlError}</p>
-          )}
+          <label className="flex items-start gap-2 rounded-xl border border-neutral-200 px-3 py-2 text-caption text-neutral-600">
+            <input
+              type="checkbox"
+              className="mt-1 h-4 w-4 rounded border-neutral-300 text-brand focus:ring-brand"
+              checked={savePackageDefault}
+              disabled={!sizeEditItem?.product_id}
+              onChange={(e) => setSavePackageDefault(e.target.checked)}
+            />
+            <span>
+              <span className="block font-medium text-neutral-900">Use for future purchases of this product</span>
+              <span className="block text-small text-neutral-400">
+                {sizeEditItem && hasProductPackageContents(sizeEditItem)
+                  ? 'Updates the existing product default'
+                  : 'Product has no default contents yet'}
+              </span>
+            </span>
+          </label>
         </div>
       </Modal>
 

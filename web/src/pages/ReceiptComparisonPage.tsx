@@ -234,7 +234,7 @@ function ReceiptComparisonPage() {
                 onClick={() => setViewMode('normalized')}
               >
                 <Table2 className="h-4 w-4" />
-                Normalized
+                Comparison
               </button>
               <button
                 type="button"
@@ -275,10 +275,10 @@ function ReceiptComparisonPage() {
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="neutral">{compare.products.length} overlapping products</Badge>
             {compare.missing_unit_count > 0 && (
-              <Badge variant="warning">{compare.missing_unit_count} size unknown</Badge>
+              <Badge variant="warning">{compare.missing_unit_count} contents needed</Badge>
             )}
             {compare.products.length > 0 && !hasComparableRows && (
-              <Badge variant="warning">no comparable unit prices</Badge>
+              <Badge variant="warning">no compared prices</Badge>
             )}
           </div>
 

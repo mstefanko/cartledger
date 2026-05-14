@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,13 +19,16 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/mstefanko/cartledger/internal/auth"
+	"github.com/mstefanko/cartledger/internal/config"
 	"github.com/mstefanko/cartledger/internal/enrichment"
 	"github.com/mstefanko/cartledger/internal/enrichment/adapters"
 	"github.com/mstefanko/cartledger/internal/enrichment/runner"
 	estore "github.com/mstefanko/cartledger/internal/enrichment/store"
 	"github.com/mstefanko/cartledger/internal/httpsafe"
 	"github.com/mstefanko/cartledger/internal/identifiers"
+	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/matcher"
+	"github.com/mstefanko/cartledger/internal/storage"
 	"github.com/mstefanko/cartledger/internal/upc"
 )
 
@@ -279,6 +283,59 @@ func (h *ProductHandler) AddLink(c echo.Context) error {
 	return c.JSON(http.StatusOK, addProductLinkResponse{Link: link, Suggestions: stored})
 }
 
+// DeleteLink removes a source link and the source-bound enrichment artifacts
+// derived from it. Accepted source-specific nutrition is removed too so a bad
+// barcode lookup does not leave orphaned facts behind.
+func (h *ProductHandler) DeleteLink(c echo.Context) error {
+	ctx := c.Request().Context()
+	householdID := auth.HouseholdIDFrom(c)
+	productID := c.Param("id")
+	linkID := strings.TrimSpace(c.Param("linkId"))
+	if linkID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "link id is required"})
+	}
+	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	tx, err := h.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx,
+		"SELECT 1 FROM product_links WHERE id = ? AND product_id = ?",
+		linkID, productID,
+	).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "source link not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+
+	for _, stmt := range []string{
+		"DELETE FROM product_nutrition WHERE product_id = ? AND product_link_id = ?",
+		"DELETE FROM product_enrichment_suggestions WHERE product_id = ? AND product_link_id = ?",
+		"DELETE FROM product_external_metadata WHERE product_id = ? AND product_link_id = ?",
+		"DELETE FROM product_links WHERE product_id = ? AND id = ?",
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, productID, linkID); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
+	}
+	h.broadcastProductUpdated(householdID, productID, []string{"links", "external_metadata", "enrichment_suggestions", "nutrition"})
+	return c.NoContent(http.StatusNoContent)
+}
+
 func (h *ProductHandler) CreateEnrichmentJob(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
@@ -416,7 +473,7 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
-	suggestionID := c.Param("suggestionId")
+	suggestionID := decodedParam(c, "suggestionId")
 	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
@@ -444,7 +501,7 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	if err := applySuggestion(ctx, tx, householdID, productID, s); err != nil {
+	if err := applySuggestion(ctx, tx, h.Cfg, householdID, productID, s); err != nil {
 		if errors.Is(err, errInvalidSuggestionValue) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
@@ -466,11 +523,11 @@ func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
 
-	updated, err := h.fetchSuggestion(ctx, productID, suggestionID)
+	updated, err := h.fetchSuggestion(ctx, productID, s.ID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	h.broadcastProductUpdated(householdID, productID, []string{s.Field})
+	h.broadcastProductUpdated(householdID, productID, changedFieldsForSuggestion(s.Field))
 	return c.JSON(http.StatusOK, updated)
 }
 
@@ -528,7 +585,7 @@ func (h *ProductHandler) BulkAcceptEnrichmentSuggestions(c echo.Context) error {
 	defer tx.Rollback()
 
 	for _, s := range toApply {
-		if err := applySuggestion(ctx, tx, householdID, productID, s); err != nil {
+		if err := applySuggestion(ctx, tx, h.Cfg, householdID, productID, s); err != nil {
 			if errors.Is(err, identifiers.ErrIdentifierConflict) || isUniqueConstraintError(err) {
 				resp.Conflicts = append(resp.Conflicts, h.suggestionConflict(ctx, householdID, s, err))
 				continue
@@ -550,6 +607,9 @@ func (h *ProductHandler) BulkAcceptEnrichmentSuggestions(c echo.Context) error {
 		}
 		resp.Accepted = append(resp.Accepted, bulkSuggestionAcceptedResponse{SuggestionID: s.ID, Field: s.Field, Value: s.Value})
 		changed[s.Field] = struct{}{}
+		if isSourceImageSuggestionField(s.Field) {
+			changed["images"] = struct{}{}
+		}
 	}
 
 	if req.RecomputePrices && (hasField(changed, "pack_quantity") || hasField(changed, "pack_unit")) {
@@ -602,15 +662,11 @@ func (h *ProductHandler) BulkRejectEnrichmentSuggestions(c echo.Context) error {
 		if suggestionID == "" {
 			continue
 		}
-		result, err := h.DB.ExecContext(ctx,
-			"UPDATE product_enrichment_suggestions SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND product_id = ? AND status = 'pending'",
-			suggestionID, productID,
-		)
+		rejected, err := h.rejectEnrichmentSuggestion(ctx, productID, suggestionID, true)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}
-		rows, _ := result.RowsAffected()
-		updated += int(rows)
+		updated += rejected
 	}
 	if updated > 0 {
 		h.broadcastProductUpdated(householdID, productID, []string{"enrichment_suggestions"})
@@ -622,26 +678,69 @@ func (h *ProductHandler) RejectEnrichmentSuggestion(c echo.Context) error {
 	ctx := c.Request().Context()
 	householdID := auth.HouseholdIDFrom(c)
 	productID := c.Param("id")
-	suggestionID := c.Param("suggestionId")
+	suggestionID := decodedParam(c, "suggestionId")
 	if err := h.verifyProduct(ctx, productID, householdID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "product not found"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	result, err := h.DB.ExecContext(ctx,
-		"UPDATE product_enrichment_suggestions SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND product_id = ?",
-		suggestionID, productID,
-	)
+	updated, err := h.rejectEnrichmentSuggestion(ctx, productID, suggestionID, false)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
+	if updated == 0 {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "suggestion not found"})
 	}
 	h.broadcastProductUpdated(householdID, productID, []string{"enrichment_suggestions"})
 	return c.NoContent(http.StatusNoContent)
+}
+
+func decodedParam(c echo.Context, name string) string {
+	value := c.Param(name)
+	decoded, err := url.PathUnescape(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+func (h *ProductHandler) rejectEnrichmentSuggestion(ctx context.Context, productID, suggestionID string, pendingOnly bool) (int, error) {
+	query := "UPDATE product_enrichment_suggestions SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND product_id = ?"
+	if pendingOnly {
+		query += " AND status = 'pending'"
+	}
+	result, err := h.DB.ExecContext(ctx,
+		query,
+		suggestionID, productID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	rows, _ := result.RowsAffected()
+	if rows > 0 || !isVirtualSourceImageSuggestionID(suggestionID) {
+		return int(rows), nil
+	}
+	s, err := h.ensureVirtualSourceImageSuggestion(ctx, productID, suggestionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	query = "UPDATE product_enrichment_suggestions SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND product_id = ?"
+	if pendingOnly {
+		query += " AND status = 'pending'"
+	}
+	result, err = h.DB.ExecContext(ctx,
+		query,
+		s.ID, productID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	rows, _ = result.RowsAffected()
+	return int(rows), nil
 }
 
 func (h *ProductHandler) upsertProductLink(ctx context.Context, productID, source string, externalID *string, rawURL string, label *string, fetchedAt time.Time, status int, contentHash string, lastError *string, confidence *float64) (productLinkResponse, error) {
@@ -782,16 +881,23 @@ func (h *ProductHandler) fetchProductEnrichmentSuggestions(productID string, pen
 			out = append(out, s)
 		}
 	}
+	if pendingOnly {
+		out = h.appendVirtualSourceImageSuggestions(productID, out)
+	}
 	return out
 }
 
 func (h *ProductHandler) fetchSuggestion(ctx context.Context, productID, suggestionID string) (productEnrichmentSuggestionResponse, error) {
-	return h.scanSuggestion(h.DB.QueryRowContext(ctx,
+	s, err := h.scanSuggestion(h.DB.QueryRowContext(ctx,
 		`SELECT id, product_id, product_link_id, external_metadata_id, source, source_url, field, value, evidence, confidence, status, created_at, updated_at
 		   FROM product_enrichment_suggestions
 		  WHERE id = ? AND product_id = ?`,
 		suggestionID, productID,
 	), h.currentValuesForProduct(productID))
+	if errors.Is(err, sql.ErrNoRows) && isVirtualSourceImageSuggestionID(suggestionID) {
+		return h.ensureVirtualSourceImageSuggestion(ctx, productID, suggestionID)
+	}
+	return s, err
 }
 
 func (h *ProductHandler) scanSuggestion(scanner rowScanner, currentValues map[string]string) (productEnrichmentSuggestionResponse, error) {
@@ -837,6 +943,277 @@ func (h *ProductHandler) currentValuesForProduct(productID string) map[string]st
 	}
 	values["pack_unit"] = ptrStringValue(p.PackUnit)
 	return values
+}
+
+const virtualSourceImageSuggestionPrefix = "source-image:"
+
+type sourceImageSuggestionKind struct {
+	Key       string
+	Field     string
+	Label     string
+	ImageType string
+	Primary   bool
+}
+
+var sourceImageSuggestionKinds = []sourceImageSuggestionKind{
+	{Key: "front", Field: "image_front_url", Label: "front", ImageType: "packaging", Primary: true},
+	{Key: "nutrition", Field: "image_nutrition_url", Label: "nutrition", ImageType: "nutrition"},
+	{Key: "ingredients", Field: "image_ingredients_url", Label: "ingredients", ImageType: "packaging"},
+	{Key: "packaging", Field: "image_packaging_url", Label: "package", ImageType: "packaging"},
+}
+
+func sourceImageKindForKey(key string) (sourceImageSuggestionKind, bool) {
+	key = strings.TrimSpace(strings.ToLower(key))
+	for _, kind := range sourceImageSuggestionKinds {
+		if kind.Key == key {
+			return kind, true
+		}
+	}
+	return sourceImageSuggestionKind{}, false
+}
+
+func sourceImageKindForField(field string) (sourceImageSuggestionKind, bool) {
+	field = strings.TrimSpace(strings.ToLower(field))
+	for _, kind := range sourceImageSuggestionKinds {
+		if kind.Field == field {
+			return kind, true
+		}
+	}
+	return sourceImageSuggestionKind{}, false
+}
+
+func isSourceImageSuggestionField(field string) bool {
+	_, ok := sourceImageKindForField(field)
+	return ok
+}
+
+func changedFieldsForSuggestion(field string) []string {
+	if isSourceImageSuggestionField(field) {
+		return []string{field, "images", "enrichment_suggestions"}
+	}
+	return []string{field}
+}
+
+func virtualSourceImageSuggestionID(metadataID, key string) string {
+	return virtualSourceImageSuggestionPrefix + metadataID + ":" + key
+}
+
+func isVirtualSourceImageSuggestionID(id string) bool {
+	return strings.HasPrefix(id, virtualSourceImageSuggestionPrefix)
+}
+
+func parseVirtualSourceImageSuggestionID(id string) (metadataID, key string, ok bool) {
+	rest := strings.TrimPrefix(id, virtualSourceImageSuggestionPrefix)
+	metadataID, key, ok = strings.Cut(rest, ":")
+	return metadataID, key, ok && strings.TrimSpace(metadataID) != "" && strings.TrimSpace(key) != ""
+}
+
+func sourceImageSuggestionKey(metadataID, field, value string) string {
+	return metadataID + "\x00" + field + "\x00" + strings.TrimSpace(value)
+}
+
+func sourceImageSuggestionFields() []string {
+	fields := make([]string, 0, len(sourceImageSuggestionKinds))
+	for _, kind := range sourceImageSuggestionKinds {
+		fields = append(fields, kind.Field)
+	}
+	return fields
+}
+
+func (h *ProductHandler) appendVirtualSourceImageSuggestions(productID string, out []productEnrichmentSuggestionResponse) []productEnrichmentSuggestionResponse {
+	existing := h.existingSourceImageSuggestionKeys(productID)
+	for _, s := range out {
+		if s.MetadataID != nil && isSourceImageSuggestionField(s.Field) {
+			existing[sourceImageSuggestionKey(*s.MetadataID, s.Field, s.Value)] = struct{}{}
+		}
+	}
+
+	now := time.Now().UTC()
+	for _, metadata := range h.fetchProductExternalMetadata(productID) {
+		var payload enrichment.MetadataPayload
+		if err := json.Unmarshal(metadata.Payload, &payload); err != nil {
+			continue
+		}
+		for _, kind := range sourceImageSuggestionKinds {
+			rawURL := strings.TrimSpace(payload.ImageURLs[kind.Key])
+			if rawURL == "" {
+				continue
+			}
+			if _, ok := existing[sourceImageSuggestionKey(metadata.ID, kind.Field, rawURL)]; ok {
+				continue
+			}
+			sourceURL := sourceURLForMetadataImage(metadata, payload, rawURL)
+			evidence := sourceImageEvidence(metadata.Source, kind)
+			metadataID := metadata.ID
+			out = append(out, productEnrichmentSuggestionResponse{
+				ID:         virtualSourceImageSuggestionID(metadata.ID, kind.Key),
+				ProductID:  productID,
+				LinkID:     metadata.ProductLinkID,
+				MetadataID: &metadataID,
+				Source:     metadata.Source,
+				SourceURL:  sourceURL,
+				Field:      kind.Field,
+				Value:      rawURL,
+				Evidence:   &evidence,
+				Status:     "pending",
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			})
+		}
+	}
+	return out
+}
+
+func (h *ProductHandler) existingSourceImageSuggestionKeys(productID string) map[string]struct{} {
+	out := map[string]struct{}{}
+	fields := sourceImageSuggestionFields()
+	if len(fields) == 0 {
+		return out
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(fields)), ",")
+	args := make([]interface{}, 0, len(fields)+1)
+	args = append(args, productID)
+	for _, field := range fields {
+		args = append(args, field)
+	}
+	rows, err := h.DB.Query(
+		`SELECT external_metadata_id, field, value
+		   FROM product_enrichment_suggestions
+		  WHERE product_id = ?
+		    AND external_metadata_id IS NOT NULL
+		    AND field IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var metadataID, field, value string
+		if rows.Scan(&metadataID, &field, &value) == nil {
+			out[sourceImageSuggestionKey(metadataID, field, value)] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (h *ProductHandler) ensureVirtualSourceImageSuggestion(ctx context.Context, productID, suggestionID string) (productEnrichmentSuggestionResponse, error) {
+	metadataID, key, ok := parseVirtualSourceImageSuggestionID(suggestionID)
+	if !ok {
+		return productEnrichmentSuggestionResponse{}, sql.ErrNoRows
+	}
+	kind, ok := sourceImageKindForKey(key)
+	if !ok {
+		return productEnrichmentSuggestionResponse{}, sql.ErrNoRows
+	}
+
+	metadata, payload, err := h.fetchMetadataPayload(ctx, productID, metadataID)
+	if err != nil {
+		return productEnrichmentSuggestionResponse{}, err
+	}
+	rawURL := strings.TrimSpace(payload.ImageURLs[kind.Key])
+	if rawURL == "" {
+		return productEnrichmentSuggestionResponse{}, sql.ErrNoRows
+	}
+
+	var id string
+	err = h.DB.QueryRowContext(ctx,
+		`SELECT id
+		   FROM product_enrichment_suggestions
+		  WHERE product_id = ? AND external_metadata_id = ? AND field = ? AND value = ?
+		  LIMIT 1`,
+		productID, metadata.ID, kind.Field, rawURL,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		sourceURL := sourceURLForMetadataImage(metadata, payload, rawURL)
+		evidence := sourceImageEvidence(metadata.Source, kind)
+		err = h.DB.QueryRowContext(ctx,
+			`INSERT INTO product_enrichment_suggestions
+			    (id, product_id, product_link_id, external_metadata_id, source, source_url, field, value, evidence, status, created_at, updated_at)
+			 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			 RETURNING id`,
+			productID, metadata.ProductLinkID, metadata.ID, metadata.Source, sourceURL, kind.Field, rawURL, evidence,
+		).Scan(&id)
+	}
+	if err != nil {
+		return productEnrichmentSuggestionResponse{}, err
+	}
+	return h.fetchSuggestion(ctx, productID, id)
+}
+
+func (h *ProductHandler) fetchMetadataPayload(ctx context.Context, productID, metadataID string) (productExternalMetadataResponse, enrichment.MetadataPayload, error) {
+	var item productExternalMetadataResponse
+	var payloadRaw string
+	var linkID, sourceRecordID, sourceURL, lookupKey, lastError sql.NullString
+	var fetchedAt sql.NullTime
+	var httpStatus sql.NullInt64
+	var confidence sql.NullFloat64
+	if err := h.DB.QueryRowContext(ctx,
+		`SELECT id, product_id, product_link_id, source, source_record_id, source_url,
+		        lookup_key, payload_json, payload_version, fetched_at, http_status,
+		        last_error, confidence, created_at, updated_at
+		   FROM product_external_metadata
+		  WHERE id = ? AND product_id = ?`,
+		metadataID, productID,
+	).Scan(
+		&item.ID, &item.ProductID, &linkID, &item.Source, &sourceRecordID, &sourceURL,
+		&lookupKey, &payloadRaw, &item.PayloadVersion, &fetchedAt, &httpStatus,
+		&lastError, &confidence, &item.CreatedAt, &item.UpdatedAt,
+	); err != nil {
+		return productExternalMetadataResponse{}, enrichment.MetadataPayload{}, err
+	}
+	item.ProductLinkID = sqlNullStringPtr(linkID)
+	item.SourceRecordID = sqlNullStringPtr(sourceRecordID)
+	item.SourceURL = sqlNullStringPtr(sourceURL)
+	item.LookupKey = sqlNullStringPtr(lookupKey)
+	item.LastError = sqlNullStringPtr(lastError)
+	if fetchedAt.Valid {
+		item.FetchedAt = &fetchedAt.Time
+	}
+	if httpStatus.Valid {
+		status := int(httpStatus.Int64)
+		item.HTTPStatus = &status
+	}
+	item.Confidence = nullFloatPtr(confidence)
+	item.Payload = json.RawMessage(payloadRaw)
+
+	var payload enrichment.MetadataPayload
+	if err := json.Unmarshal([]byte(payloadRaw), &payload); err != nil {
+		return productExternalMetadataResponse{}, enrichment.MetadataPayload{}, err
+	}
+	return item, payload, nil
+}
+
+func sourceURLForMetadataImage(metadata productExternalMetadataResponse, payload enrichment.MetadataPayload, fallback string) string {
+	if metadata.SourceURL != nil && strings.TrimSpace(*metadata.SourceURL) != "" {
+		return strings.TrimSpace(*metadata.SourceURL)
+	}
+	if payload.SourceURL != nil && strings.TrimSpace(*payload.SourceURL) != "" {
+		return strings.TrimSpace(*payload.SourceURL)
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func sourceImageEvidence(source string, kind sourceImageSuggestionKind) string {
+	return sourceDisplayName(source) + " " + kind.Label + " photo"
+}
+
+func sourceDisplayName(source string) string {
+	switch source {
+	case "openfoodfacts":
+		return "Open Food Facts"
+	case "usda_fdc":
+		return "USDA FoodData Central"
+	case "kroger":
+		return "Kroger"
+	case "url":
+		return "Product URL"
+	default:
+		if strings.TrimSpace(source) == "" {
+			return "Source"
+		}
+		return strings.TrimSpace(source)
+	}
 }
 
 func (h *ProductHandler) fetchProductNutrition(productID string) []productNutritionResponse {
@@ -894,10 +1271,65 @@ func (h *ProductHandler) fetchProductNutrition(productID string) []productNutrit
 	return out
 }
 
+func (h *ProductHandler) fetchProductExternalMetadata(productID string) []productExternalMetadataResponse {
+	rows, err := h.DB.Query(
+		`SELECT id, product_id, product_link_id, source, source_record_id, source_url,
+		        lookup_key, payload_json, payload_version, fetched_at, http_status,
+		        last_error, confidence, created_at, updated_at
+		   FROM product_external_metadata
+		  WHERE product_id = ?
+		  ORDER BY fetched_at DESC NULLS LAST, updated_at DESC, created_at DESC`,
+		productID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	out := make([]productExternalMetadataResponse, 0)
+	for rows.Next() {
+		var item productExternalMetadataResponse
+		var linkID, sourceRecordID, sourceURL, lookupKey, payload, lastError sql.NullString
+		var fetchedAt sql.NullTime
+		var httpStatus sql.NullInt64
+		var confidence sql.NullFloat64
+		if rows.Scan(
+			&item.ID, &item.ProductID, &linkID, &item.Source, &sourceRecordID, &sourceURL,
+			&lookupKey, &payload, &item.PayloadVersion, &fetchedAt, &httpStatus,
+			&lastError, &confidence, &item.CreatedAt, &item.UpdatedAt,
+		) != nil {
+			continue
+		}
+		item.ProductLinkID = sqlNullStringPtr(linkID)
+		item.SourceRecordID = sqlNullStringPtr(sourceRecordID)
+		item.SourceURL = sqlNullStringPtr(sourceURL)
+		item.LookupKey = sqlNullStringPtr(lookupKey)
+		item.LastError = sqlNullStringPtr(lastError)
+		if fetchedAt.Valid {
+			item.FetchedAt = &fetchedAt.Time
+		}
+		if httpStatus.Valid {
+			status := int(httpStatus.Int64)
+			item.HTTPStatus = &status
+		}
+		item.Confidence = nullFloatPtr(confidence)
+		raw := []byte("{}")
+		if payload.Valid && json.Valid([]byte(payload.String)) {
+			raw = []byte(payload.String)
+		}
+		item.Payload = json.RawMessage(raw)
+		out = append(out, item)
+	}
+	return out
+}
+
 var errInvalidSuggestionValue = errors.New("invalid suggestion value")
 
-func applySuggestion(ctx context.Context, tx *sql.Tx, householdID, productID string, s productEnrichmentSuggestionResponse) error {
+func applySuggestion(ctx context.Context, tx *sql.Tx, cfg *config.Config, householdID, productID string, s productEnrichmentSuggestionResponse) error {
 	now := time.Now().UTC()
+	if isSourceImageSuggestionField(s.Field) {
+		return applySourceImageSuggestion(ctx, tx, cfg, productID, s)
+	}
 	switch s.Field {
 	case "name":
 		_, err := tx.ExecContext(ctx, "UPDATE products SET name = ?, updated_at = ? WHERE id = ?", strings.TrimSpace(s.Value), now, productID)
@@ -925,6 +1357,102 @@ func applySuggestion(ctx context.Context, tx *sql.Tx, householdID, productID str
 		return err
 	}
 	return applyNutritionSuggestion(ctx, tx, productID, s)
+}
+
+func applySourceImageSuggestion(ctx context.Context, tx *sql.Tx, cfg *config.Config, productID string, s productEnrichmentSuggestionResponse) error {
+	kind, ok := sourceImageKindForField(s.Field)
+	if !ok {
+		return fmt.Errorf("%w: unsupported source image field", errInvalidSuggestionValue)
+	}
+	rawURL := strings.TrimSpace(s.Value)
+	if rawURL == "" {
+		return fmt.Errorf("%w: source image URL is required", errInvalidSuggestionValue)
+	}
+	if cfg == nil || strings.TrimSpace(cfg.DataDir) == "" {
+		return errors.New("product image storage is not configured")
+	}
+
+	client := httpsafe.NewSafeHTTPClient(12*time.Second, 10<<20, cfg.AllowPrivateIntegrations)
+	result, err := client.Fetch(ctx, rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: source image could not be fetched", errInvalidSuggestionValue)
+	}
+	if result.StatusCode < 200 || result.StatusCode >= 300 {
+		return fmt.Errorf("%w: source image returned status %d", errInvalidSuggestionValue, result.StatusCode)
+	}
+	ext, ok := sourceImageExtension(result.Body, result.ContentType)
+	if !ok {
+		return fmt.Errorf("%w: source image must be JPEG, PNG, GIF, or WebP", errInvalidSuggestionValue)
+	}
+	scrubbed, err := imaging.StripMetadata(result.Body, 95)
+	if err != nil {
+		return fmt.Errorf("%w: source image could not be decoded", errInvalidSuggestionValue)
+	}
+
+	if ext != "png" {
+		ext = "jpg"
+	}
+
+	var imageID string
+	if err := tx.QueryRowContext(ctx, "SELECT lower(hex(randomblob(16)))").Scan(&imageID); err != nil {
+		return err
+	}
+	key, err := storage.ProductImageKey(productID, imageID, ext)
+	if err != nil {
+		return err
+	}
+	localStore, err := storage.NewLocal(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	if err := localStore.WriteFileAtomic(key, scrubbed, 0o644); err != nil {
+		return err
+	}
+
+	var existingPrimary int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM product_images WHERE product_id = ? AND is_primary = 1", productID).Scan(&existingPrimary); err != nil {
+		if p, perr := localStore.Path(key); perr == nil {
+			_ = os.Remove(p)
+		}
+		return err
+	}
+	isPrimary := kind.Primary && existingPrimary == 0
+	caption := sourceImageEvidence(s.Source, kind)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO product_images (id, product_id, image_path, type, caption, is_primary, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		imageID, productID, key, kind.ImageType, caption, isPrimary,
+	)
+	if err != nil {
+		if p, perr := localStore.Path(key); perr == nil {
+			_ = os.Remove(p)
+		}
+		return err
+	}
+	return nil
+}
+
+func sourceImageExtension(raw []byte, contentType string) (string, bool) {
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if contentType == "" {
+		contentType = strings.ToLower(http.DetectContentType(raw))
+	}
+	switch contentType {
+	case "image/png":
+		return "png", true
+	case "image/jpeg", "image/jpg", "image/gif", "image/webp":
+		return "jpg", true
+	default:
+		detected := strings.ToLower(http.DetectContentType(raw))
+		switch detected {
+		case "image/png":
+			return "png", true
+		case "image/jpeg", "image/jpg", "image/gif", "image/webp":
+			return "jpg", true
+		default:
+			return "", false
+		}
+	}
 }
 
 func applyNutritionSuggestion(ctx context.Context, tx *sql.Tx, productID string, s productEnrichmentSuggestionResponse) error {
@@ -1014,14 +1542,17 @@ func suggestionsFromOpenFoodFacts(upc, sourceURL string, body []byte) []enrichme
 	var payload struct {
 		Status  int `json:"status"`
 		Product struct {
-			ProductName     string             `json:"product_name"`
-			Brands          string             `json:"brands"`
-			Code            string             `json:"code"`
-			Quantity        string             `json:"quantity"`
-			IngredientsText string             `json:"ingredients_text"`
-			Allergens       string             `json:"allergens"`
-			Nutriments      map[string]float64 `json:"nutriments"`
-			ServingSize     string             `json:"serving_size"`
+			ProductName      string             `json:"product_name"`
+			Brands           string             `json:"brands"`
+			Code             string             `json:"code"`
+			Quantity         string             `json:"quantity"`
+			IngredientsText  string             `json:"ingredients_text"`
+			Allergens        string             `json:"allergens"`
+			Nutriments       map[string]float64 `json:"nutriments"`
+			ServingSize      string             `json:"serving_size"`
+			ImageFrontURL    string             `json:"image_front_url"`
+			ImageNutrition   string             `json:"image_nutrition_url"`
+			ImageIngredients string             `json:"image_ingredients_url"`
 		} `json:"product"`
 	}
 	if json.Unmarshal(body, &payload) != nil || payload.Status != 1 {
@@ -1065,6 +1596,9 @@ func suggestionsFromOpenFoodFacts(upc, sourceURL string, body []byte) []enrichme
 			add(field, strconv.FormatFloat(value, 'f', -1, 64), key, 0.65)
 		}
 	}
+	add("image_front_url", payload.Product.ImageFrontURL, "Open Food Facts front photo", 0.68)
+	add("image_nutrition_url", payload.Product.ImageNutrition, "Open Food Facts nutrition photo", 0.68)
+	add("image_ingredients_url", payload.Product.ImageIngredients, "Open Food Facts ingredients photo", 0.68)
 	return out
 }
 
@@ -1202,14 +1736,14 @@ func titleDescription(value string) string {
 	return strings.Join(parts, " ")
 }
 
-var quantityRE = regexp.MustCompile(`(?i)\b([0-9]+(?:\.[0-9]+)?)\s*(fl\s*oz|oz|lb|g|kg|ml|l|ct|count|each|ea)\b`)
+var quantityRE = regexp.MustCompile(`(?i)\b([0-9]+(?:[\.,][0-9]+)?)\s*(fl\s*oz|oz|lb|g|kg|ml|l|ct|count|each|ea)\b`)
 
 func parseQuantity(value string) (string, string) {
 	m := quantityRE.FindStringSubmatch(value)
 	if len(m) != 3 {
 		return "", ""
 	}
-	return m[1], canonicalProductUnit(m[2])
+	return strings.ReplaceAll(m[1], ",", "."), canonicalProductUnit(m[2])
 }
 
 func canonicalProductUnit(value string) string {

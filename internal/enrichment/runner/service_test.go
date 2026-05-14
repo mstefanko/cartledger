@@ -192,6 +192,36 @@ func TestProcessJobReportsRequestedDisabledProviderAsSkipped(t *testing.T) {
 	}
 }
 
+func TestProcessJobRejectsReceiptScanWhenAutoLookupDisabled(t *testing.T) {
+	database, service, householdID, productID, cleanup := setupServiceTest(t, fakeProvider{name: "openfoodfacts"})
+	defer cleanup()
+
+	job, _, err := service.QueueJob(context.Background(), QueueJobRequest{
+		HouseholdID: householdID,
+		ProductID:   productID,
+		Trigger:     TriggerReceiptScan,
+		LookupKey:   "upc:0001111008404",
+	})
+	if err != nil {
+		t.Fatalf("queue job: %v", err)
+	}
+	if err := service.ProcessJob(context.Background(), job.ID); err == nil {
+		t.Fatalf("process job err = nil, want disabled auto-scan error")
+	}
+
+	var status string
+	var lastError sql.NullString
+	if err := database.QueryRow("SELECT status, last_error FROM product_enrichment_jobs WHERE id = ?", job.ID).Scan(&status, &lastError); err != nil {
+		t.Fatalf("query job: %v", err)
+	}
+	if status != StatusFailed {
+		t.Fatalf("status = %q, want failed", status)
+	}
+	if !lastError.Valid || !strings.Contains(lastError.String, "automatic enrichment lookup on scan is disabled") {
+		t.Fatalf("last_error = %+v, want auto-scan disabled reason", lastError)
+	}
+}
+
 func TestRateLimitRequeueDoesNotConsumeAttemptBudget(t *testing.T) {
 	database, service, householdID, productID, cleanup := setupServiceTest(t, fakeProvider{name: "openfoodfacts", err: errors.New("429 rate limited")})
 	defer cleanup()

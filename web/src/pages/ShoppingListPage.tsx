@@ -89,8 +89,8 @@ type BadgeState =
 
 function priceBasisLabel(item: ListItemWithPrice): string | null {
   if (item.price_basis === 'normalized') return null
-  if (item.price_basis === 'missing_package') return 'Needs package details'
-  if (item.price_basis === 'raw') return 'Package price only'
+  if (item.price_basis === 'missing_package') return 'Needs package contents'
+  if (item.price_basis === 'raw') return 'Receipt price only'
   return null
 }
 

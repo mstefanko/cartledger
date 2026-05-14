@@ -18,8 +18,26 @@ import (
 var (
 	APIBase     = "https://world.openfoodfacts.org/api/v2/product/"
 	ProductBase = "https://world.openfoodfacts.org/product/"
-	quantityRE  = regexp.MustCompile(`(?i)\b([0-9]+(?:\.[0-9]+)?)\s*(fl\s*oz|oz|lb|g|kg|ml|l|ct|count|each|ea)\b`)
+	quantityRE  = regexp.MustCompile(`(?i)\b([0-9]+(?:[\.,][0-9]+)?)\s*(fl\s*oz|oz|lb|g|kg|ml|l|ct|count|each|ea)\b`)
 )
+
+var productFields = []string{
+	"code",
+	"status",
+	"product_name",
+	"brands",
+	"quantity",
+	"categories",
+	"ingredients_text",
+	"allergens",
+	"nutriments",
+	"nutrient_levels",
+	"nutriscore_grade",
+	"serving_size",
+	"image_front_url",
+	"image_nutrition_url",
+	"image_ingredients_url",
+}
 
 type Provider struct {
 	Client      *httpsafe.SafeHTTPClient
@@ -60,27 +78,61 @@ func (p *Provider) Lookup(ctx context.Context, input providers.LookupInput) ([]p
 	upc := strings.TrimSpace(*input.UPC)
 	apiBase := strings.TrimRight(firstNonEmpty(p.APIBase, APIBase), "/")
 	productBase := strings.TrimRight(firstNonEmpty(p.ProductBase, ProductBase), "/")
-	sourceURL := productBase + "/" + url.PathEscape(upc)
-	apiURL := apiBase + "/" + url.PathEscape(upc) + ".json"
 
 	client := p.Client
 	if client == nil {
 		client = httpsafe.NewSafeHTTPClient(8*time.Second, 512*1024, input.AllowPrivate)
 	}
-	result, err := client.Fetch(ctx, apiURL)
-	if err != nil {
-		return nil, err
-	}
-	if result.StatusCode == 429 {
-		return nil, providersRateLimitError("openfoodfacts rate limited")
-	}
+	linkURL := productBase + "/" + url.PathEscape(upc)
+	var fallback *providers.Metadata
+	for _, lookupCode := range openFoodFactsLookupCodes(upc) {
+		sourceURL := productBase + "/" + url.PathEscape(lookupCode)
+		apiURL := openFoodFactsAPIURL(apiBase, lookupCode)
+		result, err := client.Fetch(ctx, apiURL)
+		if err != nil {
+			return nil, err
+		}
+		if result.StatusCode == 429 {
+			return nil, providersRateLimitError("openfoodfacts rate limited")
+		}
 
-	payload, suggestions := payloadFromOpenFoodFacts(upc, sourceURL, result.Body)
+		payload, suggestions := payloadFromOpenFoodFacts(upc, sourceURL, result.Body)
+		metadata := metadataFromOpenFoodFacts(upc, lookupCode, linkURL, input.LookupKey, result, payload, suggestions)
+		if fallback == nil {
+			item := metadata
+			fallback = &item
+		}
+		if payloadHasProductData(payload, suggestions) {
+			return []providers.Metadata{metadata}, nil
+		}
+	}
+	if fallback != nil {
+		return []providers.Metadata{*fallback}, nil
+	}
+	return nil, nil
+}
+
+func openFoodFactsAPIURL(apiBase, code string) string {
+	endpoint := apiBase + "/" + url.PathEscape(code) + ".json"
+	values := url.Values{}
+	values.Set("fields", strings.Join(productFields, ","))
+	return endpoint + "?" + values.Encode()
+}
+
+func metadataFromOpenFoodFacts(
+	upc string,
+	lookupCode string,
+	sourceURL string,
+	lookupKey string,
+	result httpsafe.FetchResult,
+	payload enrichment.MetadataPayload,
+	suggestions []enrichment.Suggestion,
+) providers.Metadata {
 	if payload.Version == 0 {
 		payload = enrichment.MetadataPayload{
 			Version:        1,
 			Source:         "openfoodfacts",
-			SourceRecordID: stringPtr(upc),
+			SourceRecordID: stringPtr(lookupCode),
 			SourceURL:      stringPtr(sourceURL),
 			Identifiers: []enrichment.PayloadIdentifier{{
 				Type:      "gtin",
@@ -91,35 +143,38 @@ func (p *Provider) Lookup(ctx context.Context, input providers.LookupInput) ([]p
 	}
 	hash := store.HashBytes(result.Body)
 	confidence := sourceConfidenceForSuggestions(suggestions)
-	return []providers.Metadata{{
+	return providers.Metadata{
 		Source:         "openfoodfacts",
-		SourceRecordID: stringPtr(upc),
+		SourceRecordID: sourceRecordIDForPayload(payload, lookupCode),
 		SourceURL:      sourceURL,
-		LookupKey:      input.LookupKey,
+		LookupKey:      lookupKey,
 		Confidence:     confidence,
 		Payload:        payload,
 		Suggestions:    suggestions,
 		FetchedAt:      result.FetchedAt,
 		HTTPStatus:     result.StatusCode,
 		ContentHash:    &hash,
-	}}, nil
+	}
 }
 
 func payloadFromOpenFoodFacts(upc, sourceURL string, body []byte) (enrichment.MetadataPayload, []enrichment.Suggestion) {
 	var raw struct {
 		Status  int `json:"status"`
 		Product struct {
-			ProductName     string             `json:"product_name"`
-			Brands          string             `json:"brands"`
-			Code            string             `json:"code"`
-			Quantity        string             `json:"quantity"`
-			Categories      string             `json:"categories"`
-			IngredientsText string             `json:"ingredients_text"`
-			Allergens       string             `json:"allergens"`
-			Nutriments      map[string]float64 `json:"nutriments"`
-			ServingSize     string             `json:"serving_size"`
-			ImageFrontURL   string             `json:"image_front_url"`
-			ImageNutrition  string             `json:"image_nutrition_url"`
+			ProductName      string            `json:"product_name"`
+			Brands           string            `json:"brands"`
+			Code             string            `json:"code"`
+			Quantity         string            `json:"quantity"`
+			Categories       string            `json:"categories"`
+			IngredientsText  string            `json:"ingredients_text"`
+			Allergens        string            `json:"allergens"`
+			Nutriments       map[string]any    `json:"nutriments"`
+			NutrientLevels   map[string]string `json:"nutrient_levels"`
+			NutriScoreGrade  string            `json:"nutriscore_grade"`
+			ServingSize      string            `json:"serving_size"`
+			ImageFrontURL    string            `json:"image_front_url"`
+			ImageNutrition   string            `json:"image_nutrition_url"`
+			ImageIngredients string            `json:"image_ingredients_url"`
 		} `json:"product"`
 	}
 	if json.Unmarshal(body, &raw) != nil || raw.Status != 1 {
@@ -185,21 +240,92 @@ func payloadFromOpenFoodFacts(upc, sourceURL string, body []byte) (enrichment.Me
 		payload.Allergens = allergens
 		add("allergens", strings.Join(allergens, ", "), raw.Product.Allergens, 0.62)
 	}
-	nutrients := nutrientPayloadFromOFF(raw.Product.Nutriments, add)
+	nutrients := nutrientPayloadFromOFF(numericNutriments(raw.Product.Nutriments), add)
 	if nutrients != nil {
 		payload.Nutrients = nutrients
 	}
 	imageURLs := map[string]string{}
 	if raw.Product.ImageFrontURL != "" {
 		imageURLs["front"] = raw.Product.ImageFrontURL
+		add("image_front_url", raw.Product.ImageFrontURL, "Open Food Facts front photo", 0.68)
 	}
 	if raw.Product.ImageNutrition != "" {
 		imageURLs["nutrition"] = raw.Product.ImageNutrition
+		add("image_nutrition_url", raw.Product.ImageNutrition, "Open Food Facts nutrition photo", 0.68)
+	}
+	if raw.Product.ImageIngredients != "" {
+		imageURLs["ingredients"] = raw.Product.ImageIngredients
+		add("image_ingredients_url", raw.Product.ImageIngredients, "Open Food Facts ingredients photo", 0.68)
 	}
 	if len(imageURLs) > 0 {
 		payload.ImageURLs = imageURLs
 	}
+	providerMeta := map[string]string{}
+	if grade := strings.TrimSpace(raw.Product.NutriScoreGrade); grade != "" {
+		providerMeta["nutriscore_grade"] = strings.ToUpper(grade)
+	}
+	for name, level := range raw.Product.NutrientLevels {
+		name = strings.TrimSpace(name)
+		level = strings.TrimSpace(level)
+		if name != "" && level != "" {
+			providerMeta["nutrient_level_"+name] = level
+		}
+	}
+	if len(providerMeta) > 0 {
+		payload.ProviderMeta = providerMeta
+	}
 	return payload, suggestions
+}
+
+func openFoodFactsLookupCodes(upc string) []string {
+	added := map[string]struct{}{}
+	out := make([]string, 0, 2)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := added[value]; ok {
+			return
+		}
+		added[value] = struct{}{}
+		out = append(out, value)
+	}
+	add(upc)
+	if len(upc) == 12 {
+		add("0" + upc)
+	}
+	if len(upc) == 13 && strings.HasPrefix(upc, "0") {
+		add(strings.TrimPrefix(upc, "0"))
+	}
+	return out
+}
+
+func payloadHasProductData(payload enrichment.MetadataPayload, suggestions []enrichment.Suggestion) bool {
+	if payload.Version == 0 {
+		return false
+	}
+	if payload.Name != nil || payload.Brand != nil || payload.Category != nil ||
+		payload.Package != nil || payload.Serving != nil || payload.Nutrients != nil ||
+		payload.Ingredients != nil || len(payload.Allergens) > 0 ||
+		len(payload.ImageURLs) > 0 || len(payload.ProviderMeta) > 0 {
+		return true
+	}
+	for _, suggestion := range suggestions {
+		if strings.TrimSpace(suggestion.Field) != "" && suggestion.Field != "upc" {
+			return true
+		}
+	}
+	return false
+}
+
+func sourceRecordIDForPayload(payload enrichment.MetadataPayload, fallback string) *string {
+	if payload.SourceRecordID != nil {
+		if value := strings.TrimSpace(*payload.SourceRecordID); value != "" {
+			return &value
+		}
+	}
+	return stringPtr(fallback)
 }
 
 func nutrientPayloadFromOFF(nutriments map[string]float64, add func(string, string, string, float64)) *enrichment.NutrientPayload {
@@ -226,6 +352,28 @@ func nutrientPayloadFromOFF(nutriments map[string]float64, add func(string, stri
 	set("proteins_serving", "protein_g", &out.ProteinG)
 	if out.Calories == nil && out.TotalFatG == nil && out.SodiumMG == nil && out.ProteinG == nil &&
 		out.TotalCarbohydrateG == nil && out.DietaryFiberG == nil && out.TotalSugarsG == nil {
+		return nil
+	}
+	return out
+}
+
+func numericNutriments(values map[string]any) map[string]float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(values))
+	for key, value := range values {
+		switch v := value.(type) {
+		case float64:
+			out[key] = v
+		case string:
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+			if err == nil {
+				out[key] = parsed
+			}
+		}
+	}
+	if len(out) == 0 {
 		return nil
 	}
 	return out
@@ -270,7 +418,7 @@ func parseQuantity(value string) (string, string) {
 	if len(m) != 3 {
 		return "", ""
 	}
-	return m[1], canonicalProductUnit(m[2])
+	return strings.ReplaceAll(m[1], ",", "."), canonicalProductUnit(m[2])
 }
 
 func canonicalProductUnit(value string) string {

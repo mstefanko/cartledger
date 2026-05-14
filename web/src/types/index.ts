@@ -309,6 +309,83 @@ export interface ProductNutrition {
   updated_at: string
 }
 
+export interface ProductMetadataIdentifier {
+  type: string
+  authority?: string | null
+  value: string
+}
+
+export interface ProductMetadataPackage {
+  label?: string | null
+  quantity?: number | null
+  unit?: string | null
+}
+
+export interface ProductMetadataServing {
+  label?: string | null
+  quantity?: number | null
+  unit?: string | null
+  servings_per_container?: number | null
+}
+
+export interface ProductMetadataNutrients {
+  calories?: number | null
+  total_fat_g?: number | null
+  saturated_fat_g?: number | null
+  trans_fat_g?: number | null
+  cholesterol_mg?: number | null
+  sodium_mg?: number | null
+  total_carbohydrate_g?: number | null
+  dietary_fiber_g?: number | null
+  total_sugars_g?: number | null
+  added_sugars_g?: number | null
+  protein_g?: number | null
+}
+
+export interface ProductMetadataEvidence {
+  field: string
+  text: string
+  url?: string | null
+}
+
+export interface ProductMetadataPayload {
+  version?: number
+  source?: string
+  source_record_id?: string | null
+  source_url?: string | null
+  identifiers?: ProductMetadataIdentifier[]
+  name?: string | null
+  brand?: string | null
+  category?: string | null
+  tags?: string[]
+  package?: ProductMetadataPackage | null
+  serving?: ProductMetadataServing | null
+  nutrients?: ProductMetadataNutrients | null
+  ingredients?: string | null
+  allergens?: string[]
+  image_urls?: Record<string, string>
+  provider_meta?: Record<string, string>
+  evidence?: ProductMetadataEvidence[]
+}
+
+export interface ProductExternalMetadata {
+  id: string
+  product_id: string
+  product_link_id?: string | null
+  source: string
+  source_record_id?: string | null
+  source_url?: string | null
+  lookup_key?: string | null
+  payload: ProductMetadataPayload
+  payload_version: number
+  fetched_at?: string | null
+  http_status?: number | null
+  last_error?: string | null
+  confidence?: number | null
+  created_at: string
+  updated_at: string
+}
+
 export interface ProductEnrichmentSuggestion {
   id: string
   product_id: string
@@ -461,6 +538,7 @@ export interface ProductDetail {
   images: ProductImage[]
   links: ProductLink[]
   nutrition: ProductNutrition[]
+  external_metadata: ProductExternalMetadata[]
   enrichment_suggestions: ProductEnrichmentSuggestion[]
   price_history: PriceHistoryEntry[]
   store_comparison: StorePriceComparison[]

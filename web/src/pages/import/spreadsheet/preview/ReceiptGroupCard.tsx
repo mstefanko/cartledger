@@ -127,7 +127,7 @@ function ReceiptGroupCard({
                 <th className="pb-1.5 font-medium w-6"></th>
                 <th className="pb-1.5 font-medium">Item</th>
                 <th className="pb-1.5 font-medium">Date</th>
-                <th className="pb-1.5 font-medium">Qty</th>
+                <th className="pb-1.5 font-medium">Purchased</th>
                 <th className="pb-1.5 font-medium text-right">Total</th>
               </tr>
             </thead>

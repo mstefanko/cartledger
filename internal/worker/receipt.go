@@ -19,6 +19,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/mstefanko/cartledger/internal/config"
+	enrichmentrunner "github.com/mstefanko/cartledger/internal/enrichment/runner"
 	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
@@ -95,6 +96,7 @@ type ReceiptWorker struct {
 	db          *sql.DB
 	hub         *ws.Hub
 	cfg         *config.Config
+	enrichment  *enrichmentrunner.Service
 
 	// Shutdown coordination.
 	wg          sync.WaitGroup // tracks in-flight processJob calls
@@ -125,6 +127,10 @@ func NewReceiptWorker(concurrency int, llmClient llm.Client, guard *llm.GuardedE
 		go w.process()
 	}
 	return w
+}
+
+func (w *ReceiptWorker) SetEnrichmentService(service *enrichmentrunner.Service) {
+	w.enrichment = service
 }
 
 // QueueDepth returns the current number of jobs buffered in the worker
@@ -1047,6 +1053,8 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
+	w.queueReceiptScanEnrichment(job.HouseholdID, job.ReceiptID)
+
 	// 8. Broadcast completion.
 	w.hub.Broadcast(ws.Message{
 		Type:      ws.EventReceiptComplete,
@@ -1058,6 +1066,95 @@ func (w *ReceiptWorker) processJob(job ReceiptJob) error {
 	})
 
 	return nil
+}
+
+func (w *ReceiptWorker) queueReceiptScanEnrichment(householdID, receiptID string) {
+	if w.enrichment == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	enabled, err := w.enrichment.AutoOnScanEnabled(ctx, householdID)
+	if err != nil {
+		slog.Warn("worker: enrichment auto-scan setting check failed", "receipt_id", receiptID, "err", err)
+		return
+	}
+	if !enabled {
+		return
+	}
+
+	const lookupExpr = `COALESCE(NULLIF(TRIM(p.upc), ''), NULLIF(TRIM(li.upc), ''))`
+	rows, err := w.db.QueryContext(ctx,
+		`SELECT DISTINCT li.product_id, `+lookupExpr+` AS lookup_upc
+		   FROM line_items li
+		   JOIN products p ON p.id = li.product_id
+		  WHERE li.receipt_id = ?
+		    AND p.household_id = ?
+		    AND `+lookupExpr+` IS NOT NULL`,
+		receiptID, householdID,
+	)
+	if err != nil {
+		slog.Warn("worker: enrichment auto-scan product query failed", "receipt_id", receiptID, "err", err)
+		return
+	}
+	defer rows.Close()
+
+	queued := 0
+	skippedExisting := 0
+	for rows.Next() {
+		var productID, rawUPC string
+		if err := rows.Scan(&productID, &rawUPC); err != nil {
+			slog.Warn("worker: enrichment auto-scan row scan failed", "receipt_id", receiptID, "err", err)
+			continue
+		}
+		normalizedUPC, err := upc.Normalize(rawUPC)
+		if err != nil || normalizedUPC == "" {
+			if err != nil {
+				slog.Debug("worker: enrichment auto-scan skipped invalid UPC", "receipt_id", receiptID, "product_id", productID, "upc", rawUPC, "err", err)
+			}
+			continue
+		}
+		lookupKey := "upc:" + normalizedUPC
+		if w.productHasSuccessfulExternalMetadata(ctx, productID, lookupKey) {
+			skippedExisting++
+			continue
+		}
+		_, created, err := w.enrichment.QueueJob(ctx, enrichmentrunner.QueueJobRequest{
+			HouseholdID: householdID,
+			ProductID:   productID,
+			Trigger:     enrichmentrunner.TriggerReceiptScan,
+			LookupKey:   lookupKey,
+		})
+		if err != nil {
+			slog.Warn("worker: enrichment auto-scan queue failed", "receipt_id", receiptID, "product_id", productID, "err", err)
+			continue
+		}
+		if created {
+			queued++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("worker: enrichment auto-scan rows failed", "receipt_id", receiptID, "err", err)
+	}
+	if queued > 0 || skippedExisting > 0 {
+		slog.Info("worker: enrichment auto-scan checked products", "receipt_id", receiptID, "queued", queued, "skipped_existing", skippedExisting)
+	}
+}
+
+func (w *ReceiptWorker) productHasSuccessfulExternalMetadata(ctx context.Context, productID, lookupKey string) bool {
+	var exists int
+	err := w.db.QueryRowContext(ctx,
+		`SELECT 1
+		   FROM product_external_metadata
+		  WHERE product_id = ?
+		    AND lookup_key = ?
+		    AND source IN ('openfoodfacts', 'usda_fdc')
+		    AND last_error IS NULL
+		  LIMIT 1`,
+		productID, lookupKey,
+	).Scan(&exists)
+	return err == nil
 }
 
 func packageContentForItem(item llm.ExtractedItem) (receiptline.PackageContent, float64, string, bool) {

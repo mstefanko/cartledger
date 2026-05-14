@@ -207,6 +207,9 @@ function EditableTable<TData>({
           const suggestedValue = meta.getSuggestedValue
             ? meta.getSuggestedValue(dataRowIndex)
             : null
+          const customDisplay = meta.displayRenderer
+            ? meta.displayRenderer(cell.getContext() as CellContext<TData, unknown>)
+            : undefined
           return (
             <td
               key={cell.id}
@@ -217,6 +220,7 @@ function EditableTable<TData>({
                 value={cellValue}
                 displayValue={displayValue}
                 suggestedValue={suggestedValue}
+                displayNode={customDisplay}
                 rowIndex={dataRowIndex}
                 columnId={cell.column.id}
                 isActive={isActive}

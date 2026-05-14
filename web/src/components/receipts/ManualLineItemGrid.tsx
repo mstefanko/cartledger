@@ -83,14 +83,11 @@ function ManualLineItemGrid({
         <span className="col-span-4 text-small font-medium text-neutral-400 uppercase tracking-wide">
           Item
         </span>
-        <span className="col-span-1 text-small font-medium text-neutral-400 uppercase tracking-wide">
-          Qty
+        <span className="col-span-3 text-small font-medium text-neutral-400 uppercase tracking-wide">
+          Purchased
         </span>
         <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
-          Unit
-        </span>
-        <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
-          Pack
+          Package Contents
         </span>
         <span className="col-span-2 text-small font-medium text-neutral-400 uppercase tracking-wide">
           Price
@@ -115,7 +112,7 @@ function ManualLineItemGrid({
             </div>
             <div className="col-span-3 sm:col-span-1">
               <Input
-                aria-label="Quantity"
+                aria-label="Purchased quantity"
                 inputMode="decimal"
                 placeholder="1"
                 value={row.quantity ?? ''}
@@ -125,7 +122,7 @@ function ManualLineItemGrid({
             </div>
             <div className="col-span-3 sm:col-span-2">
               <Input
-                aria-label="Unit"
+                aria-label="Purchased unit"
                 placeholder="ea"
                 value={row.unit ?? ''}
                 disabled={disabled}
@@ -134,7 +131,7 @@ function ManualLineItemGrid({
             </div>
             <div className="col-span-4 sm:col-span-2 grid grid-cols-2 gap-1">
               <Input
-                aria-label="Pack quantity"
+                aria-label="Package contents quantity"
                 inputMode="decimal"
                 placeholder="12"
                 value={row.pack_quantity_override ?? ''}
@@ -142,7 +139,7 @@ function ManualLineItemGrid({
                 onChange={(event) => updateRow(row._key, { pack_quantity_override: event.target.value })}
               />
               <Input
-                aria-label="Pack unit"
+                aria-label="Package contents unit"
                 placeholder="oz"
                 value={row.pack_unit_override ?? ''}
                 disabled={disabled}

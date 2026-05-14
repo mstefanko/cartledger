@@ -27,8 +27,8 @@ function MemberRow({ member, isBestDeal, onRemove, removing }: {
   const basis = member.price_basis === 'normalized'
     ? 'Comparable'
     : member.price_basis === 'missing_package'
-      ? 'Needs package'
-      : 'Raw'
+      ? 'Needs contents'
+      : 'Receipt price'
   return (
     <tr className={`border-b border-neutral-200 last:border-0 ${isBestDeal ? 'bg-success-subtle/30' : ''}`}>
       <td className="py-2.5 text-body-medium text-neutral-900">
@@ -315,7 +315,7 @@ function ProductGroupPage() {
       {group.units_mixed && (
         <div className="mb-4 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl">
           <p className="text-body text-amber-800">
-            <strong>Mixed units detected.</strong> Members of this group have different pack units, so price-per-unit comparisons may not be accurate. Set a comparison unit and ensure all members have matching pack units for reliable comparisons.
+            <strong>Mixed package units detected.</strong> Members of this group have different package contents units, so compared prices may not be accurate. Set a comparison unit and review each product's package contents.
           </p>
         </div>
       )}
@@ -336,10 +336,10 @@ function ProductGroupPage() {
                   <th className="pb-2 text-small font-medium text-neutral-400">Product</th>
                   <th className="pb-2 text-small font-medium text-neutral-400">Brand</th>
                   <th className="pb-2 text-small font-medium text-neutral-400">Store</th>
-                  <th className="pb-2 text-small font-medium text-neutral-400">Pack Size</th>
+                  <th className="pb-2 text-small font-medium text-neutral-400">Package Contents</th>
                   <th className="pb-2 text-small font-medium text-neutral-400 text-right">Price</th>
                   <th className="pb-2 text-small font-medium text-neutral-400 text-right">
-                    Per {group.comparison_unit ?? 'Unit'}
+                    Compared Price
                   </th>
                   <th className="pb-2 text-small font-medium text-neutral-400 text-right">Last Purchased</th>
                   <th className="pb-2 text-small font-medium text-neutral-400 text-right"></th>
