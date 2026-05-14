@@ -52,7 +52,12 @@ type Metrics struct {
 	httpRequestDuration *prometheus.HistogramVec
 
 	// Worker queue depth (gauge; sampled periodically).
-	workerQueueDepth prometheus.Gauge
+	workerQueueDepth                 prometheus.Gauge
+	enrichmentQueueDepth             *prometheus.GaugeVec
+	enrichmentJobsQueuedTotal        *prometheus.CounterVec
+	enrichmentJobsFinishedTotal      *prometheus.CounterVec
+	enrichmentProviderLatencySeconds *prometheus.HistogramVec
+	enrichmentProviderRequestsTotal  *prometheus.CounterVec
 
 	// LLM token consumption (counter; labeled by provider/model/type).
 	llmTokensTotal *prometheus.CounterVec
@@ -140,6 +145,42 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 			Help: "Number of receipt jobs currently queued in the worker pool.",
 		},
 	)
+	m.enrichmentQueueDepth = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cartledger_enrichment_queue_depth",
+			Help: "Product enrichment job rows by status.",
+		},
+		[]string{"status"},
+	)
+	m.enrichmentJobsQueuedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cartledger_enrichment_jobs_queued_total",
+			Help: "Product enrichment jobs queued by trigger.",
+		},
+		[]string{"trigger"},
+	)
+	m.enrichmentJobsFinishedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cartledger_enrichment_jobs_finished_total",
+			Help: "Product enrichment jobs finished by trigger, terminal status, and provider.",
+		},
+		[]string{"trigger", "status", "provider"},
+	)
+	m.enrichmentProviderLatencySeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "cartledger_enrichment_provider_latency_seconds",
+			Help:    "External product enrichment provider lookup latency in seconds.",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30},
+		},
+		[]string{"provider"},
+	)
+	m.enrichmentProviderRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cartledger_enrichment_provider_requests_total",
+			Help: "External product enrichment provider requests by provider and status class.",
+		},
+		[]string{"provider", "http_status"},
+	)
 	m.llmTokensTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "cartledger_llm_tokens_total",
@@ -200,6 +241,11 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 		m.httpRequestsTotal,
 		m.httpRequestDuration,
 		m.workerQueueDepth,
+		m.enrichmentQueueDepth,
+		m.enrichmentJobsQueuedTotal,
+		m.enrichmentJobsFinishedTotal,
+		m.enrichmentProviderLatencySeconds,
+		m.enrichmentProviderRequestsTotal,
 		m.llmTokensTotal,
 		m.preprocessFallbacksTotal,
 		m.storageBytes,
@@ -226,6 +272,10 @@ func NewMetrics(cfg MetricsConfig) (*Metrics, error) {
 	if cfg.Worker != nil {
 		m.wg.Add(1)
 		go m.sampleQueueDepth(cfg.Worker, queueInterval)
+	}
+	if cfg.Database != nil {
+		m.wg.Add(1)
+		go m.sampleEnrichmentQueueDepth(cfg.Database, queueInterval)
 	}
 	if cfg.DataDir != "" {
 		m.wg.Add(1)
@@ -316,6 +366,58 @@ func (m *Metrics) RecordLLMTokens(provider, model string, inputTokens, outputTok
 	}
 }
 
+func (m *Metrics) RecordEnrichmentJobQueued(trigger string) {
+	if m == nil {
+		return
+	}
+	if trigger == "" {
+		trigger = "unknown"
+	}
+	m.enrichmentJobsQueuedTotal.WithLabelValues(trigger).Inc()
+}
+
+func (m *Metrics) RecordEnrichmentJobFinished(trigger, status, provider string) {
+	if m == nil {
+		return
+	}
+	if trigger == "" {
+		trigger = "unknown"
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	if provider == "" {
+		provider = "none"
+	}
+	m.enrichmentJobsFinishedTotal.WithLabelValues(trigger, status, provider).Inc()
+}
+
+func (m *Metrics) RecordEnrichmentProviderRequest(provider, httpStatus string) {
+	if m == nil {
+		return
+	}
+	if provider == "" {
+		provider = "unknown"
+	}
+	if httpStatus == "" {
+		httpStatus = "unknown"
+	}
+	m.enrichmentProviderRequestsTotal.WithLabelValues(provider, httpStatus).Inc()
+}
+
+func (m *Metrics) ObserveEnrichmentProviderLatency(provider string, seconds float64) {
+	if m == nil {
+		return
+	}
+	if provider == "" {
+		provider = "unknown"
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.enrichmentProviderLatencySeconds.WithLabelValues(provider).Observe(seconds)
+}
+
 // RecordPreprocessFallback is called by imaging.PreprocessReceipt when the
 // fallback path fires (e.g. decode error). Safe for nil receiver.
 func (m *Metrics) RecordPreprocessFallback(reason string) {
@@ -383,6 +485,47 @@ func (m *Metrics) sampleQueueDepth(w QueueDepthReporter, interval time.Duration)
 		select {
 		case <-t.C:
 			m.workerQueueDepth.Set(float64(w.QueueDepth()))
+		case <-m.stop:
+			return
+		}
+	}
+}
+
+func (m *Metrics) sampleEnrichmentQueueDepth(database *sql.DB, interval time.Duration) {
+	defer m.wg.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	sample := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		rows, err := database.QueryContext(ctx,
+			`SELECT status, COUNT(*)
+			   FROM product_enrichment_jobs
+			  WHERE status IN ('queued', 'running')
+			  GROUP BY status`,
+		)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		counts := map[string]float64{"queued": 0, "running": 0}
+		for rows.Next() {
+			var status string
+			var count int
+			if err := rows.Scan(&status, &count); err != nil {
+				return
+			}
+			counts[status] = float64(count)
+		}
+		for status, count := range counts {
+			m.enrichmentQueueDepth.WithLabelValues(status).Set(count)
+		}
+	}
+	sample()
+	for {
+		select {
+		case <-t.C:
+			sample()
 		case <-m.stop:
 			return
 		}

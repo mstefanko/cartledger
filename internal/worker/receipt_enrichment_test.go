@@ -54,7 +54,7 @@ func TestQueueReceiptScanEnrichmentQueuesUPCLookupsWhenEnabled(t *testing.T) {
 		t.Fatalf("insert enrichment settings: %v", err)
 	}
 
-	service := enrichmentrunner.NewService(database, &config.Config{ProductEnrichmentEnabled: true}, nil)
+	service := enrichmentrunner.NewService(database, &config.Config{ProductEnrichmentEnabled: true, ProductEnrichmentAutoOnScan: true}, nil)
 	w := &ReceiptWorker{db: database, enrichment: service}
 	w.queueReceiptScanEnrichment(householdID, receiptID)
 
@@ -119,7 +119,7 @@ func TestQueueReceiptScanEnrichmentSkipsWhenAutoDisabled(t *testing.T) {
 		t.Fatalf("insert line item: %v", err)
 	}
 
-	service := enrichmentrunner.NewService(database, &config.Config{ProductEnrichmentEnabled: true}, nil)
+	service := enrichmentrunner.NewService(database, &config.Config{ProductEnrichmentEnabled: true, ProductEnrichmentAutoOnScan: true}, nil)
 	w := &ReceiptWorker{db: database, enrichment: service}
 	w.queueReceiptScanEnrichment(householdID, receiptID)
 

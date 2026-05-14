@@ -110,7 +110,7 @@ function ProductsPage() {
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [brandFilter, setBrandFilter] = useState('')
-  const [missingFilter, setMissingFilter] = useState<'' | 'missing_brand' | 'missing_pack' | 'missing_upc'>('')
+  const [metadataFilter, setMetadataFilter] = useState<'' | 'missing_metadata' | 'failed_lookups'>('')
   const [selection, setSelection] = useState<Set<string>>(new Set())
   const [groupModalOpen, setGroupModalOpen] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -130,8 +130,11 @@ function ProductsPage() {
   }, [searchTerm])
 
   const { data: products, isLoading } = useQuery({
-    queryKey: ['products', debouncedSearch],
-    queryFn: () => listProducts(debouncedSearch ? { search: debouncedSearch } : undefined),
+    queryKey: ['products', debouncedSearch, metadataFilter],
+    queryFn: () => listProducts({
+      ...(debouncedSearch ? { search: debouncedSearch } : {}),
+      ...(metadataFilter ? { filter: metadataFilter } : {}),
+    }),
   })
 
   const { data: productsWithTrends } = useQuery({
@@ -206,16 +209,13 @@ function ProductsPage() {
     return products
       .filter((p) => {
         if (brandFilter && p.brand !== brandFilter) return false
-        if (missingFilter === 'missing_brand' && p.brand) return false
-        if (missingFilter === 'missing_pack' && p.pack_quantity != null) return false
-        if (missingFilter === 'missing_upc' && p.upc) return false
         return true
       })
       .map((p) => ({
         ...p,
         trend: trendMap.get(p.id) ?? null,
       }))
-  }, [products, trendMap, brandFilter, missingFilter])
+  }, [products, trendMap, brandFilter])
 
   const handleCellUpdate = useCallback(
     (rowIndex: number, columnId: string, value: string) => {
@@ -443,14 +443,13 @@ function ProductsPage() {
             ))}
           </select>
           <select
-            value={missingFilter}
-            onChange={(e) => setMissingFilter(e.target.value as '' | 'missing_brand' | 'missing_pack' | 'missing_upc')}
+            value={metadataFilter}
+            onChange={(e) => setMetadataFilter(e.target.value as '' | 'missing_metadata' | 'failed_lookups')}
             className="px-3 py-2 text-body border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-brand"
           >
             <option value="">All products</option>
-            <option value="missing_brand">Missing brand</option>
-            <option value="missing_upc">Missing UPC</option>
-            <option value="missing_pack">Missing pack size</option>
+            <option value="missing_metadata">Missing metadata</option>
+            <option value="failed_lookups">Failed lookups</option>
           </select>
           {debouncedSearch && !isLoading && (
             <span className="text-caption text-neutral-400">

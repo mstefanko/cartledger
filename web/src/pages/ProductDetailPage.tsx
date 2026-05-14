@@ -1,8 +1,9 @@
-import { useState, useRef, useCallback, useMemo, useEffect, type ReactNode } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect, lazy, Suspense, type ReactNode } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Check,
+  Camera,
   ExternalLink,
   Flame,
   Link2,
@@ -58,6 +59,12 @@ import type {
   ProductExternalMetadata,
   ProductMetadataNutrients,
 } from '@/types'
+
+const BarcodeScannerModal = lazy(() =>
+  import('@/components/receipts/BarcodeScannerModal').then((module) => ({
+    default: module.BarcodeScannerModal,
+  })),
+)
 
 // --- Helper ---
 
@@ -270,6 +277,7 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
   const [confirmMode, setConfirmMode] = useState<'save' | 'recompute' | null>(null)
   const [affectedCount, setAffectedCount] = useState<number | null>(null)
   const [showPriceBasis, setShowPriceBasis] = useState(false)
+  const [scannerOpen, setScannerOpen] = useState(false)
 
   const updateMutation = useMutation({
     mutationFn: (data: { brand?: string; upc?: string | null; pack_quantity?: number; pack_unit?: string }) =>
@@ -450,17 +458,26 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
           </ProductInfoRow>
 
           <ProductInfoRow label="UPC" hint="Lookup required before save">
-            <div className="max-w-lg">
+            <div className="flex max-w-lg gap-2">
               <input
                 type="text"
                 value={upc}
                 onChange={(e) => setUpc(e.target.value)}
                 placeholder="Barcode"
                 inputMode="numeric"
-                className="w-full rounded-xl border border-neutral-200 px-3 py-2 text-caption focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand"
+                className="min-w-0 flex-1 rounded-xl border border-neutral-200 px-3 py-2 text-caption focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand"
                 onBlur={handleSaveUPC}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleSaveUPC() }}
               />
+              <button
+                type="button"
+                className="inline-flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl border border-neutral-200 text-neutral-500 transition-colors hover:bg-brand-subtle hover:text-brand"
+                onClick={() => setScannerOpen(true)}
+                title="Scan UPC"
+                aria-label="Scan UPC"
+              >
+                <Camera className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
             <div className="mt-2 flex flex-wrap gap-2">
               <Button
@@ -600,6 +617,21 @@ function ProductInfoSection({ detail, productId }: { detail: ProductDetail; prod
           </ProductInfoRow>
         </div>
       </ProductCard>
+
+      {scannerOpen && (
+        <Suspense fallback={null}>
+          <BarcodeScannerModal
+            open={scannerOpen}
+            mode="fill"
+            title="Scan UPC"
+            initialValue={upc}
+            onClose={() => setScannerOpen(false)}
+            onFill={(value) => {
+              setUpc(value)
+            }}
+          />
+        </Suspense>
+      )}
 
       <Modal
         open={confirmMode !== null}

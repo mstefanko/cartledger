@@ -208,6 +208,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if cc, ok := llmClient.(*llm.ClaudeClient); ok {
 		cc.SetMetrics(metrics)
 	}
+	enrichmentService.SetMetrics(metrics)
 	imaging.SetFallbackRecorder(metrics)
 
 	// Image retention janitor (2.5). Only started when
@@ -268,6 +269,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		retentionJanitor.Start(ctx)
 		defer retentionJanitor.Stop()
 	}
+	enrichmentService.Start(ctx)
 
 	authJanitor := db.NewJanitor(database, time.Hour, slog.Default())
 	authJanitor.Start(ctx)

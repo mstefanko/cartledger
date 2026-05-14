@@ -392,7 +392,7 @@ func (h *ProductHandler) CreateEnrichmentJob(c echo.Context) error {
 	if service == nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "product enrichment worker is unavailable"})
 	}
-	job, _, err := service.QueueJob(ctx, runner.QueueJobRequest{
+	result, err := service.QueueForProduct(ctx, runner.QueueForProductRequest{
 		HouseholdID:       householdID,
 		ProductID:         productID,
 		RequestedByUserID: auth.UserIDFrom(c),
@@ -403,7 +403,10 @@ func (h *ProductHandler) CreateEnrichmentJob(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	return c.JSON(http.StatusAccepted, productEnrichmentJobResponse{Job: job})
+	if result.SkippedReason != "" {
+		return c.JSON(http.StatusConflict, map[string]string{"error": "lookup skipped", "reason": result.SkippedReason})
+	}
+	return c.JSON(http.StatusAccepted, productEnrichmentJobResponse{Job: result.Job})
 }
 
 func (h *ProductHandler) ListEnrichmentJobs(c echo.Context) error {
@@ -456,17 +459,20 @@ func (h *ProductHandler) EnrichByUPC(c echo.Context) error {
 	if service == nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "product enrichment worker is unavailable"})
 	}
-	job, _, err := service.QueueJob(ctx, runner.QueueJobRequest{
+	result, err := service.QueueForProduct(ctx, runner.QueueForProductRequest{
 		HouseholdID:       householdID,
 		ProductID:         productID,
 		RequestedByUserID: auth.UserIDFrom(c),
 		Trigger:           runner.TriggerManualLookup,
-		LookupKey:         "upc:" + upc,
+		UPC:               upc,
 	})
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 	}
-	return c.JSON(http.StatusAccepted, productEnrichmentJobResponse{Job: job})
+	if result.SkippedReason != "" {
+		return c.JSON(http.StatusConflict, map[string]string{"error": "lookup skipped", "reason": result.SkippedReason})
+	}
+	return c.JSON(http.StatusAccepted, productEnrichmentJobResponse{Job: result.Job})
 }
 
 func (h *ProductHandler) AcceptEnrichmentSuggestion(c echo.Context) error {

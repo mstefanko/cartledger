@@ -18,15 +18,17 @@ import (
 	estore "github.com/mstefanko/cartledger/internal/enrichment/store"
 	"github.com/mstefanko/cartledger/internal/models"
 	"github.com/mstefanko/cartledger/internal/sqliteutil"
+	"github.com/mstefanko/cartledger/internal/upc"
 	"github.com/mstefanko/cartledger/internal/ws"
 )
 
 const (
-	TriggerReceiptScan   = "receipt_scan"
-	TriggerManualLookup  = "manual_lookup"
-	TriggerManualRefresh = "manual_refresh"
-	TriggerScheduled     = "scheduled_refresh"
-	TriggerBatchBackfill = "batch_backfill"
+	TriggerReceiptScan       = "receipt_scan"
+	TriggerReceiptReviewScan = "receipt_review_scan"
+	TriggerManualLookup      = "manual_lookup"
+	TriggerManualRefresh     = "manual_refresh"
+	TriggerScheduled         = "scheduled_refresh"
+	TriggerBatchBackfill     = "batch_backfill"
 
 	StatusQueued    = "queued"
 	StatusRunning   = "running"
@@ -44,6 +46,7 @@ type Service struct {
 	Store     estore.Repository
 	Limiter   *ProviderLimiter
 	Worker    *Worker
+	Metrics   MetricsRecorder
 	Log       *slog.Logger
 }
 
@@ -54,16 +57,43 @@ type Broadcaster interface {
 type QueueJobRequest struct {
 	HouseholdID       string
 	ProductID         string
+	ReceiptID         string
 	RequestedByUserID string
 	Trigger           string
 	LookupKey         string
 	RequestedSources  []string
 }
 
+type QueueForProductRequest struct {
+	HouseholdID       string
+	ProductID         string
+	ReceiptID         string
+	RequestedByUserID string
+	Trigger           string
+	LookupKey         string
+	UPC               string
+	URL               string
+	RequestedSources  []string
+}
+
+type QueueForProductResult struct {
+	Job           Job
+	Queued        bool
+	SkippedReason string
+}
+
+type MetricsRecorder interface {
+	RecordEnrichmentJobQueued(trigger string)
+	RecordEnrichmentJobFinished(trigger, status, provider string)
+	RecordEnrichmentProviderRequest(provider, httpStatus string)
+	ObserveEnrichmentProviderLatency(provider string, seconds float64)
+}
+
 type Job struct {
 	ID                string     `json:"id"`
 	HouseholdID       string     `json:"household_id,omitempty"`
 	ProductID         string     `json:"product_id"`
+	ReceiptID         *string    `json:"receipt_id,omitempty"`
 	RequestedByUserID *string    `json:"requested_by_user_id,omitempty"`
 	Trigger           string     `json:"trigger"`
 	LookupKey         string     `json:"lookup_key"`
@@ -128,6 +158,111 @@ func (s *Service) SetWorker(worker *Worker) {
 	s.Worker = worker
 }
 
+func (s *Service) SetMetrics(metrics MetricsRecorder) {
+	s.Metrics = metrics
+}
+
+func (s *Service) QueueForProduct(ctx context.Context, req QueueForProductRequest) (QueueForProductResult, error) {
+	jobReq, skipped, err := s.PrepareQueueForProduct(ctx, req)
+	if err != nil || skipped != "" {
+		return QueueForProductResult{SkippedReason: skipped}, err
+	}
+	job, queued, err := s.QueueJob(ctx, jobReq)
+	return QueueForProductResult{Job: job, Queued: queued}, err
+}
+
+func (s *Service) PrepareQueueForProduct(ctx context.Context, req QueueForProductRequest) (QueueJobRequest, string, error) {
+	trigger := strings.TrimSpace(req.Trigger)
+	if trigger == "" {
+		trigger = TriggerManualLookup
+	}
+	lookupKey := strings.TrimSpace(req.LookupKey)
+	switch {
+	case lookupKey != "":
+	case strings.TrimSpace(req.URL) != "":
+		lookupKey = "url:" + strings.TrimSpace(req.URL)
+	default:
+		rawUPC := strings.TrimSpace(req.UPC)
+		if rawUPC == "" {
+			product, err := s.loadProduct(ctx, req.HouseholdID, req.ProductID)
+			if err != nil {
+				return QueueJobRequest{}, "", err
+			}
+			if product.UPC != nil {
+				rawUPC = *product.UPC
+			}
+		}
+		normalized, err := normalizeLookupUPC(rawUPC)
+		if err != nil {
+			return QueueJobRequest{}, "", err
+		}
+		if normalized != "" {
+			lookupKey = "upc:" + normalized
+		}
+	}
+	if lookupKey == "" {
+		return QueueJobRequest{}, "", errors.New("lookup key is required")
+	}
+
+	settings, err := s.loadSettings(ctx, req.HouseholdID)
+	if err != nil {
+		return QueueJobRequest{}, "", err
+	}
+	if !s.globalEnabled() {
+		return QueueJobRequest{}, "env_disabled", nil
+	}
+	if isManualTrigger(trigger) && !settings.ManualLookupEnabled {
+		return QueueJobRequest{}, "household_manual_lookup_disabled", nil
+	}
+	if trigger == TriggerReceiptScan && s.Cfg != nil && !s.Cfg.ProductEnrichmentAutoOnScan {
+		return QueueJobRequest{}, "global_auto_on_scan_disabled", nil
+	}
+	if trigger == TriggerReceiptScan && !settings.AutoOnScanEnabled {
+		return QueueJobRequest{}, "household_auto_on_scan_disabled", nil
+	}
+	if (trigger == TriggerScheduled || trigger == TriggerBatchBackfill) && !settings.ScheduledSweepEnabled {
+		return QueueJobRequest{}, "household_scheduled_sweep_disabled", nil
+	}
+
+	product, err := s.loadProduct(ctx, req.HouseholdID, req.ProductID)
+	if err != nil {
+		return QueueJobRequest{}, "", err
+	}
+	input := providers.LookupInput{
+		HouseholdID:  req.HouseholdID,
+		ProductID:    req.ProductID,
+		ProductName:  product.Name,
+		Brand:        product.Brand,
+		UPC:          product.UPC,
+		LookupKey:    lookupKey,
+		AllowPrivate: s.Cfg != nil && s.Cfg.AllowPrivateIntegrations,
+	}
+	if key, ok := strings.CutPrefix(lookupKey, "upc:"); ok && key != "" {
+		input.UPC = &key
+	}
+	if rawURL, ok := strings.CutPrefix(lookupKey, "url:"); ok && rawURL != "" {
+		input.URL = &rawURL
+	}
+	input.USDAAPIKey, _ = s.usdaAPIKey(ctx, req.HouseholdID)
+	selected, _, _ := s.providerPlan(Job{
+		Trigger:          trigger,
+		RequestedSources: req.RequestedSources,
+	}, settings, input)
+	if len(selected) == 0 {
+		return QueueJobRequest{}, "no_provider_configured", nil
+	}
+
+	return QueueJobRequest{
+		HouseholdID:       req.HouseholdID,
+		ProductID:         req.ProductID,
+		ReceiptID:         req.ReceiptID,
+		RequestedByUserID: req.RequestedByUserID,
+		Trigger:           trigger,
+		LookupKey:         lookupKey,
+		RequestedSources:  req.RequestedSources,
+	}, "", nil
+}
+
 func (s *Service) QueueJob(ctx context.Context, req QueueJobRequest) (Job, bool, error) {
 	if strings.TrimSpace(req.Trigger) == "" {
 		req.Trigger = TriggerManualLookup
@@ -174,10 +309,10 @@ func (s *Service) QueueJob(ctx context.Context, req QueueJobRequest) (Job, bool,
 	var id string
 	err = s.DB.QueryRowContext(ctx,
 		`INSERT INTO product_enrichment_jobs
-		    (id, household_id, product_id, requested_by_user_id, trigger, lookup_key, requested_sources, status, queued_at, updated_at)
-		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		    (id, household_id, product_id, receipt_id, requested_by_user_id, trigger, lookup_key, requested_sources, status, queued_at, updated_at)
+		 VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, 'queued', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		 RETURNING id`,
-		req.HouseholdID, req.ProductID, nullableUserID(req.RequestedByUserID), req.Trigger, req.LookupKey, nullableString(sourceJSON),
+		req.HouseholdID, req.ProductID, nullableString(req.ReceiptID), nullableUserID(req.RequestedByUserID), req.Trigger, req.LookupKey, nullableString(sourceJSON),
 	).Scan(&id)
 	if err != nil {
 		if sqliteutil.IsUniqueConstraint(err) {
@@ -196,6 +331,9 @@ func (s *Service) QueueJob(ctx context.Context, req QueueJobRequest) (Job, bool,
 	if s.Worker != nil {
 		_ = s.Worker.Submit(job.ID)
 	}
+	if s.Metrics != nil {
+		s.Metrics.RecordEnrichmentJobQueued(job.Trigger)
+	}
 	return job, true, nil
 }
 
@@ -204,7 +342,7 @@ func (s *Service) ListJobs(ctx context.Context, householdID, productID string, l
 		limit = 20
 	}
 	rows, err := s.DB.QueryContext(ctx,
-		`SELECT id, household_id, product_id, requested_by_user_id, trigger, lookup_key,
+		`SELECT id, household_id, product_id, receipt_id, requested_by_user_id, trigger, lookup_key,
 		        requested_sources, status, attempt_count, next_attempt_at, last_error,
 		        queued_at, started_at, finished_at, updated_at
 		   FROM product_enrichment_jobs
@@ -230,7 +368,7 @@ func (s *Service) ListJobs(ctx context.Context, householdID, productID string, l
 
 func (s *Service) GetJob(ctx context.Context, householdID, productID, jobID string) (Job, error) {
 	return scanJob(s.DB.QueryRowContext(ctx,
-		`SELECT id, household_id, product_id, requested_by_user_id, trigger, lookup_key,
+		`SELECT id, household_id, product_id, receipt_id, requested_by_user_id, trigger, lookup_key,
 		        requested_sources, status, attempt_count, next_attempt_at, last_error,
 		        queued_at, started_at, finished_at, updated_at
 		   FROM product_enrichment_jobs
@@ -268,6 +406,11 @@ func (s *Service) ProcessJob(ctx context.Context, jobID string) error {
 	}
 	if isManualTrigger(job.Trigger) && !settings.ManualLookupEnabled {
 		msg := "manual enrichment lookup is disabled"
+		s.finishJob(ctx, job, StatusFailed, map[string]string{}, msg, 0)
+		return errors.New(msg)
+	}
+	if job.Trigger == TriggerReceiptScan && s.Cfg != nil && !s.Cfg.ProductEnrichmentAutoOnScan {
+		msg := "automatic enrichment lookup on scan is disabled by server configuration"
 		s.finishJob(ctx, job, StatusFailed, map[string]string{}, msg, 0)
 		return errors.New(msg)
 	}
@@ -324,9 +467,16 @@ func (s *Service) ProcessJob(ctx context.Context, jobID string) error {
 			}
 		}
 		lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		started := time.Now()
 		metadata, err := provider.Lookup(lookupCtx, input)
+		if s.Metrics != nil {
+			s.Metrics.ObserveEnrichmentProviderLatency(name, time.Since(started).Seconds())
+		}
 		cancel()
 		if err != nil {
+			if s.Metrics != nil {
+				s.Metrics.RecordEnrichmentProviderRequest(name, "error")
+			}
 			if isRateLimitError(err) {
 				rateLimited = true
 				nextAttempt = retryAt(job.AttemptCount)
@@ -338,6 +488,13 @@ func (s *Service) ProcessJob(ctx context.Context, jobID string) error {
 		providerStatus[name] = "succeeded"
 		successes++
 		for _, item := range metadata {
+			if s.Metrics != nil {
+				statusLabel := "unknown"
+				if item.HTTPStatus > 0 {
+					statusLabel = httpStatusClass(item.HTTPStatus)
+				}
+				s.Metrics.RecordEnrichmentProviderRequest(name, statusLabel)
+			}
 			count, err := s.storeMetadataResult(ctx, job, item)
 			if err != nil {
 				providerStatus[name] = "failed"
@@ -491,11 +648,15 @@ func (s *Service) finishJob(ctx context.Context, job Job, status string, provide
 	if strings.TrimSpace(errMsg) != "" {
 		lastError = errMsg
 	}
+	var nextAttempt interface{}
+	if status == StatusFailed {
+		nextAttempt = time.Now().UTC().Add(7 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	}
 	if _, err := s.DB.ExecContext(ctx,
 		`UPDATE product_enrichment_jobs
-		    SET status = ?, last_error = ?, finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		    SET status = ?, last_error = ?, next_attempt_at = ?, finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
 		  WHERE id = ? AND household_id = ? AND product_id = ?`,
-		status, lastError, job.ID, job.HouseholdID, job.ProductID,
+		status, lastError, nextAttempt, job.ID, job.HouseholdID, job.ProductID,
 	); err != nil && s.Log != nil {
 		s.Log.Warn("enrichment: failed to finish job", "job_id", job.ID, "err", err)
 	}
@@ -503,7 +664,15 @@ func (s *Service) finishJob(ctx context.Context, job Job, status string, provide
 		s.broadcastProductUpdated(job.HouseholdID, job.ProductID)
 	}
 	if isTerminalStatus(status) {
-		s.broadcastJobUpdated(job.HouseholdID, job.ProductID, job.ID, status, providerStatus, errMsg)
+		if s.Metrics != nil {
+			if len(providerStatus) == 0 {
+				s.Metrics.RecordEnrichmentJobFinished(job.Trigger, status, "")
+			}
+			for provider := range providerStatus {
+				s.Metrics.RecordEnrichmentJobFinished(job.Trigger, status, provider)
+			}
+		}
+		s.broadcastJobUpdated(job.HouseholdID, job.ProductID, job.ID, job.ReceiptID, status, providerStatus, errMsg)
 	}
 }
 
@@ -579,7 +748,7 @@ func (s *Service) AutoOnScanEnabled(ctx context.Context, householdID string) (bo
 	if err != nil {
 		return false, err
 	}
-	return s.globalEnabled() && settings.AutoOnScanEnabled, nil
+	return s.globalEnabled() && (s.Cfg == nil || s.Cfg.ProductEnrichmentAutoOnScan) && settings.AutoOnScanEnabled, nil
 }
 
 func (s *Service) usdaAPIKey(ctx context.Context, householdID string) (string, string) {
@@ -603,7 +772,7 @@ func (s *Service) globalEnabled() bool {
 
 func (s *Service) getJobByID(ctx context.Context, jobID string) (Job, error) {
 	return scanJob(s.DB.QueryRowContext(ctx,
-		`SELECT id, household_id, product_id, requested_by_user_id, trigger, lookup_key,
+		`SELECT id, household_id, product_id, receipt_id, requested_by_user_id, trigger, lookup_key,
 		        requested_sources, status, attempt_count, next_attempt_at, last_error,
 		        queued_at, started_at, finished_at, updated_at
 		   FROM product_enrichment_jobs
@@ -614,7 +783,7 @@ func (s *Service) getJobByID(ctx context.Context, jobID string) (Job, error) {
 
 func (s *Service) findActiveJob(ctx context.Context, householdID, productID, trigger, lookupKey string) (Job, error) {
 	return scanJob(s.DB.QueryRowContext(ctx,
-		`SELECT id, household_id, product_id, requested_by_user_id, trigger, lookup_key,
+		`SELECT id, household_id, product_id, receipt_id, requested_by_user_id, trigger, lookup_key,
 		        requested_sources, status, attempt_count, next_attempt_at, last_error,
 		        queued_at, started_at, finished_at, updated_at
 		   FROM product_enrichment_jobs
@@ -632,14 +801,17 @@ type scanner interface {
 
 func scanJob(row scanner) (Job, error) {
 	var job Job
-	var userID, requestedSources, lastError sql.NullString
+	var receiptID, userID, requestedSources, lastError sql.NullString
 	var nextAttempt, startedAt, finishedAt sql.NullTime
 	if err := row.Scan(
-		&job.ID, &job.HouseholdID, &job.ProductID, &userID, &job.Trigger, &job.LookupKey,
+		&job.ID, &job.HouseholdID, &job.ProductID, &receiptID, &userID, &job.Trigger, &job.LookupKey,
 		&requestedSources, &job.Status, &job.AttemptCount, &nextAttempt, &lastError,
 		&job.QueuedAt, &startedAt, &finishedAt, &job.UpdatedAt,
 	); err != nil {
 		return job, err
+	}
+	if receiptID.Valid {
+		job.ReceiptID = &receiptID.String
 	}
 	if userID.Valid {
 		job.RequestedByUserID = &userID.String
@@ -703,7 +875,7 @@ func min(a, b int) int {
 }
 
 func isManualTrigger(trigger string) bool {
-	return trigger == TriggerManualLookup || trigger == TriggerManualRefresh
+	return trigger == TriggerManualLookup || trigger == TriggerManualRefresh || trigger == TriggerReceiptReviewScan
 }
 
 func isTerminalStatus(status string) bool {
@@ -721,6 +893,21 @@ func isRateLimitError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "rate limit") || strings.Contains(msg, "rate limited") || strings.Contains(msg, "429")
+}
+
+func normalizeLookupUPC(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	return upc.Normalize(raw)
+}
+
+func httpStatusClass(status int) string {
+	if status < 100 {
+		return "unknown"
+	}
+	return string(rune('0'+status/100)) + "xx"
 }
 
 func sourceLabelPtr(source string) *string {
@@ -787,7 +974,7 @@ func (s *Service) broadcastProductUpdated(householdID, productID string) {
 	})
 }
 
-func (s *Service) broadcastJobUpdated(householdID, productID, jobID, status string, providerStatus map[string]string, errMsg string) {
+func (s *Service) broadcastJobUpdated(householdID, productID, jobID string, receiptID *string, status string, providerStatus map[string]string, errMsg string) {
 	if s.Hub == nil {
 		return
 	}
@@ -795,15 +982,19 @@ func (s *Service) broadcastJobUpdated(householdID, productID, jobID, status stri
 	if strings.TrimSpace(errMsg) != "" {
 		errValue = errMsg
 	}
+	payload := map[string]interface{}{
+		"product_id":      productID,
+		"job_id":          jobID,
+		"status":          status,
+		"provider_status": providerStatus,
+		"error":           errValue,
+	}
+	if receiptID != nil && strings.TrimSpace(*receiptID) != "" {
+		payload["receipt_id"] = strings.TrimSpace(*receiptID)
+	}
 	s.Hub.Broadcast(ws.Message{
 		Type:      ws.EventProductEnrichmentJobUpdated,
 		Household: householdID,
-		Payload: map[string]interface{}{
-			"product_id":      productID,
-			"job_id":          jobID,
-			"status":          status,
-			"provider_status": providerStatus,
-			"error":           errValue,
-		},
+		Payload:   payload,
 	})
 }

@@ -16,12 +16,13 @@ import (
 type AliasSource string
 
 const (
-	AliasSourceLegacy       AliasSource = "legacy"
-	AliasSourceReceiptMatch AliasSource = "receipt_match"
-	AliasSourceManualMatch  AliasSource = "manual_match"
-	AliasSourceUserAlias    AliasSource = "user_alias"
-	AliasSourceImport       AliasSource = "import"
-	AliasSourceEnrichment   AliasSource = "enrichment"
+	AliasSourceLegacy            AliasSource = "legacy"
+	AliasSourceReceiptMatch      AliasSource = "receipt_match"
+	AliasSourceManualMatch       AliasSource = "manual_match"
+	AliasSourceUserAlias         AliasSource = "user_alias"
+	AliasSourceImport            AliasSource = "import"
+	AliasSourceEnrichment        AliasSource = "enrichment"
+	AliasSourceReceiptReviewScan AliasSource = "receipt_review_scan"
 )
 
 var ErrAliasConflict = errors.New("alias already belongs to another product")

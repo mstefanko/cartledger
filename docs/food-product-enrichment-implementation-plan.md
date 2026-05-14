@@ -149,6 +149,11 @@ Existing pieces to keep and extend:
   metadata.
 - `ProductDetailPage` already exposes brand, UPC lookup, package size editing,
   source links, suggestions, and accepted nutrition.
+- `internal/api/product_enrichment_settings.go` and
+  `web/src/components/settings/IntegrationsTab.tsx` already expose the
+  household enrichment settings surface; Phase 3 should evolve labels,
+  availability messaging, and scheduled/automatic behavior rather than adding a
+  second settings API.
 - `Settings -> Integrations` already has a credential-storage pattern for
   household-scoped integrations.
 
@@ -509,7 +514,8 @@ CREATE TABLE product_enrichment_jobs (
         'manual_lookup',
         'manual_refresh',
         'scheduled_refresh',
-        'batch_backfill'
+        'batch_backfill',
+        'receipt_review_scan'
     )),
     lookup_key          TEXT NOT NULL DEFAULT '',
     requested_sources   TEXT,
@@ -537,14 +543,20 @@ CREATE INDEX idx_product_enrichment_jobs_product
     ON product_enrichment_jobs(product_id, queued_at);
 
 CREATE UNIQUE INDEX idx_product_enrichment_jobs_active
-    ON product_enrichment_jobs(product_id, trigger, lookup_key)
+    ON product_enrichment_jobs(household_id, product_id, trigger, lookup_key)
     WHERE status IN ('queued', 'running');
 ```
 
+Implementation note: migrations 041 and 043 already exist in the repository.
+Because migration 041's `trigger` CHECK currently omits
+`receipt_review_scan`, add a follow-up migration before Phase 3.5 that recreates
+`product_enrichment_jobs` with the expanded trigger set and preserves the
+household-scoped active-job unique index from migration 043.
+
 Job idempotency:
 
-- before queueing a job, check for queued/running jobs for the same product and
-  lookup key;
+- before queueing a job, check for queued/running jobs for the same
+  `(household_id, product_id, trigger, lookup_key)`;
 - provider adapters upsert snapshots by source and source record;
 - suggestions upsert through either the existing link unique constraint or the
   new snapshot unique index;
@@ -694,7 +706,7 @@ CREATE INDEX idx_product_enrichment_jobs_status
 CREATE INDEX idx_product_enrichment_jobs_product
     ON product_enrichment_jobs(product_id, queued_at);
 CREATE UNIQUE INDEX idx_product_enrichment_jobs_active
-    ON product_enrichment_jobs(product_id, trigger, lookup_key)
+    ON product_enrichment_jobs(household_id, product_id, trigger, lookup_key)
     WHERE status IN ('queued', 'running');
 
 CREATE TABLE product_enrichment_settings (...);
@@ -798,6 +810,13 @@ Create `internal/enrichment/runner`.
 
 Responsibilities:
 
+- expose a single queue chokepoint,
+  `Service.QueueForProduct(ctx, householdID, productID, trigger, opts)`, and
+  migrate the existing manual lookup and receipt-scan call sites onto it before
+  adding receipt-review barcode assist;
+- own queue-time gate checks, UPC normalization, lookup-key construction,
+  active-job dedupe, queue caps, and metrics emission in that helper; adapters
+  should not have to know which UI or worker requested the job;
 - load product, UPC, store codes, latest receipt descriptions, and store refs;
 - load `product_identifiers` through `internal/identifiers` rather than
   inventing a second identifier store;
@@ -815,6 +834,24 @@ Responsibilities:
 - update job status and metrics;
 - emit WebSocket invalidation events when jobs produce visible changes;
 - never overwrite product fields without user acceptance.
+
+Gate precedence:
+
+| Gate | Applies to | Behavior |
+| --- | --- | --- |
+| `PRODUCT_ENRICHMENT_ENABLED=false` | all provider lookups | Do not enqueue provider work. Explicit receipt-review barcode apply may still store the UPC/match the row and returns `lookup_skipped_reason="env_disabled"`. |
+| `manual_lookup_enabled=false` | `manual_lookup`, `manual_refresh`, `receipt_review_scan` | Do not enqueue provider work for explicit lookup actions. Receipt-review barcode apply still stores the identifier and returns `lookup_skipped_reason="household_manual_lookup_disabled"`. |
+| `auto_on_scan_enabled=false` | `receipt_scan` | Receipt scan completion does not queue enrichment jobs; eligible products may still be found by a later scheduled sweep if enabled. |
+| `PRODUCT_ENRICHMENT_SCHEDULED_SWEEP=false` | `scheduled_refresh`, `batch_backfill` | Sweeper does not run at all, regardless of household settings. |
+| `scheduled_sweep_enabled=false` | `scheduled_refresh`, `batch_backfill` | Sweeper skips that household. |
+
+Metric names:
+
+- `cartledger_enrichment_jobs_queued_total{trigger}`;
+- `cartledger_enrichment_jobs_finished_total{trigger,status,provider}`;
+- `cartledger_enrichment_provider_latency_seconds{provider}`;
+- `cartledger_enrichment_provider_requests_total{provider,http_status}`;
+- `cartledger_enrichment_queue_depth{status}`.
 
 Provider order:
 
@@ -1011,9 +1048,27 @@ Add config:
   must also be enabled before sweeps run;
 - `PRODUCT_ENRICHMENT_SWEEP_INTERVAL=24h`;
 - `PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP=50`;
+- `PRODUCT_ENRICHMENT_MAX_JOBS_PER_RECEIPT=20`;
 - `PRODUCT_ENRICHMENT_REFRESH_AFTER_DAYS=90`;
 - provider-specific timeout and rate-limit constants in code, not user-tuned
   until there is operational evidence.
+
+Scheduling model:
+
+- use a `time.NewTicker` goroutine owned by the enrichment service and started
+  from `cmd/server/serve.go`; no cron dependency or external scheduler is needed
+  for this single-process SQLite deployment;
+- the ticker must be context-cancellable and stopped in tests/shutdown;
+- skip the entire sweeper when the global scheduled-sweep env gate is disabled;
+- for each household with `scheduled_sweep_enabled`, query eligible products
+  from current product/job/snapshot state rather than maintaining a separate
+  worklist table;
+- order sweep candidates by `last_purchased_at DESC NULLS LAST`, then purchase
+  count/value signals, and limit to `PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP`;
+- first-run backfill uses `first_run_backfill_limit` once per household opt-in,
+  then normal sweeps return to `PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP`;
+- batch reads outside write transactions and insert jobs in small chunks to
+  respect SQLite's single-writer model.
 
 First-run backfill:
 
@@ -1049,10 +1104,15 @@ Retention maintenance:
 
 - implement scheduled pruning with the Phase 3 sweeper, not Phase 2 manual
   lookup. Phase 2 must store enough timestamps/status to make pruning safe.
-- prune failed-only snapshots after 30 days;
-- prune unaccepted stale snapshots after 180 days unless a pending suggestion,
-  accepted suggestion, product link, or current product evidence still references
-  them.
+- prune failed-only snapshots by `product_external_metadata.fetched_at` after
+  30 days when `last_error IS NOT NULL`;
+- prune unaccepted stale snapshots by `fetched_at` after 180 days when no
+  pending or accepted suggestion references the snapshot through
+  `product_enrichment_suggestions.external_metadata_id`;
+- keep snapshots referenced by accepted suggestions, source links, or current
+  product evidence while the product exists;
+- delete in bounded transactions, e.g. 1000 snapshot rows per sweep tick, so
+  pruning does not block receipt writes.
 
 ## UI/UX Plan
 
@@ -1235,14 +1295,14 @@ Backend:
 - add shared per-host provider rate limiting and provider-specific tests using
   fixtures;
 - add job status list endpoint and terminal job WebSocket event;
-- add product enrichment settings API for household provider/manual/automatic
-  toggles;
+- harden the existing product enrichment settings API for household
+  provider/manual/automatic toggles and provider availability messaging;
 - add USDA integration row support while preserving `USDA_FDC_API_KEY`.
 
 Frontend:
 
-- settings provider toggles for Open Food Facts and USDA plus USDA API key,
-  including the operator-configured env fallback display for USDA;
+- evolve settings provider toggles for Open Food Facts and USDA plus USDA API
+  key, including the operator-configured env fallback display for USDA;
 - `Lookup missing info` button on Product Detail routed to
   `POST /api/v1/products/:id/enrichment-jobs`;
 - job status and provider error display.
@@ -1263,28 +1323,76 @@ Acceptance:
 
 Backend:
 
-- reuse the Phase 2 enrichment worker for automatic scan and sweep jobs;
-- apply the existing queued/running recovery and queue caps to automatic jobs;
-- queue limited jobs after receipt scan commit;
-- add scheduler/sweeper with config gates;
-- add scheduled snapshot pruning for the 30-day failed-only and 180-day stale
-  unaccepted retention rules;
-- add metrics for jobs queued, succeeded, failed, provider latency, and
-  provider status.
+- reuse the Phase 2 enrichment worker for automatic scan and sweep jobs, but
+  first introduce `Service.QueueForProduct` so manual lookup, receipt-scan
+  auto-enqueue, scheduled sweeps, and Phase 3.5 barcode apply all share the same
+  gate, dedupe, lookup-key, cap, and metrics logic;
+- keep the existing receipt worker's post-commit `queueReceiptScanEnrichment`
+  shape: it remains best-effort, runs after the receipt transaction commits, and
+  logs then moves on if queueing fails because the sweeper can catch eligible
+  products later;
+- cap receipt-scan auto jobs per receipt with
+  `PRODUCT_ENRICHMENT_MAX_JOBS_PER_RECEIPT`, default 20, prioritizing highest
+  `total_price` products first;
+- only queue auto-on-scan products with a normalized UPC/GTIN from `products.upc`
+  or `line_items.upc`; products without a UPC remain manual/sweep candidates only
+  when a later provider supports non-UPC lookup;
+- apply queued/running recovery on startup by resetting stale `running` jobs back
+  to `queued` with incremented attempts until the max-attempt policy is reached;
+- add a context-cancellable `time.NewTicker` scheduler in the enrichment service
+  for scheduled sweeps and snapshot pruning; no new cron dependency is needed;
+- enforce gate precedence from the Enrichment Runner section at queue time and
+  again before adapter execution so disabled jobs do not surprise users after
+  sitting in the queue;
+- add sweeper candidate selection from current product state: missing package
+  metadata, UPC present, no recent successful snapshot, or failed job whose
+  `next_attempt_at` has elapsed; order by recent purchase signals and cap by
+  `PRODUCT_ENRICHMENT_MAX_JOBS_PER_SWEEP`;
+- add scheduled snapshot pruning using `fetched_at` semantics: 30-day failed-only
+  rows, 180-day stale unaccepted rows, and never delete snapshots referenced by
+  accepted suggestions/current evidence;
+- expose the explicit Prometheus metrics listed in Enrichment Runner;
+- include `receipt_id` in `product.enrichment_job.updated` payloads for
+  `receipt_scan` and `receipt_review_scan` jobs so Receipt Review can invalidate
+  the visible receipt without a full product-list refresh.
 
 Frontend:
 
-- product list filters for missing metadata and failed lookups;
-- receipt review badges for queued/found package/UPC;
-- settings toggle for automatic lookup.
+- product list filters for `missing_metadata` and `failed_lookups`; extend
+  `web/src/api/products.ts:listProducts` and `internal/api/products.go` rather
+  than filtering all products client-side. Define `missing_metadata` as missing
+  brand, missing package size, or absent accepted nutrition/source metadata;
+- receipt review row badges using one badge slot beside the product/suggestion:
+  `queued`/`running` -> `Looking up...`, `succeeded` with suggestions ->
+  `Package data found`, `succeeded` without useful data -> `No package data`,
+  terminal `failed` -> `Lookup failed`, and hide `cancelled`/uninformative
+  `partial` states;
+- extend `GET /api/v1/receipts/:id` to include per-line latest enrichment job
+  status and suggestion count so badges render without a Product Detail fetch;
+- update `web/src/api/ws.ts` handling for `product.enrichment_job.updated` to
+  invalidate `['receipt', receipt_id]` when `receipt_id` is present, while
+  preserving existing product invalidation;
+- settings use the existing Product Enrichment settings API/UI surface in
+  `IntegrationsTab`; label the receipt toggle as
+  `Automatic lookup after receipt scan` and show the global env-disabled banner.
 
 Acceptance:
 
 - scanning a receipt with UPCs queues jobs after the receipt completes when the
   household has automatic lookup enabled;
-- jobs are capped and idempotent;
-- app restart leaves queued jobs recoverable;
-- users can disable all automatic external lookups.
+- receipt auto-enqueue is capped per receipt and idempotent against
+  `(household_id, product_id, trigger, lookup_key)` for active jobs;
+- scheduled sweeps are capped per household sweep, respect first-run backfill
+  limits, and skip recent failures until `next_attempt_at`;
+- app restart recovers queued jobs and reconciles stale running jobs;
+- users can disable all automatic external lookups from Settings and the next
+  receipt scan queues zero auto-on-scan jobs;
+- receipt review badges update after terminal job WebSocket events without a
+  page refresh;
+- metrics for queued/finished jobs, provider requests, provider latency, and
+  queue depth are visible on `/metrics`;
+- snapshot pruning preserves snapshots referenced by accepted suggestions and
+  deletes only eligible failed-only or stale unaccepted snapshots.
 
 ### Phase 3.5: Receipt Review Barcode Assist
 
@@ -1310,27 +1418,52 @@ Why it belongs after Phase 3:
 
 Backend:
 
-- add a dedicated receipt-review barcode command endpoint instead of stretching
-  generic line-item update semantics, for example
-  `POST /api/v1/receipts/:id/line-items/:itemId/barcode`;
-- request body: `{ "upc": "...", "mode": "preview" | "apply", "create_product": false }`;
+- add a follow-up migration before implementation that extends CHECK
+  constraints for `product_enrichment_jobs.trigger`,
+  `product_identifiers.source`, `line_item_identifier_observations.source`, and
+  `product_aliases.source` to allow `receipt_review_scan`; SQLite table
+  recreation is expected for the job/source CHECK changes;
+- add `TriggerReceiptReviewScan = "receipt_review_scan"` and treat it as a
+  manual trigger for provider-gate purposes: the global env kill switch still
+  blocks lookup, and `manual_lookup_enabled=false` stores the UPC/match but
+  skips provider work;
+- add dedicated receipt-review barcode endpoints instead of stretching generic
+  line-item update semantics:
+  - `POST /api/v1/receipts/:id/line-items/:itemId/barcode/preview`
+    with `{ "upc": "..." }`;
+  - `POST /api/v1/receipts/:id/line-items/:itemId/barcode`
+    with `{ "upc": "...", "create_product": false }`;
 - normalize UPC/GTIN through `internal/identifiers` / `internal/upc` and reject
   invalid codes before any provider call;
-- limit eligibility to editable receipts and line items that are unmatched,
-  suggested as `new_product`, or explicitly being created from the Add Row flow;
+- limit persisted-line eligibility to editable receipts and line items that are
+  not reviewed, not actively processing, and either unmatched/no `product_id` or
+  suggested as `new_product`; pre-commit Add Row/manual grid scanning uses the
+  modal's `fill` mode and the existing create-line-item `upc` field instead of
+  this apply endpoint;
 - on preview, return local household matches from `product_identifiers` and
   `products.upc`, provider/manual-lookup availability, and any conflict details;
-- on apply with a local match, match the line item to that product and store the
-  line UPC/identifier observation; do not overwrite product fields;
+- reuse the existing UPC conflict response shape from product enrichment
+  (`existing_product_id`, `existing_product_name`, `suggested_merge`) so the
+  frontend has one conflict contract;
+- on apply with a local match, update the line item directly to
+  `product_id=<matched product>`, `matched='identifier'`, `confidence=1.0`, and
+  store the line UPC/identifier observation; do not overwrite product fields;
+- upsert the receipt text alias using a new `receipt_review_scan` alias source
+  and upsert the product identifier using `receipt_review_scan` with
+  `SetPrimaryProduct=true`;
 - on apply with `create_product=true`, create a product from the receipt text
   plus scanned UPC, attach the primary GTIN using the existing conflict checks,
   match the line item, and queue a Phase 2 enrichment job with trigger
   `receipt_review_scan`;
+- product creation, identifier attach, line-item update, alias upsert, and job
+  queue insert must commit atomically or roll back together, except provider
+  queue skip responses caused by disabled gates;
 - if providers are disabled or unavailable, still store the scanned identifier
-  and show that lookup was skipped;
-- make the endpoint idempotent for repeated scans of the same UPC on the same
-  line item, and return a clear duplicate response when the scanned UPC already
-  belongs to another household product;
+  and return `lookup_skipped_reason` with one of `env_disabled`,
+  `household_manual_lookup_disabled`, or `no_provider_configured`;
+- make apply idempotent by DB state: a second identical apply for a line already
+  matched to the same product returns the same success shape and does not create
+  another product or job;
 - for Product Detail correction, reuse the existing product update and
   enrichment-job endpoints; do not create a second product-UPC write path;
 - do not auto-merge products, auto-accept provider suggestions, or update
@@ -1347,21 +1480,37 @@ Frontend:
 - add a camera icon beside the Product Detail UPC input; on scan success, fill
   the UPC field and use the existing save/lookup controls rather than adding a
   separate correction flow;
+- add UPC entry/scan fill support to `ManualLineItemGrid` and Add Row so new
+  rows can carry a UPC through existing create-line-item APIs before they have a
+  line-item ID;
+- support two modal modes: `apply-to-line` for Receipt Review and `fill` for
+  Product Detail / simple UPC fields;
 - implement a live camera scanner with a custom CartLedger modal using
   `@zxing/browser` or a similarly small wrapper; do not depend solely on the
   native `BarcodeDetector` API because it is still limited/experimental across
   major browsers;
+- restrict camera decoding to grocery 1D formats (`UPC_A`, `UPC_E`, `EAN_13`,
+  `EAN_8`, `ITF`, `CODE_128`) to reduce false positives and CPU work;
+- optionally feature-detect native `BarcodeDetector` by supported formats as a
+  fast path, but keep ZXing as the default/fallback implementation;
 - lazy-load the scanner code so desktop receipt review does not pay the camera
   bundle cost until the user opens the modal;
 - include manual UPC entry in the same modal for denied camera permission,
   unsupported browsers, damaged labels, and physical USB scanners that type into
-  the focused field;
+  the focused field; use a text input, not `type=number`, so leading zeroes are
+  preserved;
 - after a successful scan, stop the camera stream immediately unless the user
   enables `Keep scanner open`; the default should be scan, confirm, then
   auto-advance to the next eligible row;
+- cleanup must call `controls.stop()`, stop every track on `video.srcObject`,
+  clear `video.srcObject`, and run on modal unmount and `visibilitychange` hidden;
+- auto-advance only focus/cursor after a successful apply; do not auto-open the
+  scanner or auto-commit the next row;
 - prefer the rear/environment camera, remember the last selected camera when the
   browser exposes stable device IDs, and keep camera selection secondary to the
   main scan/confirm task;
+- show an HTTPS/self-hosting warning when `getUserMedia` is unavailable because
+  the app is served over non-localhost HTTP;
 - result states:
   - existing household product found: show product name and `Match row`;
   - no local product: show `Create product from receipt row` and queue lookup;
@@ -1370,6 +1519,9 @@ Frontend:
     Product Detail or merge path when relevant;
   - camera blocked/unsupported: keep manual entry available without dead-ending
     the user;
+- basic keyboard-wedge scanners are supported through the focused manual UPC
+  input and Enter-to-submit behavior; a global hidden-input/HID scanner mode is
+  deferred;
 - keep detailed nutrition, ingredient, allergen, and source-snapshot review on
   Product Detail. Receipt review should show only enough metadata to confirm that
   the row is matched correctly.
@@ -1378,18 +1530,27 @@ Acceptance:
 
 - reviewing a receipt on a phone, the user can tap scan on an unmatched packaged
   item, scan the barcode, and match the row to an existing household product when
-  the UPC is already known;
+  the UPC is already known on iOS Safari 16+ and Android Chrome 110+;
 - scanning a UPC for a new product can create and match a product from the
   receipt row, store the UPC, and queue provider lookup without typing the UPC;
-- manual UPC entry follows the same preview/apply path as camera scanning;
+- manual UPC entry hits the same preview and apply endpoints as camera scanning;
 - camera permission denial, unsupported camera APIs, and failed decodes do not
   block manual review;
+- invalid GTIN/check-digit input shows an inline error and does not call apply;
 - repeated scans of the same barcode do not create duplicate products or jobs;
-- existing matched products are not silently corrected from receipt review;
+  the modal debounces duplicate decodes in-session and the backend enforces
+  idempotency through DB state plus active-job uniqueness;
+- existing matched products are not silently corrected from receipt review; if a
+  scanned UPC resolves to a different existing product, the modal blocks with
+  `Switch match` or `Cancel`;
+- when `PRODUCT_ENRICHMENT_ENABLED=false`, apply can still create/match/store the
+  UPC but returns `lookup_skipped_reason="env_disabled"` and inserts no job row;
 - on Product Detail, scanning fills the UPC input and follows the existing
   product save/conflict/lookup behavior;
-- the camera stream is stopped when the modal closes, the route changes, or the
-  scan is applied.
+- the scanner chunk is lazy-loaded and Receipt Review's initial desktop bundle
+  does not include ZXing when the scanner is never opened;
+- the camera stream is stopped when the modal closes, the route changes, the tab
+  hides, or the scan is applied.
 
 References:
 
@@ -1404,6 +1565,8 @@ References:
   products.
 - Technical references: [`@zxing/browser`](https://github.com/zxing-js/browser),
   [`html5-qrcode`](https://github.com/mebjas/html5-qrcode),
+  [`zxing-wasm`](https://github.com/Sec-ant/zxing-wasm) as a future migration
+  target if `@zxing/browser` lifecycle issues become blocking,
   [Grocy camera scanner component](https://github.com/grocy/grocy/blob/master/public/viewjs/components/camerabarcodescanner.js),
   [MDN `BarcodeDetector`](https://developer.mozilla.org/en-US/docs/Web/API/BarcodeDetector/detect),
   [MDN `getUserMedia`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia),
@@ -1462,6 +1625,8 @@ Deferred because value is uncertain or maintenance cost is high:
 - automatic download/storage of product photos;
 - standalone pantry/inventory barcode scanning, bulk shelf scanning, and
   barcode-first product correction flows outside Product Detail;
+- global USB/HID scanner mode with hidden always-focused input, prefix/suffix
+  detection, and app-wide scan routing;
 - full PLU database;
 - GS1/1WorldSync commercial catalog integration;
 - paid provider implementation;
@@ -1564,6 +1729,9 @@ Backend tests:
 - Open Food Facts adapter maps fixtures to metadata and suggestions;
 - USDA adapter filters non-exact UPC matches;
 - runner honors global, manual, and per-provider settings before adapter calls;
+- `Service.QueueForProduct` centralizes gate checks, lookup-key construction,
+  active-job dedupe, queue caps, and metric emission for manual lookup,
+  receipt-scan enqueue, scheduled sweep, and receipt-review barcode apply;
 - provider rate limiter enforces Open Food Facts and USDA budgets and
   reschedules on provider throttle responses;
 - Kroger adapter preserves existing visible-text fixture behavior and adds
@@ -1579,9 +1747,23 @@ Backend tests:
 - suggestion acceptance broadcasts `product.updated`;
 - metadata payload allowlist rejects raw provider blobs;
 - safe HTTP client remains used for URL/manual fetch paths;
-- scheduled sweep caps jobs and skips recent failures;
+- scheduled sweep caps jobs, orders by recent purchase signals, and skips recent
+  failures until `next_attempt_at`;
+- receipt auto-enrichment caps jobs per receipt and prioritizes high-value lines;
 - snapshot prune keeps referenced snapshots and deletes only eligible failed-only
   or stale unaccepted snapshots.
+- metrics expose enrichment queued/finished counters, provider request/latency
+  series, and queue depth on `/metrics`;
+- Phase 3.5 migration expands `receipt_review_scan` trigger/source CHECK values
+  and down-migrates cleanly;
+- barcode preview returns local match/conflict/provider-availability state
+  without writes;
+- barcode apply with existing product updates the line to `matched='identifier'`,
+  stores observation/product identifier, and upserts alias with confidence 1.0;
+- barcode apply with `create_product=true` commits product creation, UPC attach,
+  line match, alias, and job enqueue atomically;
+- barcode apply with disabled provider gates stores the identifier/match and
+  returns `lookup_skipped_reason` without inserting a job.
 
 Frontend tests:
 
@@ -1593,7 +1775,16 @@ Frontend tests:
 - settings cards store/test provider config;
 - USDA settings show env fallback configured status without revealing the key;
 - settings expose granular provider and automatic lookup toggles;
-- product filters for missing metadata and failed lookups.
+- product filters for missing metadata and failed lookups;
+- receipt review enrichment badges map queued/running/succeeded/failed states and
+  update from `product.enrichment_job.updated` without a page refresh;
+- BarcodeScannerModal supports camera denied/unsupported states, manual UPC
+  entry, duplicate scan debounce, invalid GTIN error, and Product Detail `fill`
+  mode;
+- ManualLineItemGrid/Add Row can fill and submit UPC values without stripping
+  leading zeroes;
+- scanner cleanup stops ZXing controls and all media tracks on close, tab hide,
+  and route unmount.
 
 Manual smoke:
 
@@ -1605,4 +1796,6 @@ Manual smoke:
 - photo URL returns 404;
 - provider timeout/failure;
 - automatic enrichment disabled;
-- first-run backfill opt-in with more candidates than the default limit.
+- first-run backfill opt-in with more candidates than the default limit;
+- receipt review barcode scan for an existing product, a new product, a
+  conflicting product, and a disabled-provider lookup.

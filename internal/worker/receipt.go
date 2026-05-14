@@ -1085,14 +1085,21 @@ func (w *ReceiptWorker) queueReceiptScanEnrichment(householdID, receiptID string
 	}
 
 	const lookupExpr = `COALESCE(NULLIF(TRIM(p.upc), ''), NULLIF(TRIM(li.upc), ''))`
+	limit := 20
+	if w.cfg != nil && w.cfg.ProductEnrichmentMaxJobsPerReceipt > 0 {
+		limit = w.cfg.ProductEnrichmentMaxJobsPerReceipt
+	}
 	rows, err := w.db.QueryContext(ctx,
-		`SELECT DISTINCT li.product_id, `+lookupExpr+` AS lookup_upc
+		`SELECT li.product_id, `+lookupExpr+` AS lookup_upc
 		   FROM line_items li
 		   JOIN products p ON p.id = li.product_id
 		  WHERE li.receipt_id = ?
 		    AND p.household_id = ?
-		    AND `+lookupExpr+` IS NOT NULL`,
-		receiptID, householdID,
+		    AND `+lookupExpr+` IS NOT NULL
+		  GROUP BY li.product_id, lookup_upc
+		  ORDER BY MAX(CAST(li.total_price AS REAL)) DESC, MIN(li.line_number) ASC
+		  LIMIT ?`,
+		receiptID, householdID, limit,
 	)
 	if err != nil {
 		slog.Warn("worker: enrichment auto-scan product query failed", "receipt_id", receiptID, "err", err)
@@ -1120,17 +1127,22 @@ func (w *ReceiptWorker) queueReceiptScanEnrichment(householdID, receiptID string
 			skippedExisting++
 			continue
 		}
-		_, created, err := w.enrichment.QueueJob(ctx, enrichmentrunner.QueueJobRequest{
+		result, err := w.enrichment.QueueForProduct(ctx, enrichmentrunner.QueueForProductRequest{
 			HouseholdID: householdID,
 			ProductID:   productID,
+			ReceiptID:   receiptID,
 			Trigger:     enrichmentrunner.TriggerReceiptScan,
-			LookupKey:   lookupKey,
+			UPC:         normalizedUPC,
 		})
 		if err != nil {
 			slog.Warn("worker: enrichment auto-scan queue failed", "receipt_id", receiptID, "product_id", productID, "err", err)
 			continue
 		}
-		if created {
+		if result.SkippedReason != "" {
+			slog.Debug("worker: enrichment auto-scan skipped", "receipt_id", receiptID, "product_id", productID, "reason", result.SkippedReason)
+			continue
+		}
+		if result.Queued {
 			queued++
 		}
 	}

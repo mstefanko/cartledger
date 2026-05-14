@@ -176,6 +176,38 @@ func scanProductRow(rows *sql.Rows, p *productResponse) error {
 		&p.LastPurchasedAt, &p.PurchaseCount, &p.AliasCount, &p.LastPrice, &p.CreatedAt, &p.UpdatedAt)
 }
 
+func productListFilter(filter string) (string, []interface{}, bool) {
+	switch filter {
+	case "":
+		return "", nil, true
+	case "missing_metadata":
+		return `(p.brand IS NULL OR TRIM(p.brand) = ''
+			OR p.pack_quantity IS NULL
+			OR p.pack_unit IS NULL OR TRIM(p.pack_unit) = ''
+			OR NOT EXISTS (
+				SELECT 1
+				  FROM product_nutrition pn
+				 WHERE pn.product_id = p.id
+				   AND pn.accepted_by_user = 1
+			)
+			OR NOT EXISTS (
+				SELECT 1
+				  FROM product_external_metadata pem
+				 WHERE pem.product_id = p.id
+				   AND pem.last_error IS NULL
+			))`, nil, true
+	case "failed_lookups":
+		return `EXISTS (
+			SELECT 1
+			  FROM product_enrichment_jobs pej
+			 WHERE pej.product_id = p.id
+			   AND pej.status = 'failed'
+		)`, nil, true
+	default:
+		return "", nil, false
+	}
+}
+
 func floatPtr(v float64) *float64 {
 	return &v
 }
@@ -253,7 +285,12 @@ func (h *ProductHandler) List(c echo.Context) error {
 	q := strings.TrimSpace(c.QueryParam("q"))
 	brandFilter := strings.TrimSpace(c.QueryParam("brand"))
 	sortParam := strings.TrimSpace(c.QueryParam("sort"))
+	filterParam := strings.TrimSpace(c.QueryParam("filter"))
 	ctx := c.Request().Context()
+	filterClause, filterArgs, filterOK := productListFilter(filterParam)
+	if !filterOK {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unsupported product filter"})
+	}
 
 	// --- Search branch: delegate ranking to internal/search, then hydrate.
 	if q != "" {
@@ -281,6 +318,10 @@ func (h *ProductHandler) List(c echo.Context) error {
 		if brandFilter != "" {
 			query += ` AND LOWER(p.brand) = LOWER(?)`
 			args = append(args, brandFilter)
+		}
+		if filterClause != "" {
+			query += ` AND ` + filterClause
+			args = append(args, filterArgs...)
 		}
 
 		rows, err := h.DB.QueryContext(ctx, query, args...)
@@ -325,16 +366,28 @@ func (h *ProductHandler) List(c echo.Context) error {
 	}
 
 	if brandFilter != "" {
+		args := []interface{}{householdID, brandFilter}
+		where := "p.household_id = ? AND LOWER(p.brand) = LOWER(?)"
+		if filterClause != "" {
+			where += ` AND ` + filterClause
+			args = append(args, filterArgs...)
+		}
 		rows, err = h.DB.QueryContext(ctx,
 			`SELECT `+productListColumns+`
-			 FROM products p WHERE p.household_id = ? AND LOWER(p.brand) = LOWER(?) ORDER BY `+orderBy,
-			householdID, brandFilter,
+			 FROM products p WHERE `+where+` ORDER BY `+orderBy,
+			args...,
 		)
 	} else {
+		args := []interface{}{householdID}
+		where := "p.household_id = ?"
+		if filterClause != "" {
+			where += ` AND ` + filterClause
+			args = append(args, filterArgs...)
+		}
 		rows, err = h.DB.QueryContext(ctx,
 			`SELECT `+productListColumns+`
-			 FROM products p WHERE p.household_id = ? ORDER BY `+orderBy,
-			householdID,
+			 FROM products p WHERE `+where+` ORDER BY `+orderBy,
+			args...,
 		)
 	}
 	if err != nil {

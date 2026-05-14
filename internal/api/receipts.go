@@ -23,6 +23,7 @@ import (
 
 	"github.com/mstefanko/cartledger/internal/auth"
 	"github.com/mstefanko/cartledger/internal/config"
+	enrichmentrunner "github.com/mstefanko/cartledger/internal/enrichment/runner"
 	"github.com/mstefanko/cartledger/internal/identifiers"
 	"github.com/mstefanko/cartledger/internal/imaging"
 	"github.com/mstefanko/cartledger/internal/llm"
@@ -38,9 +39,10 @@ import (
 
 // ReceiptHandler holds dependencies for receipt-related endpoints.
 type ReceiptHandler struct {
-	DB     *sql.DB
-	Cfg    *config.Config
-	Worker *worker.ReceiptWorker
+	DB         *sql.DB
+	Cfg        *config.Config
+	Worker     *worker.ReceiptWorker
+	Enrichment *enrichmentrunner.Service
 	// Guard is optional. When non-nil, the Reprocess handler uses it to
 	// pre-flight budget + circuit-breaker state so users get a fast 503
 	// with a clear message instead of enqueueing a doomed job.
@@ -129,36 +131,39 @@ type receiptListItem struct {
 }
 
 type lineItemResponse struct {
-	ID                   string   `json:"id"`
-	ReceiptID            string   `json:"receipt_id"`
-	ProductID            *string  `json:"product_id,omitempty"`
-	ProductName          *string  `json:"product_name,omitempty"`
-	ProductPackQuantity  *float64 `json:"product_pack_quantity,omitempty"`
-	ProductPackUnit      *string  `json:"product_pack_unit,omitempty"`
-	Category             *string  `json:"category,omitempty"`
-	RawName              string   `json:"raw_name"`
-	StoreItemCode        *string  `json:"store_item_code,omitempty"`
-	ReceiptDescription   *string  `json:"receipt_description,omitempty"`
-	UPC                  *string  `json:"upc,omitempty"`
-	Quantity             string   `json:"quantity"`
-	Unit                 *string  `json:"unit,omitempty"`
-	UnitPrice            *string  `json:"unit_price,omitempty"`
-	TotalPrice           string   `json:"total_price"`
-	RegularPrice         *string  `json:"regular_price,omitempty"`
-	DiscountAmount       *string  `json:"discount_amount,omitempty"`
-	CountContribution    string   `json:"count_contribution"`
-	PackQuantityOverride *string  `json:"pack_quantity_override,omitempty"`
-	PackUnitOverride     *string  `json:"pack_unit_override,omitempty"`
-	PackOverrideSource   *string  `json:"pack_override_source,omitempty"`
-	Matched              string   `json:"matched"`
-	ReviewStatus         string   `json:"review_status"`
-	Confidence           *float64 `json:"confidence,omitempty"`
-	LineNumber           *int     `json:"line_number,omitempty"`
-	SuggestedName        *string  `json:"suggested_name,omitempty"`
-	SuggestedCategory    *string  `json:"suggested_category,omitempty"`
-	SuggestedProductID   *string  `json:"suggested_product_id,omitempty"`
-	SuggestedProductName *string  `json:"suggested_product_name,omitempty"`
-	SuggestionType       *string  `json:"suggestion_type,omitempty"`
+	ID                        string   `json:"id"`
+	ReceiptID                 string   `json:"receipt_id"`
+	ProductID                 *string  `json:"product_id,omitempty"`
+	ProductName               *string  `json:"product_name,omitempty"`
+	ProductPackQuantity       *float64 `json:"product_pack_quantity,omitempty"`
+	ProductPackUnit           *string  `json:"product_pack_unit,omitempty"`
+	Category                  *string  `json:"category,omitempty"`
+	RawName                   string   `json:"raw_name"`
+	StoreItemCode             *string  `json:"store_item_code,omitempty"`
+	ReceiptDescription        *string  `json:"receipt_description,omitempty"`
+	UPC                       *string  `json:"upc,omitempty"`
+	Quantity                  string   `json:"quantity"`
+	Unit                      *string  `json:"unit,omitempty"`
+	UnitPrice                 *string  `json:"unit_price,omitempty"`
+	TotalPrice                string   `json:"total_price"`
+	RegularPrice              *string  `json:"regular_price,omitempty"`
+	DiscountAmount            *string  `json:"discount_amount,omitempty"`
+	CountContribution         string   `json:"count_contribution"`
+	PackQuantityOverride      *string  `json:"pack_quantity_override,omitempty"`
+	PackUnitOverride          *string  `json:"pack_unit_override,omitempty"`
+	PackOverrideSource        *string  `json:"pack_override_source,omitempty"`
+	Matched                   string   `json:"matched"`
+	ReviewStatus              string   `json:"review_status"`
+	Confidence                *float64 `json:"confidence,omitempty"`
+	LineNumber                *int     `json:"line_number,omitempty"`
+	SuggestedName             *string  `json:"suggested_name,omitempty"`
+	SuggestedCategory         *string  `json:"suggested_category,omitempty"`
+	SuggestedProductID        *string  `json:"suggested_product_id,omitempty"`
+	SuggestedProductName      *string  `json:"suggested_product_name,omitempty"`
+	SuggestionType            *string  `json:"suggestion_type,omitempty"`
+	EnrichmentJobID           *string  `json:"enrichment_job_id,omitempty"`
+	EnrichmentJobStatus       *string  `json:"enrichment_job_status,omitempty"`
+	EnrichmentSuggestionCount int      `json:"enrichment_suggestion_count"`
 }
 
 type receiptWarningResponse struct {
@@ -247,6 +252,8 @@ func (h *ReceiptHandler) RegisterRoutes(protected *echo.Group) {
 	receipts.GET("/:id", h.Get)
 	receipts.POST("/:id/line-items/bulk", h.CreateLineItems)
 	receipts.POST("/:id/line-items", h.CreateLineItem)
+	receipts.POST("/:id/line-items/:itemId/barcode/preview", h.PreviewLineItemBarcode)
+	receipts.POST("/:id/line-items/:itemId/barcode", h.ApplyLineItemBarcode)
 	receipts.PUT("/:id/line-items/:itemId", h.UpdateLineItem)
 	receipts.POST("/:id/repair-preview", h.RepairPreview)
 	receipts.POST("/:id/apply-repair", h.ApplyRepair)
@@ -1061,13 +1068,33 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 		        li.pack_quantity_override, li.pack_unit_override, li.pack_override_source,
 		        li.matched, li.review_status, li.confidence, li.line_number,
 		        li.suggested_name, li.suggested_category,
-		        li.suggested_product_id, sp.name
+		        li.suggested_product_id, sp.name,
+		        ej.id AS enrichment_job_id,
+		        ej.status AS enrichment_job_status,
+		        (SELECT COUNT(*)
+		           FROM product_enrichment_suggestions pes
+		          WHERE pes.product_id = li.product_id
+		            AND pes.status = 'pending') AS enrichment_suggestion_count
 		 FROM line_items li
 		 LEFT JOIN products p ON li.product_id = p.id
 		 LEFT JOIN products sp ON li.suggested_product_id = sp.id
+		 LEFT JOIN (
+		     SELECT product_id, id, status
+		       FROM (
+		           SELECT j.product_id, j.id, j.status,
+		                  ROW_NUMBER() OVER (
+		                      PARTITION BY j.product_id
+		                      ORDER BY j.queued_at DESC, j.updated_at DESC
+		                  ) AS rn
+		             FROM product_enrichment_jobs j
+		            WHERE j.household_id = ?
+		              AND j.receipt_id = ?
+		       )
+		      WHERE rn = 1
+		 ) ej ON ej.product_id = li.product_id
 		 WHERE li.receipt_id = ?
 		 ORDER BY li.line_number, li.created_at`,
-		receiptID,
+		householdID, receiptID, receiptID,
 	)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -1089,6 +1116,7 @@ func (h *ReceiptHandler) Get(c echo.Context) error {
 			&li.Matched, &li.ReviewStatus, &li.Confidence, &li.LineNumber,
 			&li.SuggestedName, &li.SuggestedCategory,
 			&li.SuggestedProductID, &li.SuggestedProductName,
+			&li.EnrichmentJobID, &li.EnrichmentJobStatus, &li.EnrichmentSuggestionCount,
 		); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "database error"})
 		}

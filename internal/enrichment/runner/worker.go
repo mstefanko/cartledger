@@ -92,6 +92,7 @@ func (w *Worker) RequeueReady(ctx context.Context) (int, error) {
 		    CASE trigger
 		      WHEN 'manual_lookup' THEN 0
 		      WHEN 'manual_refresh' THEN 0
+		      WHEN 'receipt_review_scan' THEN 0
 		      WHEN 'receipt_scan' THEN 1
 		      WHEN 'batch_backfill' THEN 2
 		      WHEN 'scheduled_refresh' THEN 3

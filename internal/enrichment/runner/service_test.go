@@ -97,7 +97,7 @@ func setupServiceTest(t *testing.T, provider providers.Provider) (*sql.DB, *Serv
 	}
 
 	broadcaster := &recordingBroadcaster{}
-	service := NewServiceWithProviders(database, &config.Config{ProductEnrichmentEnabled: true}, broadcaster, []providers.Provider{provider})
+	service := NewServiceWithProviders(database, &config.Config{ProductEnrichmentEnabled: true, ProductEnrichmentAutoOnScan: true}, broadcaster, []providers.Provider{provider})
 	cleanup := func() {
 		database.Close()
 		os.RemoveAll(dir)

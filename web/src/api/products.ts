@@ -17,6 +17,7 @@ import type {
 export async function listProducts(params?: {
   search?: string
   sort?: 'last_purchased_at'
+  filter?: 'missing_metadata' | 'failed_lookups'
 }): Promise<ProductListItem[]> {
   const searchParams = new URLSearchParams()
   if (params?.search) {
@@ -24,6 +25,9 @@ export async function listProducts(params?: {
   }
   if (params?.sort) {
     searchParams.set('sort', params.sort)
+  }
+  if (params?.filter) {
+    searchParams.set('filter', params.filter)
   }
   const query = searchParams.toString()
   return get<ProductListItem[]>(`/products${query ? `?${query}` : ''}`)

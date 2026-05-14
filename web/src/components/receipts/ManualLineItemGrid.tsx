@@ -1,7 +1,14 @@
-import { Plus, Trash2 } from 'lucide-react'
+import { lazy, Suspense, useState } from 'react'
+import { Camera, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import type { ManualLineItemInput } from '@/api/receipts'
+
+const BarcodeScannerModal = lazy(() =>
+  import('@/components/receipts/BarcodeScannerModal').then((module) => ({
+    default: module.BarcodeScannerModal,
+  })),
+)
 
 export type ManualLineItemGridRow = ManualLineItemInput & { _key: string }
 
@@ -51,6 +58,7 @@ function toManualLineItemInputs(
   return rows.map(({ _key, ...row }) => ({
     raw_name: row.raw_name.trim(),
     product_id: optionalText(row.product_id),
+    upc: optionalText(row.upc),
     quantity: optionalText(row.quantity),
     unit: optionalText(row.unit),
     unit_price: optionalText(row.unit_price),
@@ -67,6 +75,7 @@ function ManualLineItemGrid({
   disabled = false,
   addButtonLabel = 'Add item',
 }: ManualLineItemGridProps) {
+  const [scanRowKey, setScanRowKey] = useState<string | null>(null)
   const updateRow = (key: string, patch: Partial<ManualLineItemGridRow>) =>
     onRowsChange(rows.map((row) => (row._key === key ? { ...row, ...patch } : row)))
 
@@ -109,6 +118,27 @@ function ManualLineItemGrid({
                 disabled={disabled}
                 onChange={(event) => updateRow(row._key, { raw_name: event.target.value })}
               />
+              <div className="mt-2 flex gap-1">
+                <Input
+                  aria-label="UPC"
+                  inputMode="numeric"
+                  placeholder="UPC"
+                  value={row.upc ?? ''}
+                  disabled={disabled}
+                  onChange={(event) => updateRow(row._key, { upc: event.target.value })}
+                />
+                <Button
+                  type="button"
+                  variant="subtle"
+                  size="sm"
+                  aria-label="Scan UPC"
+                  onClick={() => setScanRowKey(row._key)}
+                  disabled={disabled}
+                  className="h-9 w-9 px-0"
+                >
+                  <Camera className="h-4 w-4" aria-hidden="true" />
+                </Button>
+              </div>
             </div>
             <div className="col-span-3 sm:col-span-1">
               <Input
@@ -186,6 +216,21 @@ function ManualLineItemGrid({
           {addButtonLabel}
         </Button>
       </div>
+      {scanRowKey && (
+        <Suspense fallback={null}>
+          <BarcodeScannerModal
+            open={scanRowKey !== null}
+            mode="fill"
+            title="Scan UPC"
+            initialValue={rows.find((row) => row._key === scanRowKey)?.upc ?? ''}
+            onClose={() => setScanRowKey(null)}
+            onFill={(value) => {
+              if (scanRowKey) updateRow(scanRowKey, { upc: value })
+              setScanRowKey(null)
+            }}
+          />
+        </Suspense>
+      )}
     </div>
   )
 }

@@ -157,7 +157,7 @@ function ProductEnrichmentSettingsCard() {
             onChange={(checked) => update({ provider_usda_fdc_enabled: checked })}
           />
           <SettingToggle
-            label="Automatic lookup on scan"
+            label="Automatic lookup after receipt scan"
             description="Queue external lookups after receipt scans."
             checked={settings.auto_on_scan_enabled}
             disabled={mutation.isPending || !settings.global_enabled}

@@ -1,8 +1,8 @@
-import { useState, useMemo, useCallback, useEffect, type FormEvent } from 'react'
+import { useState, useMemo, useCallback, useEffect, lazy, Suspense, type FormEvent } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
-import { Check, ChevronDown, Circle, CircleAlert, ExternalLink, FileCode2, Loader2, Search, Wrench } from 'lucide-react'
+import { Camera, Check, ChevronDown, Circle, CircleAlert, ExternalLink, FileCode2, Loader2, Search, Wrench } from 'lucide-react'
 import { EditableTable, type AutocompleteOption } from '@/components/ui/EditableTable'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
@@ -19,6 +19,12 @@ import { getReceipt, updateLineItem, createLineItem, createLineItems, repairRece
 import { listProducts, updateProduct } from '@/api/products'
 import { matchLineItem } from '@/api/matching'
 import type { AcceptSuggestionsResponse, LineItem, Product } from '@/types'
+
+const BarcodeScannerModal = lazy(() =>
+  import('@/components/receipts/BarcodeScannerModal').then((module) => ({
+    default: module.BarcodeScannerModal,
+  })),
+)
 
 interface ReceiptReviewProps {
   receiptId: string
@@ -246,6 +252,29 @@ function matchMethodLabel(matched: LineItem['matched']): string | null {
   return null
 }
 
+function enrichmentBadge(item: LineItem): { label: string; variant: 'neutral' | 'success' | 'warning' | 'error' } | null {
+  const status = item.enrichment_job_status
+  if (!status || status === 'cancelled' || status === 'partial') return null
+  if (status === 'queued' || status === 'running') {
+    return { label: 'Looking up...', variant: 'neutral' }
+  }
+  if (status === 'failed') {
+    return { label: 'Lookup failed', variant: 'error' }
+  }
+  if (status === 'succeeded') {
+    return (item.enrichment_suggestion_count ?? 0) > 0
+      ? { label: 'Package data found', variant: 'success' }
+      : { label: 'No package data', variant: 'neutral' }
+  }
+  return null
+}
+
+function barcodeEligible(item: LineItem): boolean {
+  if (item.review_status === 'accepted') return false
+  if (item.product_id) return false
+  return item.matched === 'unmatched' && (item.suggestion_type == null || item.suggestion_type === 'new_product')
+}
+
 function packageContentsStatus(item: LineItem): PackageContentsStatus {
   if (item.pack_quantity_override && item.pack_unit_override) {
     return { kind: 'label', label: `${item.pack_quantity_override} ${item.pack_unit_override}`, source: 'receipt' }
@@ -367,6 +396,7 @@ function ProductMatchDisplay({ item }: { item: LineItemRow }) {
   const methodLabel = matchMethodLabel(item.matched)
   const suggestedName = suggestedProductName(item)
   const suggestion = suggestionTone(item)
+  const lookupBadge = enrichmentBadge(item)
 
   return (
     <div className="min-w-0 py-1">
@@ -386,6 +416,7 @@ function ProductMatchDisplay({ item }: { item: LineItemRow }) {
             <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
           </Link>
           {methodLabel && <Badge variant="neutral">{methodLabel}</Badge>}
+          {lookupBadge && <Badge variant={lookupBadge.variant}>{lookupBadge.label}</Badge>}
         </div>
       ) : suggestedName && suggestion ? (
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -396,12 +427,16 @@ function ProductMatchDisplay({ item }: { item: LineItemRow }) {
             {suggestedName}
           </span>
           <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-neutral-400" aria-hidden="true" />
+          {lookupBadge && <Badge variant={lookupBadge.variant}>{lookupBadge.label}</Badge>}
         </div>
       ) : (
-        <span className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-caption font-semibold text-amber-700">
-          <Search className="h-3.5 w-3.5" aria-hidden="true" />
-          Match product
-        </span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-caption font-semibold text-amber-700">
+            <Search className="h-3.5 w-3.5" aria-hidden="true" />
+            Match product
+          </span>
+          {lookupBadge && <Badge variant={lookupBadge.variant}>{lookupBadge.label}</Badge>}
+        </div>
       )}
       <ReceiptEvidenceLine item={item} />
     </div>
@@ -432,6 +467,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   // --- Manual add row modal ---
   const [addRowOpen, setAddRowOpen] = useState(false)
   const [newRow, setNewRow] = useState<CreateLineItemRequest>(emptyNewRow)
+  const [addRowScannerOpen, setAddRowScannerOpen] = useState(false)
 
   // --- Contextual repair note modal ---
   const [repairOpen, setRepairOpen] = useState(false)
@@ -442,6 +478,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
   const [sizeUnit, setSizeUnit] = useState('')
   const [savePackageDefault, setSavePackageDefault] = useState(false)
   const [identifierWarnings, setIdentifierWarnings] = useState<IdentifierWarning[]>([])
+  const [barcodeItem, setBarcodeItem] = useState<LineItemRow | null>(null)
 
   useEffect(() => {
     setIdentifierWarnings([])
@@ -606,6 +643,19 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       product_name: li.product_name ?? (li.product_id ? productMap.get(li.product_id) ?? '' : ''),
     }))
   }, [receipt, productMap])
+
+  const barcodeEligibleRows = useMemo(
+    () => rows.filter(barcodeEligible),
+    [rows],
+  )
+
+  const handleBarcodeApplied = useCallback(() => {
+    const currentItemId = barcodeItem?.id
+    const nextItem = barcodeEligibleRows.find((row) => row.id !== currentItemId) ?? null
+    setBarcodeItem(nextItem)
+    queryClient.invalidateQueries({ queryKey: ['receipt', receiptId] })
+    queryClient.invalidateQueries({ queryKey: ['products'] })
+  }, [barcodeEligibleRows, barcodeItem?.id, queryClient, receiptId])
 
   // --- Status counts ---
   const matchedCount = useMemo(
@@ -778,6 +828,7 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
       createLineItemMutation.mutate({
         ...newRow,
         raw_name: newRow.raw_name.trim(),
+        upc: newRow.upc?.trim() || undefined,
         total_price: newRow.total_price.trim(),
         quantity: newRow.quantity?.trim() || undefined,
         unit: newRow.unit?.trim() || undefined,
@@ -854,6 +905,31 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               ) : (
                 <CircleAlert className="h-4 w-4" aria-hidden="true" />
               )}
+            </button>
+          )
+        },
+      },
+      {
+        id: 'barcode',
+        header: '',
+        size: 40,
+        cell: ({ row }) => {
+          const item = row.original
+          if (!barcodeEligible(item)) {
+            return <span className="block h-7 w-7" />
+          }
+          return (
+            <button
+              type="button"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-brand-subtle hover:text-brand"
+              title="Scan barcode"
+              aria-label={`Scan barcode for ${item.raw_name}`}
+              onClick={(event) => {
+                event.stopPropagation()
+                setBarcodeItem(item)
+              }}
+            >
+              <Camera className="h-4 w-4" aria-hidden="true" />
             </button>
           )
         },
@@ -1052,6 +1128,17 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {barcodeEligibleRows.length > 0 && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => setBarcodeItem(barcodeEligibleRows[0] ?? null)}
+            >
+              <Camera className="mr-1 h-4 w-4" aria-hidden="true" />
+              Scan next new item
+            </Button>
+          )}
           <Button
             variant="secondary"
             size="sm"
@@ -1193,6 +1280,19 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
         />
       )}
 
+      {barcodeItem && (
+        <Suspense fallback={null}>
+          <BarcodeScannerModal
+            open={barcodeItem !== null}
+            mode="apply-to-line"
+            receiptId={receiptId}
+            lineItem={barcodeItem}
+            onClose={() => setBarcodeItem(null)}
+            onApplied={handleBarcodeApplied}
+          />
+        </Suspense>
+      )}
+
       {/* Raw JSON modal */}
       <Modal
         open={rawJsonOpen}
@@ -1251,6 +1351,26 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
               className="rounded-lg border border-neutral-200 px-3 py-2 text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
               autoFocus
             />
+          </label>
+          <label className="col-span-2 flex flex-col gap-1 text-caption font-medium text-neutral-900">
+            UPC
+            <div className="flex gap-2">
+              <input
+                value={newRow.upc ?? ''}
+                onChange={(e) => updateNewRow('upc', e.target.value)}
+                inputMode="numeric"
+                className="min-w-0 flex-1 rounded-lg border border-neutral-200 px-3 py-2 font-mono text-body font-normal focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand"
+              />
+              <button
+                type="button"
+                className="inline-flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg border border-neutral-200 text-neutral-500 transition-colors hover:bg-brand-subtle hover:text-brand"
+                onClick={() => setAddRowScannerOpen(true)}
+                aria-label="Scan UPC"
+                title="Scan UPC"
+              >
+                <Camera className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
           </label>
           <label className="flex flex-col gap-1 text-caption font-medium text-neutral-900">
             Purchased Qty
@@ -1316,6 +1436,22 @@ function ReceiptReview({ receiptId }: ReceiptReviewProps) {
           )}
         </form>
       </Modal>
+
+      {addRowScannerOpen && (
+        <Suspense fallback={null}>
+          <BarcodeScannerModal
+            open={addRowScannerOpen}
+            mode="fill"
+            title="Scan UPC"
+            initialValue={newRow.upc ?? ''}
+            onClose={() => setAddRowScannerOpen(false)}
+            onFill={(value) => {
+              updateNewRow('upc', value)
+              setAddRowScannerOpen(false)
+            }}
+          />
+        </Suspense>
+      )}
 
       <Modal
         open={repairOpen}

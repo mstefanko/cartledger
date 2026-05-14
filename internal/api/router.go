@@ -208,7 +208,7 @@ func NewRouter(appCtx context.Context, database *sql.DB, cfg *config.Config, hub
 	aliasHandler := &AliasHandler{DB: database, Cfg: cfg}
 	aliasHandler.RegisterRoutes(protected)
 
-	receiptHandler := &ReceiptHandler{DB: database, Cfg: cfg, Worker: receiptWorker, Guard: llmGuard}
+	receiptHandler := &ReceiptHandler{DB: database, Cfg: cfg, Worker: receiptWorker, Enrichment: enrichmentService, Guard: llmGuard}
 	receiptHandler.RegisterRoutes(protected)
 
 	matchingHandler := &MatchingHandler{DB: database, Cfg: cfg}

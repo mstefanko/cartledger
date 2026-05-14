@@ -70,7 +70,7 @@ export interface ProductAlias {
   alias: string
   alias_normalized?: string | null
   store_id: string | null
-  source: 'legacy' | 'receipt_match' | 'manual_match' | 'user_alias' | 'import' | 'enrichment'
+  source: 'legacy' | 'receipt_match' | 'manual_match' | 'user_alias' | 'import' | 'enrichment' | 'receipt_review_scan'
   confidence?: number | null
   accepted_at?: string | null
   updated_at?: string | null
@@ -181,6 +181,9 @@ export interface LineItem {
   suggested_product_id: string | null
   suggested_product_name: string | null
   suggestion_type: 'existing_match' | 'new_product' | 'cross_store_match' | null
+  enrichment_job_id?: string | null
+  enrichment_job_status?: 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled' | null
+  enrichment_suggestion_count?: number
   created_at: string
 }
 
@@ -406,7 +409,8 @@ export interface ProductEnrichmentSuggestion {
 export interface ProductEnrichmentJob {
   id: string
   product_id: string
-  trigger: 'receipt_scan' | 'manual_lookup' | 'manual_refresh' | 'scheduled_refresh' | 'batch_backfill'
+  receipt_id?: string | null
+  trigger: 'receipt_scan' | 'receipt_review_scan' | 'manual_lookup' | 'manual_refresh' | 'scheduled_refresh' | 'batch_backfill'
   lookup_key: string
   requested_sources?: string[]
   status: 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled'

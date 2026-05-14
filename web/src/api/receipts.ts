@@ -8,6 +8,7 @@ import type {
   AcceptSuggestionsResponse,
 } from '@/types'
 import type { ReceiptUploadPage } from '@/lib/receiptUpload'
+import type { ProductEnrichmentJob } from '@/types'
 
 export interface ScanReceiptResponse {
   id: string
@@ -201,4 +202,52 @@ export async function createManualReceipt(
   data: CreateManualReceiptRequest,
 ): Promise<{ id: string }> {
   return post<{ id: string }>('/receipts/manual', data)
+}
+
+export interface LineItemBarcodePreview {
+  upc: string
+  matched_product?: { id: string; name: string }
+  create_product_allowed: boolean
+  lookup_available: boolean
+  lookup_skipped_reason?: 'env_disabled' | 'household_manual_lookup_disabled' | 'no_provider_configured' | 'queue_failed'
+  conflict?: {
+    code: string
+    message: string
+    existing_product_id?: string
+    existing_product_name?: string
+    suggested_merge: boolean
+  }
+}
+
+export interface LineItemBarcodeApplyResponse {
+  line_item_id: string
+  upc: string
+  product_id: string
+  product_name: string
+  created_product: boolean
+  job?: ProductEnrichmentJob
+  lookup_skipped_reason?: 'env_disabled' | 'household_manual_lookup_disabled' | 'no_provider_configured' | 'queue_failed'
+}
+
+export async function previewLineItemBarcode(
+  receiptId: string,
+  itemId: string,
+  upc: string,
+  createProduct = false,
+): Promise<LineItemBarcodePreview> {
+  return post<LineItemBarcodePreview>(
+    `/receipts/${encodeURIComponent(receiptId)}/line-items/${encodeURIComponent(itemId)}/barcode/preview`,
+    { upc, create_product: createProduct },
+  )
+}
+
+export async function applyLineItemBarcode(
+  receiptId: string,
+  itemId: string,
+  data: { upc: string; create_product?: boolean },
+): Promise<LineItemBarcodeApplyResponse> {
+  return post<LineItemBarcodeApplyResponse>(
+    `/receipts/${encodeURIComponent(receiptId)}/line-items/${encodeURIComponent(itemId)}/barcode`,
+    { upc: data.upc, create_product: Boolean(data.create_product) },
+  )
 }
